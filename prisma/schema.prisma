@@ -1,0 +1,57 @@
+// Prisma como CLIENTE TIPADO sobre el esquema existente (owner: db/schema.sql).
+// NO se usa `prisma migrate`: el DDL vive en schema.sql. Solo `prisma generate`.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  schemas  = ["sst"]
+}
+
+/// EST-01 · Estados de la OS. Los nombres Prisma mapean a los valores reales del
+/// enum de PostgreSQL `sst.estado_orden` (con espacios/acentos) vía @map.
+enum EstadoOrden {
+  SIN_PROGRAMAR   @map("SIN PROGRAMAR")
+  PROGRAMADA      @map("PROGRAMADA")
+  EN_VERIFICACION @map("EN VERIFICACIÓN")
+  EJECUTADA       @map("EJECUTADA")
+  CANCELADA       @map("CANCELADA")
+
+  @@map("estado_orden")
+  @@schema("sst")
+}
+
+/// Orden de Servicio (tabla central `sst.ordenes_servicio`).
+model Order {
+  id                    String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  codigo                String?     @unique
+  arlId                 String      @map("arl_id") @db.Uuid
+  codigoCronograma      String      @map("codigo_cronograma")
+  secuencia             String
+  nitNic                String?     @map("nit_nic")
+  empresaNombre         String?     @map("empresa_nombre")
+  actividadEconomica    String?     @map("actividad_economica")
+  horasAsignadas        Decimal?    @map("horas_asignadas") @db.Decimal(8, 2)
+  fechaCarga            DateTime    @default(now()) @map("fecha_carga") @db.Timestamptz(6)
+  descripcion           String?
+  contactoSstNombre     String?     @map("contacto_sst_nombre")
+  contactoSstTelefono   String?     @map("contacto_sst_telefono")
+  contactoSstCorreo     String?     @map("contacto_sst_correo")
+  estado                EstadoOrden @default(SIN_PROGRAMAR)
+  profesionalAsignadoId String?     @map("profesional_asignado_id") @db.Uuid
+  fechaProgramada       DateTime?   @map("fecha_programada") @db.Timestamptz(6)
+  fechaEjecucion        DateTime?   @map("fecha_ejecucion") @db.Timestamptz(6)
+  loteImportacionId     String?     @map("lote_importacion_id") @db.Uuid
+  urlArchivoOriginal    String?     @map("url_archivo_original")
+  metadatosExtraccion   Json?       @map("metadatos_extraccion")
+  creadoEn              DateTime    @default(now()) @map("creado_en") @db.Timestamptz(6)
+  // `actualizado_en` lo gestiona el trigger de la BD (no @updatedAt aquí).
+  actualizadoEn         DateTime    @default(now()) @map("actualizado_en") @db.Timestamptz(6)
+
+  @@unique([arlId, codigoCronograma, secuencia], map: "uq_ordenes_dedup")
+  @@map("ordenes_servicio")
+  @@schema("sst")
+}
