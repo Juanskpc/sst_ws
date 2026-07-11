@@ -74,4 +74,62 @@ router.patch('/:id/estado', requireRole('admin'), asyncHandler(async (req, res) 
   res.json({ data: r.rows[0] });
 }));
 
+// ===== Ocupaciones (agenda) del profesional — calendario de disponibilidad =====
+
+async function ensureProfessional(id) {
+  const r = await pool.query(`SELECT id FROM sst.profesionales WHERE id=$1`, [id]);
+  if (!r.rows[0]) throw notFound('Profesional no encontrado');
+}
+
+// SELECT con fecha/hora ya formateadas como texto para el frontend.
+const OCUPACION_COLS = `
+  id, profesional_id,
+  to_char(fecha, 'YYYY-MM-DD') AS fecha,
+  to_char(hora_inicio, 'HH24:MI') AS hora_inicio,
+  to_char(hora_fin, 'HH24:MI') AS hora_fin,
+  motivo, creado_en`;
+
+// Listar franjas ocupadas del profesional.
+router.get('/:id/ocupaciones', asyncHandler(async (req, res) => {
+  await ensureProfessional(req.params.id);
+  const r = await pool.query(
+    `SELECT ${OCUPACION_COLS}
+     FROM sst.ocupaciones_profesional
+     WHERE profesional_id=$1
+     ORDER BY fecha, hora_inicio`,
+    [req.params.id]
+  );
+  res.json({ data: r.rows });
+}));
+
+// Registrar una franja de ocupación (admin).
+router.post('/:id/ocupaciones', requireRole('admin'), asyncHandler(async (req, res) => {
+  await ensureProfessional(req.params.id);
+  const { fecha, hora_inicio, hora_fin, motivo = null } = req.body || {};
+  if (!fecha || !hora_inicio || !hora_fin) {
+    throw badRequest('fecha, hora_inicio y hora_fin son obligatorios');
+  }
+  if (hora_fin <= hora_inicio) throw badRequest('hora_fin debe ser mayor que hora_inicio');
+  const ins = await pool.query(
+    `INSERT INTO sst.ocupaciones_profesional (profesional_id, fecha, hora_inicio, hora_fin, motivo, creado_por)
+     VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+    [req.params.id, fecha, hora_inicio, hora_fin, motivo, req.user.sub]
+  );
+  const r = await pool.query(
+    `SELECT ${OCUPACION_COLS} FROM sst.ocupaciones_profesional WHERE id=$1`,
+    [ins.rows[0].id]
+  );
+  res.status(201).json({ data: r.rows[0] });
+}));
+
+// Eliminar una franja de ocupación (admin).
+router.delete('/:id/ocupaciones/:slotId', requireRole('admin'), asyncHandler(async (req, res) => {
+  const r = await pool.query(
+    `DELETE FROM sst.ocupaciones_profesional WHERE id=$1 AND profesional_id=$2 RETURNING id`,
+    [req.params.slotId, req.params.id]
+  );
+  if (!r.rows[0]) throw notFound('Ocupación no encontrada');
+  res.json({ data: { id: r.rows[0].id } });
+}));
+
 export default router;

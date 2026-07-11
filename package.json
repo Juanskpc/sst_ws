@@ -12,7 +12,8 @@
     "migrate": "node db/migrate.js",
     "seed:admin": "node db/seed-admin.js",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "prisma:generate": "prisma generate"
+    "prisma:generate": "prisma generate",
+    "seed:demo": "node db/seed-demo.js"
   },
   "dependencies": {
     "@google/genai": "^2.10.0",
