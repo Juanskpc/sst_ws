@@ -19,6 +19,7 @@ de Fase 2, pero **sin lógica de backend** (Regla de Oro).
 ```bash
 npm install
 npm run migrate     # crea el esquema sst: tablas, vistas, funciones, seeds + admin
+npm run seed:demo   # (opcional) carga datos de DEMO ricos en TODAS las categorías
 npm start           # levanta la API en http://localhost:4000
 # desarrollo con reload:
 npm run dev
@@ -37,6 +38,9 @@ db/
                  vistas RPT-01/02, funciones de dominio y triggers.
   seed.sql       Catálogo ARLs, plantillas de formatos, app_settings (umbral 70%).
   migrate.js     Aplica schema+seed y siembra admin + profesionales de ejemplo.
+  seed-demo.js   Datos de DEMO completos: usuarios (varios roles), 8 profesionales,
+                 lotes, 8 borradores pendientes, 26 OS en todos los estados,
+                 historial, documentos, soportes, notificaciones y tablas Fase 2.
 src/
   config/        env + pool de PostgreSQL (search_path = sst).
   middleware/    auth (JWT + roles), manejo de errores, uploads (multer).

@@ -9,32 +9,95 @@ import { CANONICAL_FIELDS } from '../../services/gemini.service.js';
 const router = Router();
 router.use(authRequired);
 
-// Bandeja de validación IA (M3). Filtrable por estado del borrador.
+// SELECT base con nombres legibles (ARL, archivo del lote y profesional asignado).
+const DRAFT_SELECT = `
+  SELECT d.*, a.nombre AS arl_nombre, b.nombre_archivo, b.tipo_mime,
+         p.nombre AS profesional_nombre
+  FROM sst.borradores_extraccion d
+  LEFT JOIN sst.arls a ON a.id = d.arl_id
+  LEFT JOIN sst.lotes_importacion b ON b.id = d.lote_importacion_id
+  LEFT JOIN sst.profesionales p ON p.id = d.profesional_asignado_id`;
+
+// Vista "Órdenes" (M3). Filtrable por estado y por soft-delete.
+//   ?estado=PENDIENTE_VALIDACION | VALIDADA | ... | ALL
+//   ?deshabilitado=false (por defecto) | true | all
 router.get('/', asyncHandler(async (req, res) => {
   const estado = req.query.estado || req.query.status || 'PENDIENTE_VALIDACION';
+  const desh = String(req.query.deshabilitado ?? 'false').toLowerCase();
+
+  const params = [estado];
+  let filtroDesh = 'AND d.deshabilitado = false';
+  if (desh === 'true') filtroDesh = 'AND d.deshabilitado = true';
+  else if (desh === 'all') filtroDesh = '';
+
   const r = await pool.query(
-    `SELECT d.*, a.nombre AS arl_nombre, b.nombre_archivo, b.tipo_mime
-     FROM sst.borradores_extraccion d
-     LEFT JOIN sst.arls a ON a.id = d.arl_id
-     LEFT JOIN sst.lotes_importacion b ON b.id = d.lote_importacion_id
+    `${DRAFT_SELECT}
      WHERE ($1 = 'ALL' OR d.estado = $1::sst.estado_extraccion)
+     ${filtroDesh}
      ORDER BY d.creado_en DESC`,
-    [estado]
+    params
   );
   res.json({ data: r.rows });
 }));
 
 router.get('/:id', asyncHandler(async (req, res) => {
-  const r = await pool.query(
-    `SELECT d.*, a.nombre AS arl_nombre, b.nombre_archivo, b.tipo_mime
-     FROM sst.borradores_extraccion d
-     LEFT JOIN sst.arls a ON a.id = d.arl_id
-     LEFT JOIN sst.lotes_importacion b ON b.id = d.lote_importacion_id
-     WHERE d.id=$1`,
-    [req.params.id]
-  );
+  const r = await pool.query(`${DRAFT_SELECT} WHERE d.id=$1`, [req.params.id]);
   if (!r.rows[0]) throw notFound('Borrador no encontrado');
   res.json({ data: r.rows[0] });
+}));
+
+/** Recarga un borrador expandido (helper para respuestas tras un cambio). */
+async function loadDraftExpanded(id, client = pool) {
+  const r = await client.query(`${DRAFT_SELECT} WHERE d.id=$1`, [id]);
+  return r.rows[0] || null;
+}
+
+// ASG · Asignar profesional al borrador (asignación ligera antes de materializar).
+router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) => {
+  const profesionalId = req.body?.profesional_id || req.body?.professional_id;
+  const fechaProgramada = req.body?.fecha_programada || req.body?.scheduled_at || null;
+  if (!profesionalId) throw badRequest('profesional_id es obligatorio');
+
+  const prof = await pool.query(`SELECT id, estado FROM sst.profesionales WHERE id=$1`, [profesionalId]);
+  if (!prof.rows[0]) throw badRequest('Profesional no existe');
+  if (prof.rows[0].estado !== 'Activo') throw badRequest('El profesional está Inactivo');
+
+  const upd = await pool.query(
+    `UPDATE sst.borradores_extraccion
+       SET profesional_asignado_id=$2, fecha_programada=$3
+     WHERE id=$1 AND deshabilitado=false
+     RETURNING id`,
+    [req.params.id, profesionalId, fechaProgramada]
+  );
+  if (!upd.rows[0]) throw notFound('Borrador no encontrado o deshabilitado');
+
+  res.json({ message: 'Profesional asignado a la orden.', data: await loadDraftExpanded(req.params.id) });
+}));
+
+// SOFT-DELETE · Deshabilitar (inactivar) el borrador sin borrarlo físicamente.
+router.patch('/:id/disable', requireRole('admin'), asyncHandler(async (req, res) => {
+  const r = await pool.query(
+    `UPDATE sst.borradores_extraccion
+       SET deshabilitado=true, deshabilitado_en=now(), deshabilitado_por=$2
+     WHERE id=$1 AND deshabilitado=false
+     RETURNING id`,
+    [req.params.id, req.user.sub]
+  );
+  if (!r.rows[0]) throw notFound('Borrador no encontrado o ya deshabilitado');
+  res.json({ message: 'Orden deshabilitada.', data: await loadDraftExpanded(req.params.id) });
+}));
+
+// Restaurar un borrador deshabilitado.
+router.patch('/:id/enable', requireRole('admin'), asyncHandler(async (req, res) => {
+  const r = await pool.query(
+    `UPDATE sst.borradores_extraccion
+       SET deshabilitado=false, deshabilitado_en=NULL, deshabilitado_por=NULL
+     WHERE id=$1 AND deshabilitado=true
+     RETURNING id`,
+    [req.params.id]
+  );
+  if (!r.rows[0]) throw notFound('Borrador no encontrado o ya activo');
+  res.json({ message: 'Orden restaurada.', data: await loadDraftExpanded(req.params.id) });
 }));
 
 // IMP-03/04 · Guardar correcciones manuales del split-view (sin validar aún).

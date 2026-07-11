@@ -192,6 +192,37 @@ CREATE TABLE IF NOT EXISTS sst.borradores_extraccion (
 CREATE INDEX IF NOT EXISTS idx_borradores_lote   ON sst.borradores_extraccion(lote_importacion_id);
 CREATE INDEX IF NOT EXISTS idx_borradores_estado ON sst.borradores_extraccion(estado);
 
+-- Órdenes (vista "Órdenes"): asignación ligera de profesional y SOFT-DELETE.
+-- Se opera sobre el borrador mientras vive en la bandeja (antes de materializar la OS).
+ALTER TABLE sst.borradores_extraccion
+  ADD COLUMN IF NOT EXISTS profesional_asignado_id UUID REFERENCES sst.profesionales(id) ON DELETE SET NULL;
+ALTER TABLE sst.borradores_extraccion
+  ADD COLUMN IF NOT EXISTS fecha_programada TIMESTAMPTZ;
+ALTER TABLE sst.borradores_extraccion
+  ADD COLUMN IF NOT EXISTS deshabilitado BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE sst.borradores_extraccion
+  ADD COLUMN IF NOT EXISTS deshabilitado_en TIMESTAMPTZ;
+ALTER TABLE sst.borradores_extraccion
+  ADD COLUMN IF NOT EXISTS deshabilitado_por UUID REFERENCES sst.usuarios(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_borradores_deshabilitado ON sst.borradores_extraccion(deshabilitado);
+CREATE INDEX IF NOT EXISTS idx_borradores_prof          ON sst.borradores_extraccion(profesional_asignado_id);
+
+-- Ocupaciones (agenda) del profesional: franjas fecha+hora en que NO está disponible.
+-- Alimenta el calendario del modal "Asignar profesional".
+CREATE TABLE IF NOT EXISTS sst.ocupaciones_profesional (
+  id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  profesional_id UUID NOT NULL REFERENCES sst.profesionales(id) ON DELETE CASCADE,
+  fecha          DATE NOT NULL,
+  hora_inicio    TIME NOT NULL,
+  hora_fin       TIME NOT NULL,
+  motivo         TEXT,
+  creado_por     UUID REFERENCES sst.usuarios(id) ON DELETE SET NULL,
+  creado_en      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT chk_ocupacion_rango CHECK (hora_fin > hora_inicio)
+);
+CREATE INDEX IF NOT EXISTS idx_ocupaciones_prof  ON sst.ocupaciones_profesional(profesional_id);
+CREATE INDEX IF NOT EXISTS idx_ocupaciones_fecha ON sst.ocupaciones_profesional(profesional_id, fecha);
+
 -- M4 · Documentos generados (formatos PDF auto-diligenciados) ------------------
 CREATE TABLE IF NOT EXISTS sst.documentos_generados (
   id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),

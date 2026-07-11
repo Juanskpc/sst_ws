@@ -10,7 +10,7 @@
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
     "migrate": "node db/migrate.js",
-    "seed:admin": "node db/seed-admin.js"
+    "seed:demo": "node db/seed-demo.js"
   },
   "dependencies": {
     "@google/genai": "^2.10.0",
