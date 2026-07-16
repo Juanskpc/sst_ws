@@ -1,5 +1,6 @@
 import ExcelJS from 'exceljs';
-import { CANONICAL_FIELDS, extractFromPdf, classifyPdfArl } from './gemini.service.js';
+import { CANONICAL_FIELDS, classifyPdfArl } from './gemini.service.js';
+import { extractPdfWithOpenAI } from './openai-extraction.bridge.js';
 
 /** Promedio de confianzas → confianza general de la OS (0-100). */
 export function computeOverallConfidence(fields) {
@@ -98,6 +99,6 @@ export async function runExtraction({ buffer, mime, arlHint }) {
   }
   // PDF: clasificar ARL si no viene forzada.
   const arlNombre = arlHint || (await classifyPdfArl(buffer));
-  const { fields, engine } = await extractFromPdf(buffer, arlNombre);
+  const { fields, engine } = await extractPdfWithOpenAI(buffer);
   return { arlNombre, records: [{ fields, engine }] };
 }
