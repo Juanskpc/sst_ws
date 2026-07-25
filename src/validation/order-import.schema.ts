@@ -56,21 +56,52 @@ const campoDescripcion = z.strictObject({
   confidence: confianza,
 });
 
-/** Contacto SST (costura M8): nombre, teléfono y correo, cada uno con su confianza. */
+/** Contacto SST (costura M8): responsable real de SST en la empresa cliente. */
 const contactoSstSchema = z.strictObject({
   nombre: campoTexto('contacto SST · nombre'),
   telefono: campoTexto('contacto SST · teléfono'),
   correo: campoTexto('contacto SST · correo'),
 });
 
-/** Esquema completo de una OS extraída por el pipeline IA. */
+/** Persona de contacto de la empresa cliente (p. ej. representante legal en AXA). */
+const contactoEmpresaSchema = z.strictObject({
+  nombre: campoTexto('contacto empresa · nombre'),
+  cargo: campoTexto('contacto empresa · cargo'),
+  telefono: campoTexto('contacto empresa · teléfono'),
+});
+
+/**
+ * Esquema completo de una OS extraída por el pipeline IA.
+ *
+ * Cobertura por ARL (una misma orden nunca trae todos los campos):
+ *  • Bolívar (Excel SIPAB): cronograma + secuencia, nit/empresa, actividad, horas, descripción.
+ *  • AXA Colpatria (PDF): numero_orden, fechas, afiliación, valores, ciudad/dirección,
+ *    tipo_actividad/modalidad, contacto empresa + contacto SST (en OBSERVACIONES).
+ *  • Colmena (PDF): numero_orden, nit/empresa, ciudad_ejecucion, descripción, horas.
+ * Los campos que una ARL no trae salen como { value: null }.
+ */
 export const OrderImportSchema = z.strictObject({
+  // Identidad
+  numero_orden: campoTexto('número de orden'),
   codigo_cronograma: campoTexto('cronograma'),
   secuencia: campoTexto('secuencia'),
+  nro_afiliacion: campoTexto('número de afiliación'),
+  // Empresa / actividad
   nit_nic: campoTexto('NIT/NIC'),
   empresa_nombre: campoTexto('empresa'),
   actividad_economica: campoTexto('actividad'),
+  tipo_actividad: campoTexto('tipo de actividad'),
+  modalidad: campoTexto('modalidad'),
+  // Logística
   horas_asignadas: campoNumero('horas'),
+  valor_unitario: campoNumero('valor unitario'),
+  valor_total: campoNumero('valor total'),
+  fecha_orden: campoTexto('fecha de la orden'),
+  fecha_vencimiento: campoTexto('fecha de vencimiento'),
+  ciudad_ejecucion: campoTexto('ciudad de ejecución'),
+  direccion: campoTexto('dirección'),
+  // Contactos y detalle
+  contacto_empresa: contactoEmpresaSchema,
   contacto_sst: contactoSstSchema,
   descripcion: campoDescripcion,
   overall_confidence: confianza.nullable(),

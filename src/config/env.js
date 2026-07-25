@@ -18,11 +18,33 @@ export const env = {
   jwtSecret: process.env.JWT_SECRET || 'dev-insecure-secret',
   jwtExpiresIn: process.env.JWT_EXPIRES_IN || '8h',
 
-  admin: {
-    nombre: process.env.ADMIN_NOMBRE || 'Administrador',
-    email: process.env.ADMIN_EMAIL || 'admin@jdd.com',
-    documento: process.env.ADMIN_DOCUMENTO || '1234567890',
-    password: process.env.ADMIN_PASSWORD || 'Admin123*',
+  // Administrador Maestro: cuenta exclusiva del equipo de desarrollo (es_maestro).
+  // Única con capacidad de crear/gestionar usuarios internos del sistema.
+  maestro: {
+    nombre: process.env.MAESTRO_NOMBRE || 'Administrador Maestro JD&D',
+    email: (process.env.MAESTRO_EMAIL || 'admin@jdd.com').toLowerCase(),
+    documento: process.env.MAESTRO_DOCUMENTO || '9999999999',
+    password: process.env.MAESTRO_PASSWORD || process.env.ADMIN_PASSWORD || 'Maestro123*',
+  },
+
+  // Cuenta del cliente (administradora operativa). Conserva el rol 'admin' y el
+  // documento con el que el cliente ya inicia sesión; NO es maestro.
+  cliente: {
+    nombre: process.env.CLIENTE_NOMBRE || 'Administrador JD&D',
+    email: (process.env.CLIENTE_EMAIL || 'juanskpc@gmail.com').toLowerCase(),
+    documento: process.env.CLIENTE_DOCUMENTO || '1234567890',
+    celular: process.env.CLIENTE_CELULAR || '3188887013',
+    // Solo se usa si la cuenta no existe aún (alta inicial); nunca pisa el hash actual.
+    password: process.env.CLIENTE_PASSWORD || process.env.ADMIN_PASSWORD || 'Admin123*',
+  },
+
+  auth: {
+    // Vida útil del token de recuperación de contraseña (minutos).
+    resetTokenTtlMinutes: parseInt(process.env.RESET_TOKEN_TTL_MINUTES || '60', 10),
+    // Rate limiting de /auth/forgot-password: máx. solicitudes por ventana.
+    resetRateWindowMinutes: parseInt(process.env.RESET_RATE_WINDOW_MINUTES || '15', 10),
+    resetRateMax: parseInt(process.env.RESET_RATE_MAX || '3', 10),
+    passwordMinLength: parseInt(process.env.PASSWORD_MIN_LENGTH || '8', 10),
   },
 
   storage: {

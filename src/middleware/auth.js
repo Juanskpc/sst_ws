@@ -22,3 +22,15 @@ export function requireRole(...roles) {
     next();
   };
 }
+
+/**
+ * Exclusivo del Administrador Maestro (equipo de desarrollo): gestión de
+ * usuarios internos y tareas de mantenimiento. El flag viaja en el JWT.
+ */
+export function requireMaestro(req, _res, next) {
+  if (!req.user) return next(unauthorized());
+  if (req.user.es_maestro !== true) {
+    return next(forbidden('Operación exclusiva del Administrador Maestro'));
+  }
+  next();
+}

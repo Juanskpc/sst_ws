@@ -20,26 +20,58 @@ async function runSqlFile(client, file) {
   console.log('ok');
 }
 
-async function seedAdmin(client) {
-  const { nombre, email, documento, password } = env.admin;
-  const hash = await bcrypt.hash(password, 10);
-  const res = await client.query(
-    `INSERT INTO sst.usuarios (nombre, correo, documento_identidad, contrasena_hash, rol)
-     VALUES ($1, $2, $3, $4, 'admin')
+/**
+ * Separa el antiguo admin único en dos cuentas:
+ *  1. CLIENTE  — conserva el documento con el que ya inicia sesión (y su
+ *     contraseña actual); se actualizan correo y celular. Rol 'admin' intacto.
+ *  2. MAESTRO  — Administrador Maestro (es_maestro=TRUE), exclusivo del equipo
+ *     de desarrollo; único que administra usuarios internos.
+ * Idempotente: re-ejecutar no duplica ni pisa contraseñas existentes.
+ */
+async function seedCuentas(client) {
+  const { cliente, maestro } = env;
+
+  // --- 1 · Cuenta del cliente (por documento; el correo puede haber cambiado) --
+  const upd = await client.query(
+    `UPDATE sst.usuarios
+        SET correo = $2, telefono = $3, es_maestro = FALSE, rol = 'admin',
+            actualizado_en = now()
+      WHERE documento_identidad = $1
+      RETURNING id`,
+    [cliente.documento, cliente.email, cliente.celular]
+  );
+  if (upd.rowCount > 0) {
+    console.log(`  → cliente actualizado: documento ${cliente.documento} · ${cliente.email} · cel ${cliente.celular}`);
+  } else {
+    const hash = await bcrypt.hash(cliente.password, 10);
+    await client.query(
+      `INSERT INTO sst.usuarios (nombre, correo, documento_identidad, contrasena_hash, rol, telefono)
+       VALUES ($1, $2, $3, $4, 'admin', $5)
+       ON CONFLICT (correo) DO NOTHING`,
+      [cliente.nombre, cliente.email, cliente.documento, hash, cliente.celular]
+    );
+    console.log(`  → cliente creado: documento ${cliente.documento} · ${cliente.email}`);
+  }
+
+  // --- 2 · Administrador Maestro (correo liberado por el paso anterior) -------
+  const hashMaestro = await bcrypt.hash(maestro.password, 10);
+  const ins = await client.query(
+    `INSERT INTO sst.usuarios (nombre, correo, documento_identidad, contrasena_hash, rol, es_maestro)
+     VALUES ($1, $2, $3, $4, 'admin', TRUE)
      ON CONFLICT (correo) DO NOTHING
      RETURNING id`,
-    [nombre, email, documento, hash]
+    [maestro.nombre, maestro.email, maestro.documento, hashMaestro]
   );
-  if (res.rowCount > 0) {
-    console.log(`  → admin creado: ${email} · documento ${documento}`);
+  if (ins.rowCount > 0) {
+    console.log(`  → Administrador Maestro creado: ${maestro.email} · documento ${maestro.documento}`);
   } else {
-    // Asegura el documento en admins ya existentes que no lo tengan.
+    // Ya existía: asegura el flag sin tocar su contraseña.
     await client.query(
-      `UPDATE sst.usuarios SET documento_identidad = $2
-       WHERE correo = $1 AND documento_identidad IS NULL`,
-      [email, documento]
+      `UPDATE sst.usuarios SET es_maestro = TRUE, rol = 'admin', actualizado_en = now()
+       WHERE correo = $1 AND NOT es_maestro`,
+      [maestro.email]
     );
-    console.log(`  → admin ya existía: ${email} · documento asegurado (${documento})`);
+    console.log(`  → Administrador Maestro ya existía: ${maestro.email} · flag asegurado`);
   }
 }
 
@@ -66,7 +98,7 @@ async function main() {
   try {
     await runSqlFile(client, 'schema.sql');
     await runSqlFile(client, 'seed.sql');
-    await seedAdmin(client);
+    await seedCuentas(client);
     await seedSampleProfessionals(client);
     console.log('== Migración completa ✔ ==');
   } finally {

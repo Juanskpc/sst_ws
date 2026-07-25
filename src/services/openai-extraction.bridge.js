@@ -16,23 +16,38 @@ function deps() {
 }
 
 // Mapeo OpenAI → pipeline JS (matriz de compatibilidad):
-//  • contacto_sst.* anidado → contacto_sst_* plano
-//  • value null/undefined → ''  ·  horas_asignadas number → String
+//  • contacto_sst.* / contacto_empresa.* anidados → *_nombre/_cargo/... planos
+//  • value null/undefined → ''  ·  números → String
 //  • confidence 1:1  ·  overall_confidence NO se propaga (lo recalcula el pipeline)
 function aFieldsPlanos(data) {
   const s = (v) => (v === null || v === undefined ? '' : String(v));
-  const c = data.contacto_sst;
+  const campo = (f) => ({ value: s(f.value), confidence: f.confidence });
+  const cs = data.contacto_sst;
+  const ce = data.contacto_empresa;
   return {
-    codigo_cronograma:     { value: s(data.codigo_cronograma.value),   confidence: data.codigo_cronograma.confidence },
-    secuencia:             { value: s(data.secuencia.value),           confidence: data.secuencia.confidence },
-    nit_nic:               { value: s(data.nit_nic.value),             confidence: data.nit_nic.confidence },
-    empresa_nombre:        { value: s(data.empresa_nombre.value),      confidence: data.empresa_nombre.confidence },
-    actividad_economica:   { value: s(data.actividad_economica.value), confidence: data.actividad_economica.confidence },
-    horas_asignadas:       { value: s(data.horas_asignadas.value),     confidence: data.horas_asignadas.confidence },
-    contacto_sst_nombre:   { value: s(c.nombre.value),                 confidence: c.nombre.confidence },
-    contacto_sst_telefono: { value: s(c.telefono.value),               confidence: c.telefono.confidence },
-    contacto_sst_correo:   { value: s(c.correo.value),                 confidence: c.correo.confidence },
-    descripcion:           { value: s(data.descripcion.value),         confidence: data.descripcion.confidence },
+    numero_orden:          campo(data.numero_orden),
+    codigo_cronograma:     campo(data.codigo_cronograma),
+    secuencia:             campo(data.secuencia),
+    nro_afiliacion:        campo(data.nro_afiliacion),
+    nit_nic:               campo(data.nit_nic),
+    empresa_nombre:        campo(data.empresa_nombre),
+    actividad_economica:   campo(data.actividad_economica),
+    tipo_actividad:        campo(data.tipo_actividad),
+    modalidad:             campo(data.modalidad),
+    horas_asignadas:       campo(data.horas_asignadas),
+    valor_unitario:        campo(data.valor_unitario),
+    valor_total:           campo(data.valor_total),
+    fecha_orden:           campo(data.fecha_orden),
+    fecha_vencimiento:     campo(data.fecha_vencimiento),
+    ciudad_ejecucion:      campo(data.ciudad_ejecucion),
+    direccion:             campo(data.direccion),
+    contacto_empresa_nombre:   campo(ce.nombre),
+    contacto_empresa_cargo:    campo(ce.cargo),
+    contacto_empresa_telefono: campo(ce.telefono),
+    contacto_sst_nombre:   campo(cs.nombre),
+    contacto_sst_telefono: campo(cs.telefono),
+    contacto_sst_correo:   campo(cs.correo),
+    descripcion:           campo(data.descripcion),
   };
 }
 

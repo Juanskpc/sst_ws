@@ -24,10 +24,15 @@ import { env } from '../config/env.js';
  * vigentes en la documentación oficial de Gemini.
  */
 
-// Campos canónicos IMP-06 (cada uno { value, confidence }).
+// Campos canónicos IMP-06 (forma PLANA: cada uno { value, confidence }).
+// Los contactos anidados del esquema OpenAI se aplanan a *_nombre/_cargo/... aquí.
+// Ninguna ARL trae todos: los ausentes salen con value vacío/null.
 export const CANONICAL_FIELDS = [
-  'codigo_cronograma', 'secuencia', 'nit_nic', 'empresa_nombre',
-  'actividad_economica', 'horas_asignadas',
+  'numero_orden', 'codigo_cronograma', 'secuencia', 'nro_afiliacion',
+  'nit_nic', 'empresa_nombre', 'actividad_economica', 'tipo_actividad', 'modalidad',
+  'horas_asignadas', 'valor_unitario', 'valor_total',
+  'fecha_orden', 'fecha_vencimiento', 'ciudad_ejecucion', 'direccion',
+  'contacto_empresa_nombre', 'contacto_empresa_cargo', 'contacto_empresa_telefono',
   'contacto_sst_nombre', 'contacto_sst_telefono', 'contacto_sst_correo',
   'descripcion',
 ];
@@ -41,7 +46,7 @@ const fieldSchema = {
 export const EXTRACTION_SCHEMA = {
   type: 'object',
   properties: Object.fromEntries(CANONICAL_FIELDS.map((f) => [f, fieldSchema])),
-  required: CANONICAL_FIELDS.filter((f) => !f.startsWith('contacto_sst_')),
+  required: CANONICAL_FIELDS.filter((f) => !f.startsWith('contacto_')),
 };
 
 let _ai = null;

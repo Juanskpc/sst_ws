@@ -29,12 +29,20 @@ async function processBatch({ batchId, buffer, mime, arlHint }) {
   for (const rec of records) {
     const fields = rec.fields;
     const overall = computeOverallConfidence(fields);
+    const numeroOrden = fields.numero_orden?.value || null;
     const cron = fields.codigo_cronograma?.value || null;
     const sec = fields.secuencia?.value || null;
 
-    // Dedup IMP-07/09 contra OS ya persistidas.
+    // Dedup IMP-07/09 contra OS ya persistidas, según la identidad de la ARL:
+    // AXA/Colmena por numero_orden; Bolívar por (cronograma + secuencia).
     let duplicadoDe = null;
-    if (arlId && cron && sec) {
+    if (arlId && numeroOrden) {
+      const dup = await pool.query(
+        `SELECT id FROM sst.ordenes_servicio WHERE arl_id=$1 AND numero_orden=$2`,
+        [arlId, numeroOrden]
+      );
+      duplicadoDe = dup.rows[0]?.id || null;
+    } else if (arlId && cron && sec) {
       const dup = await pool.query(
         `SELECT id FROM sst.ordenes_servicio
          WHERE arl_id=$1 AND codigo_cronograma=$2 AND secuencia=$3`,

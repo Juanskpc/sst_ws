@@ -12,3 +12,4 @@ export const unauthorized = (msg = 'No autenticado') => new HttpError(401, msg);
 export const forbidden    = (msg = 'No autorizado') => new HttpError(403, msg);
 export const notFound     = (msg = 'Recurso no encontrado') => new HttpError(404, msg);
 export const conflict     = (msg, d) => new HttpError(409, msg, d);
+export const tooManyRequests = (msg = 'Demasiadas solicitudes, intente más tarde') => new HttpError(429, msg);

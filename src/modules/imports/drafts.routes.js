@@ -9,6 +9,30 @@ import { CANONICAL_FIELDS } from '../../services/gemini.service.js';
 const router = Router();
 router.use(authRequired);
 
+/** "588.560,00" | "$ 58.856" | 588560 → 588560. Devuelve number o null. */
+function parseNumeroCO(raw) {
+  if (raw == null || raw === '') return null;
+  let s = String(raw).trim().replace(/[^\d.,-]/g, '');
+  if (!s) return null;
+  const hasComma = s.includes(',');
+  const hasDot = s.includes('.');
+  if (hasComma && hasDot) s = s.replace(/\./g, '').replace(',', '.'); // CO: . miles, , decimal
+  else if (hasComma) s = s.replace(',', '.');
+  const n = parseFloat(s);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** "26/06/2026" | "2026-06-26" → "YYYY-MM-DD". Devuelve string ISO o null. */
+function parseFechaCO(raw) {
+  if (!raw) return null;
+  const s = String(raw).trim();
+  let m = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(s);
+  if (m) return `${m[3]}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}`;
+  m = /^(\d{4})-(\d{2})-(\d{2})/.exec(s);
+  if (m) return `${m[1]}-${m[2]}-${m[3]}`;
+  return null;
+}
+
 // SELECT base con nombres legibles (ARL, archivo del lote y profesional asignado).
 const DRAFT_SELECT = `
   SELECT d.*, a.nombre AS arl_nombre, b.nombre_archivo, b.tipo_mime,
@@ -139,16 +163,29 @@ router.post('/:id/validate', requireRole('admin'), asyncHandler(async (req, res)
 
     const m = draft.metadatos_extraccion || {};
     const val = (f) => (m[f]?.value ?? null) || null;
+    const numeroOrden = val('numero_orden');
     const cron = val('codigo_cronograma');
     const sec = val('secuencia');
-    if (!cron || !sec) throw badRequest('codigo_cronograma y secuencia son obligatorios');
 
-    // Dedup IMP-09 (defensa adicional a la constraint UNIQUE).
-    const dup = await client.query(
-      `SELECT id FROM sst.ordenes_servicio WHERE arl_id=$1 AND codigo_cronograma=$2 AND secuencia=$3`,
-      [draft.arl_id, cron, sec]
-    );
-    if (dup.rows[0]) throw conflict('OS duplicada por (ARL + cronograma + secuencia)');
+    // Identidad por ARL: Bolívar usa cronograma+secuencia; AXA/Colmena, numero_orden.
+    if (!numeroOrden && !(cron && sec)) {
+      throw badRequest('La OS necesita numero_orden, o bien codigo_cronograma + secuencia');
+    }
+
+    // Dedup IMP-09 según la identidad disponible (defensa adicional al índice UNIQUE).
+    if (numeroOrden) {
+      const dup = await client.query(
+        `SELECT id FROM sst.ordenes_servicio WHERE arl_id=$1 AND numero_orden=$2`,
+        [draft.arl_id, numeroOrden]
+      );
+      if (dup.rows[0]) throw conflict('OS duplicada por (ARL + número de orden)');
+    } else {
+      const dup = await client.query(
+        `SELECT id FROM sst.ordenes_servicio WHERE arl_id=$1 AND codigo_cronograma=$2 AND secuencia=$3`,
+        [draft.arl_id, cron, sec]
+      );
+      if (dup.rows[0]) throw conflict('OS duplicada por (ARL + cronograma + secuencia)');
+    }
 
     // Código legible OS-YYYY-NNNN.
     const year = new Date().getFullYear();
@@ -159,17 +196,25 @@ router.post('/:id/validate', requireRole('admin'), asyncHandler(async (req, res)
 
     const ord = await client.query(
       `INSERT INTO sst.ordenes_servicio (
-         codigo, arl_id, codigo_cronograma, secuencia, nit_nic, empresa_nombre,
-         actividad_economica, horas_asignadas, descripcion,
+         codigo, arl_id, numero_orden, codigo_cronograma, secuencia, nro_afiliacion,
+         nit_nic, empresa_nombre, actividad_economica, tipo_actividad, modalidad,
+         horas_asignadas, valor_unitario, valor_total,
+         fecha_orden, fecha_vencimiento, ciudad_ejecucion, direccion, descripcion,
+         contacto_empresa_nombre, contacto_empresa_cargo, contacto_empresa_telefono,
          contacto_sst_nombre, contacto_sst_telefono, contacto_sst_correo,
          lote_importacion_id, url_archivo_original, metadatos_extraccion, estado)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'SIN PROGRAMAR')
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,
+               $20,$21,$22,$23,$24,$25,$26,$27,$28,'SIN PROGRAMAR')
        RETURNING *`,
       [
-        codigo, draft.arl_id, cron, sec, val('nit_nic'), val('empresa_nombre'),
-        val('actividad_economica'),
-        val('horas_asignadas') ? parseFloat(String(val('horas_asignadas')).replace(',', '.')) : null,
-        val('descripcion'),
+        codigo, draft.arl_id, numeroOrden, cron, sec, val('nro_afiliacion'),
+        val('nit_nic'), val('empresa_nombre'), val('actividad_economica'),
+        val('tipo_actividad'), val('modalidad'),
+        parseNumeroCO(val('horas_asignadas')), parseNumeroCO(val('valor_unitario')),
+        parseNumeroCO(val('valor_total')),
+        parseFechaCO(val('fecha_orden')), parseFechaCO(val('fecha_vencimiento')),
+        val('ciudad_ejecucion'), val('direccion'), val('descripcion'),
+        val('contacto_empresa_nombre'), val('contacto_empresa_cargo'), val('contacto_empresa_telefono'),
         val('contacto_sst_nombre'), val('contacto_sst_telefono'), val('contacto_sst_correo'),
         draft.lote_importacion_id, draft.url_archivo_original, m,
       ]

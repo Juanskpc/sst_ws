@@ -55,6 +55,9 @@ EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 -- M1 · Usuarios / Auth ---------------------------------------------------------
 -- Login por DOCUMENTO DE IDENTIDAD (varchar) + contraseña. El correo se conserva
 -- para notificaciones y recuperación de contraseña (AUTH-03).
+-- `es_maestro`: marca al Administrador Maestro (cuenta exclusiva del equipo de
+-- desarrollo). Mantiene rol 'admin' para no alterar los permisos existentes; las
+-- capacidades exclusivas (gestión de usuarios internos) se validan sobre el flag.
 CREATE TABLE IF NOT EXISTS sst.usuarios (
   id                       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   documento_identidad      VARCHAR(30) UNIQUE,
@@ -65,15 +68,66 @@ CREATE TABLE IF NOT EXISTS sst.usuarios (
   telefono                 TEXT,
   especialidad             TEXT,
   activo                   BOOLEAN NOT NULL DEFAULT TRUE,
-  -- Recuperación de contraseña por correo (AUTH-03)
-  token_recuperacion       TEXT,
-  token_recuperacion_expira TIMESTAMPTZ,
+  es_maestro               BOOLEAN NOT NULL DEFAULT FALSE,
+  -- Costuras de autenticación robusta (verificación de correo y bloqueo por
+  -- intentos): columnas listas, la lógica se activa en iteraciones futuras.
+  correo_verificado_en     TIMESTAMPTZ,
+  intentos_fallidos        INT NOT NULL DEFAULT 0,
+  bloqueado_hasta          TIMESTAMPTZ,
+  contrasena_actualizada_en TIMESTAMPTZ,
   creado_en                TIMESTAMPTZ NOT NULL DEFAULT now(),
   actualizado_en           TIMESTAMPTZ NOT NULL DEFAULT now()
 );
--- Para bases ya existentes: agrega la columna sin perder datos.
+-- Para bases ya existentes: agrega columnas sin perder datos.
 ALTER TABLE sst.usuarios ADD COLUMN IF NOT EXISTS documento_identidad VARCHAR(30);
+ALTER TABLE sst.usuarios ADD COLUMN IF NOT EXISTS es_maestro BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE sst.usuarios ADD COLUMN IF NOT EXISTS correo_verificado_en TIMESTAMPTZ;
+ALTER TABLE sst.usuarios ADD COLUMN IF NOT EXISTS intentos_fallidos INT NOT NULL DEFAULT 0;
+ALTER TABLE sst.usuarios ADD COLUMN IF NOT EXISTS bloqueado_hasta TIMESTAMPTZ;
+ALTER TABLE sst.usuarios ADD COLUMN IF NOT EXISTS contrasena_actualizada_en TIMESTAMPTZ;
+-- Los tokens de recuperación ya no viven en texto plano sobre usuarios:
+-- se hashean en sst.tokens_autenticacion (ver más abajo).
+ALTER TABLE sst.usuarios DROP COLUMN IF EXISTS token_recuperacion;
+ALTER TABLE sst.usuarios DROP COLUMN IF EXISTS token_recuperacion_expira;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_usuarios_documento ON sst.usuarios(documento_identidad);
+-- Garantiza a nivel de BD que exista a lo sumo UN Administrador Maestro.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_usuarios_maestro ON sst.usuarios(es_maestro) WHERE es_maestro;
+
+-- AUTH-03 · Tokens de autenticación de un solo uso -----------------------------
+-- Base común para recuperación de contraseña HOY y verificación de correo en el
+-- futuro. El token en claro solo viaja en el correo; aquí se guarda su SHA-256.
+DO $$ BEGIN
+  CREATE TYPE sst.proposito_token AS ENUM ('recuperacion_contrasena', 'verificacion_correo');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+CREATE TABLE IF NOT EXISTS sst.tokens_autenticacion (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  usuario_id  UUID NOT NULL REFERENCES sst.usuarios(id) ON DELETE CASCADE,
+  proposito   sst.proposito_token NOT NULL DEFAULT 'recuperacion_contrasena',
+  token_hash  TEXT NOT NULL UNIQUE,          -- SHA-256 hex del token en claro
+  expira_en   TIMESTAMPTZ NOT NULL,
+  usado_en    TIMESTAMPTZ,                   -- un solo uso: NULL = vigente
+  ip          TEXT,
+  user_agent  TEXT,
+  creado_en   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_tokens_aut_usuario ON sst.tokens_autenticacion(usuario_id, proposito);
+
+-- AUTH-06 · Auditoría de eventos de autenticación ------------------------------
+-- Evento como TEXT (no enum) para poder auditar nuevos eventos sin migrar tipos.
+CREATE TABLE IF NOT EXISTS sst.eventos_autenticacion (
+  id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  usuario_id UUID REFERENCES sst.usuarios(id) ON DELETE SET NULL,
+  correo     TEXT,
+  evento     TEXT NOT NULL,   -- login_exitoso | login_fallido | recuperacion_solicitada | ...
+  exito      BOOLEAN,
+  ip         TEXT,
+  user_agent TEXT,
+  datos      JSONB,
+  creado_en  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_eventos_aut_usuario ON sst.eventos_autenticacion(usuario_id);
+CREATE INDEX IF NOT EXISTS idx_eventos_aut_evento  ON sst.eventos_autenticacion(evento, creado_en);
 
 -- CFG-01 · Profesionales (asesores de campo) ----------------------------------
 CREATE TABLE IF NOT EXISTS sst.profesionales (
@@ -130,15 +184,30 @@ CREATE TABLE IF NOT EXISTS sst.ordenes_servicio (
   id                       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   codigo                   TEXT UNIQUE,       -- código legible tipo OS-2026-0148 (autogenerado)
   arl_id                   UUID NOT NULL REFERENCES sst.arls(id),
-  codigo_cronograma        TEXT NOT NULL,
-  secuencia                TEXT NOT NULL,
+  -- Identidad por ARL: Bolívar usa (cronograma + secuencia); AXA/Colmena usan
+  -- numero_orden. Por eso cronograma/secuencia son NULLABLE (ver índices abajo).
+  numero_orden             TEXT,
+  codigo_cronograma        TEXT,
+  secuencia                TEXT,
+  nro_afiliacion           TEXT,
   nit_nic                  TEXT,
   empresa_nombre           TEXT,
   actividad_economica      TEXT,
+  tipo_actividad           TEXT,
+  modalidad                TEXT,
   horas_asignadas          NUMERIC(8,2),
+  valor_unitario           NUMERIC(14,2),
+  valor_total              NUMERIC(14,2),
+  fecha_orden              DATE,
+  fecha_vencimiento        DATE,
+  ciudad_ejecucion         TEXT,
+  direccion                TEXT,
   fecha_carga              TIMESTAMPTZ NOT NULL DEFAULT now(),
   descripcion              TEXT,
-  contacto_sst_nombre      TEXT,             -- 🔗 costura M8 (encuesta Fase 2)
+  contacto_empresa_nombre  TEXT,             -- persona administrativa de la empresa cliente
+  contacto_empresa_cargo   TEXT,
+  contacto_empresa_telefono TEXT,
+  contacto_sst_nombre      TEXT,             -- 🔗 costura M8 (encuesta Fase 2): responsable SST real
   contacto_sst_telefono    TEXT,
   contacto_sst_correo      TEXT,
   estado                   sst.estado_orden NOT NULL DEFAULT 'SIN PROGRAMAR',
@@ -150,9 +219,31 @@ CREATE TABLE IF NOT EXISTS sst.ordenes_servicio (
   metadatos_extraccion     JSONB,            -- extracción cruda IA + confidencias por campo
   creado_en                TIMESTAMPTZ NOT NULL DEFAULT now(),
   actualizado_en           TIMESTAMPTZ NOT NULL DEFAULT now(),
-  -- IMP-09: evitar duplicados por (ARL + cronograma + secuencia)
+  -- IMP-09: dedup de Bolívar por (ARL + cronograma + secuencia). Postgres trata
+  -- los NULL como distintos, así que las filas de AXA/Colmena (cronograma NULL)
+  -- no colisionan aquí; su unicidad la cubre uq_ordenes_numero (abajo).
   CONSTRAINT uq_ordenes_dedup UNIQUE (arl_id, codigo_cronograma, secuencia)
 );
+-- Para bases ya existentes: agrega columnas nuevas y relaja los NOT NULL previos.
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS numero_orden TEXT;
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS nro_afiliacion TEXT;
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS tipo_actividad TEXT;
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS modalidad TEXT;
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS valor_unitario NUMERIC(14,2);
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS valor_total NUMERIC(14,2);
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS fecha_orden DATE;
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS fecha_vencimiento DATE;
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS ciudad_ejecucion TEXT;
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS direccion TEXT;
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS contacto_empresa_nombre TEXT;
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS contacto_empresa_cargo TEXT;
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS contacto_empresa_telefono TEXT;
+ALTER TABLE sst.ordenes_servicio ALTER COLUMN codigo_cronograma DROP NOT NULL;
+ALTER TABLE sst.ordenes_servicio ALTER COLUMN secuencia DROP NOT NULL;
+-- Unicidad de AXA/Colmena por (ARL + numero_orden). Parcial: solo aplica cuando
+-- numero_orden viene informado (las OS de Bolívar lo dejan NULL).
+CREATE UNIQUE INDEX IF NOT EXISTS uq_ordenes_numero
+  ON sst.ordenes_servicio (arl_id, numero_orden) WHERE numero_orden IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_ordenes_estado      ON sst.ordenes_servicio(estado);
 CREATE INDEX IF NOT EXISTS idx_ordenes_arl         ON sst.ordenes_servicio(arl_id);
 CREATE INDEX IF NOT EXISTS idx_ordenes_prof        ON sst.ordenes_servicio(profesional_asignado_id);
@@ -430,7 +521,10 @@ END; $$ LANGUAGE plpgsql;
 -- =============================================================================
 
 -- Listado expandido de OS con nombres legibles (apoya M3 / Informes).
-CREATE OR REPLACE VIEW sst.vw_ordenes_expandidas AS
+-- Se re-crea desde cero (no OR REPLACE) porque `o.*` cambia de columnas cuando
+-- se agregan campos a ordenes_servicio, y CREATE OR REPLACE no admite reordenar.
+DROP VIEW IF EXISTS sst.vw_ordenes_expandidas;
+CREATE VIEW sst.vw_ordenes_expandidas AS
 SELECT o.*,
        a.nombre         AS arl_nombre,
        a.formato_origen AS arl_formato,

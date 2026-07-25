@@ -33,8 +33,15 @@ npm run dev
 node scripts/smoke.js
 ```
 
-Login por **documento de identidad** + contraseña. Admin inicial (configurable en
-`.env`): documento `1234567890` / `Admin123*` (correo `admin@jdd.com` para recuperación).
+Login por **documento de identidad** + contraseña. Existen **dos cuentas admin
+separadas** (configurables en `.env`, ver `docs/06-auth-y-seguridad.md`):
+
+- **Administrador Maestro** (exclusivo del equipo de desarrollo): documento
+  `9999999999` / `MAESTRO_PASSWORD` (correo `admin@jdd.com`). Único que puede
+  crear/gestionar usuarios internos (`es_maestro`).
+- **Cuenta del cliente** (operación diaria): documento `1234567890` (correo
+  `juanskpc@gmail.com`, cel `3188887013`). Rol `admin` normal, sin gestión de
+  usuarios; su contraseña no cambia con las migraciones.
 
 ## Arquitectura
 
@@ -75,7 +82,9 @@ src/
   `CANCELADA` y en rechazos de verificación, actualiza la OS y escribe la auditoría
   en `historial_estados_orden` de forma atómica.
 - Trigger `fn_bloquear_regresion_ejecutada`: bloquea cualquier retroceso desde `EJECUTADA`.
-- `UNIQUE(arl_id, codigo_cronograma, secuencia)`: dedup IMP-09.
+- Dedup IMP-09 **según la ARL**: `UNIQUE(arl_id, codigo_cronograma, secuencia)` para
+  Bolívar y `UNIQUE(arl_id, numero_orden)` (parcial) para AXA/Colmena. `numero_orden`
+  y `cronograma+secuencia` son excluyentes por ARL. Ver `docs/04-pipeline-ia.md`.
 
 ## Endpoints (prefijo `/api`)
 
@@ -84,9 +93,11 @@ src/
 | Health | GET | `/health` | — |
 | **M1 Auth** | POST | `/auth/login` | — |
 | | GET | `/auth/me` | auth |
-| | POST | `/auth/forgot-password` | — |
-| | POST | `/auth/reset-password` | — |
-| | POST | `/auth/usuarios` | admin |
+| | POST | `/auth/forgot-password` | — (rate limited, anti-enumeración) |
+| | POST | `/auth/reset-password` | — (token un solo uso, SHA-256 en BD) |
+| | POST/GET | `/auth/usuarios` | **maestro** |
+| | PUT | `/auth/usuarios/:id` | **maestro** |
+| | PATCH | `/auth/usuarios/:id/estado` | **maestro** |
 | **CFG-01** | GET/POST | `/professionals` | auth / admin |
 | | GET/PUT | `/professionals/:id` | auth / admin |
 | | PATCH | `/professionals/:id/estado` | admin |
@@ -137,6 +148,9 @@ src/
   clasificación de ARL, resúmenes y búsqueda NL reales; sin la key usan mock. **No**
   interviene en la extracción.
 - **Correo:** `EMAIL_DRIVER=smtp` + credenciales SMTP (por defecto `console`).
+- **Recuperación de contraseña:** `RESET_TOKEN_TTL_MINUTES` (60), `RESET_RATE_MAX`
+  (3) por `RESET_RATE_WINDOW_MINUTES` (15), `PASSWORD_MIN_LENGTH` (8). Cuentas
+  seed: `MAESTRO_*` y `CLIENTE_*`.
 - **Storage:** `STORAGE_DRIVER=local` (default, escribe en `./storage`) o `s3`
   (punto de extensión en `services/storage.service.js`).
 
