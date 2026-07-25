@@ -9,6 +9,7 @@ import filesRoutes from '../modules/files/files.routes.js';
 import notificationsRoutes from '../modules/notifications/notifications.routes.js';
 import reportsRoutes from '../modules/reports/reports.routes.js';
 import publicRoutes from '../modules/public/public.routes.js';
+import permissionsRoutes from '../modules/permissions/permissions.routes.js';
 
 const router = Router();
 
@@ -33,6 +34,8 @@ router.use('/files', filesRoutes);
 router.use('/notifications', notificationsRoutes);
 // M10
 router.use('/reports', reportsRoutes);
+// Roles y permisos (Configuración) — matriz de acceso por vista, exclusivo admin
+router.use('/permisos', permissionsRoutes);
 // Catálogos + Configuración (montado en '/', va al final por su comodín)
 router.use('/', catalogRoutes);
 

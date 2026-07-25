@@ -136,6 +136,18 @@ CREATE TABLE IF NOT EXISTS sst.eventos_autenticacion (
 CREATE INDEX IF NOT EXISTS idx_eventos_aut_usuario ON sst.eventos_autenticacion(usuario_id);
 CREATE INDEX IF NOT EXISTS idx_eventos_aut_evento  ON sst.eventos_autenticacion(evento, creado_en);
 
+-- Roles y permisos · matriz de acceso por vista (rol × vista → permitido) ------
+-- Vistas = ítems del sidebar: dashboard | importar | ordenes | informes |
+-- profesionales | configuracion. es_maestro (ver arriba) siempre tiene acceso
+-- total y no depende de esta tabla — es la salvaguarda ante un bloqueo accidental.
+CREATE TABLE IF NOT EXISTS sst.permisos_rol (
+  rol            sst.rol_usuario NOT NULL,
+  vista          TEXT NOT NULL,
+  permitido      BOOLEAN NOT NULL DEFAULT TRUE,
+  actualizado_en TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (rol, vista)
+);
+
 -- CFG-01 · Profesionales (asesores de campo) ----------------------------------
 CREATE TABLE IF NOT EXISTS sst.profesionales (
   id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),

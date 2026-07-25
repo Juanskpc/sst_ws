@@ -40,6 +40,18 @@ export async function auditar({ usuarioId = null, correo = null, evento, exito =
 
 export const ipDe = (req) => req?.ip || req?.socket?.remoteAddress || null;
 
+/** Vistas del sidebar gestionables desde Configuración → Roles y permisos. */
+export const VISTAS_SISTEMA = ['dashboard', 'importar', 'ordenes', 'informes', 'profesionales', 'configuracion'];
+
+/** Vistas permitidas para un rol (para armar la sesión del usuario autenticado). */
+export async function permisosDeRol(rol) {
+  const r = await pool.query(
+    `SELECT vista FROM sst.permisos_rol WHERE rol = $1 AND permitido = TRUE`,
+    [rol]
+  );
+  return r.rows.map((row) => row.vista);
+}
+
 /**
  * Genera un token de recuperación para el usuario: invalida los anteriores
  * pendientes, persiste solo el SHA-256 y envía el correo con el enlace.

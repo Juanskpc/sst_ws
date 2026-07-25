@@ -8,7 +8,7 @@ import { createRateLimiter } from '../../utils/rateLimit.js';
 import { env } from '../../config/env.js';
 import {
   EVENTOS, auditar, ipDe, emitirTokenRecuperacion, canjearTokenRecuperacion,
-  validarPolicyPassword,
+  validarPolicyPassword, permisosDeRol, VISTAS_SISTEMA,
 } from './auth.service.js';
 
 const router = Router();
@@ -18,6 +18,10 @@ const usuarioPublico = (u) => ({
   rol: u.rol, telefono: u.telefono, especialidad: u.especialidad, activo: u.activo,
   es_maestro: u.es_maestro === true,
 });
+
+/** Vistas del sidebar habilitadas para la sesión. Maestro = acceso total (bypass). */
+const permisosDeSesion = (usuario) =>
+  usuario.es_maestro === true ? VISTAS_SISTEMA : permisosDeRol(usuario.rol);
 
 // Rate limiting de recuperación (por IP y por correo, ventana configurable).
 const forgotLimiter = createRateLimiter({
@@ -58,14 +62,18 @@ router.post('/login', asyncHandler(async (req, res) => {
   // crear el usuario), se recomienda cambiarla. Se detecta comparando el claro
   // contra el documento, sin depender de ninguna columna que pueda quedar obsoleta.
   const requiereCambio = password === usuario.documento_identidad;
-  res.json({ token: signToken(usuario), usuario: usuarioPublico(usuario), requiere_cambio_contrasena: requiereCambio });
+  res.json({
+    token: signToken(usuario), usuario: usuarioPublico(usuario),
+    permisos: await permisosDeSesion(usuario),
+    requiere_cambio_contrasena: requiereCambio,
+  });
 }));
 
-// AUTH-05 · Perfil del usuario autenticado
+// AUTH-05 · Perfil del usuario autenticado (+ permisos vigentes de su rol)
 router.get('/me', authRequired, asyncHandler(async (req, res) => {
   const r = await pool.query(`SELECT * FROM sst.usuarios WHERE id=$1`, [req.user.sub]);
   if (!r.rows[0]) throw notFound('Usuario no encontrado');
-  res.json({ usuario: usuarioPublico(r.rows[0]) });
+  res.json({ usuario: usuarioPublico(r.rows[0]), permisos: await permisosDeSesion(r.rows[0]) });
 }));
 
 // AUTH-03 · Solicitud de recuperación de contraseña por correo.
