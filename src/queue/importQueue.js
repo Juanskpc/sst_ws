@@ -21,8 +21,8 @@ async function arlIdByName(nombre) {
   return r.rows[0]?.id || null;
 }
 
-async function processBatch({ batchId, buffer, mime, arlHint }) {
-  const { arlNombre, arlConfidence, records } = await runExtraction({ buffer, mime, arlHint });
+async function processBatch({ batchId, buffer, mime, filename, arlHint }) {
+  const { arlNombre, arlConfidence, records } = await runExtraction({ buffer, mime, filename, arlHint });
   const arlId = await arlIdByName(arlNombre);
 
   let created = 0;
@@ -52,13 +52,16 @@ async function processBatch({ batchId, buffer, mime, arlHint }) {
     }
 
     const metadata = { ...fields, overall_confidence: overall, engine: rec.engine, arl_confidence: arlConfidence };
+    // El borrador nace en PENDIENTE_REVISION: se queda en la vista previa de
+    // Importar y NO entra a Órdenes hasta que el Admin confirme el lote
+    // (POST /imports/:id/confirm). Así la revisión humana es obligatoria.
     await pool.query(
       `INSERT INTO sst.borradores_extraccion
          (lote_importacion_id, arl_id, confianza_general, metadatos_extraccion, estado, duplicado_de)
        VALUES ($1,$2,$3,$4,$5,$6)`,
       [
         batchId, arlId, overall, metadata,
-        duplicadoDe ? 'DUPLICADA' : 'PENDIENTE_VALIDACION',
+        duplicadoDe ? 'DUPLICADA' : 'PENDIENTE_REVISION',
         duplicadoDe,
       ]
     );

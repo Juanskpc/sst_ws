@@ -24,7 +24,7 @@ router.post('/', requireRole('admin'), uploadImport.single('file'), asyncHandler
   const batchId = batch.rows[0].id;
 
   // Encola el pipeline IA (clasificación + extracción + dedup) en background.
-  enqueueImport({ batchId, buffer, mime: mimetype, arlHint: req.body?.arl || null });
+  enqueueImport({ batchId, buffer, mime: mimetype, filename: originalname, arlHint: req.body?.arl || null });
 
   res.status(202).json({
     message: 'Archivo recibido. Procesando con IA…',
@@ -65,6 +65,47 @@ router.get('/:id', asyncHandler(async (req, res) => {
     [req.params.id]
   );
   res.json({ data: { ...b.rows[0], borradores: borradores.rows } });
+}));
+
+// IMP-04 · Confirmar el lote tras la revisión humana en la vista previa.
+// Los borradores pasan de PENDIENTE_REVISION → PENDIENTE_VALIDACION y recién
+// entonces aparecen en la bandeja de Órdenes. Los DUPLICADA no se tocan.
+router.post('/:id/confirm', requireRole('admin'), asyncHandler(async (req, res) => {
+  const lote = await pool.query(`SELECT id FROM sst.lotes_importacion WHERE id=$1`, [req.params.id]);
+  if (!lote.rows[0]) throw notFound('Lote no encontrado');
+
+  const r = await pool.query(
+    `UPDATE sst.borradores_extraccion
+        SET estado='PENDIENTE_VALIDACION', actualizado_en=now()
+      WHERE lote_importacion_id=$1 AND estado='PENDIENTE_REVISION'
+      RETURNING id`,
+    [req.params.id]
+  );
+  if (!r.rowCount) throw badRequest('El lote no tiene órdenes pendientes de revisión');
+
+  res.json({
+    message: `${r.rowCount} orden(es) enviada(s) a Órdenes.`,
+    data: { confirmadas: r.rowCount },
+  });
+}));
+
+// Descartar el lote completo sin enviarlo a Órdenes (los borradores quedan
+// DESCARTADA; el archivo original se conserva para auditoría).
+router.post('/:id/discard', requireRole('admin'), asyncHandler(async (req, res) => {
+  const lote = await pool.query(`SELECT id FROM sst.lotes_importacion WHERE id=$1`, [req.params.id]);
+  if (!lote.rows[0]) throw notFound('Lote no encontrado');
+
+  const r = await pool.query(
+    `UPDATE sst.borradores_extraccion
+        SET estado='DESCARTADA', actualizado_en=now()
+      WHERE lote_importacion_id=$1 AND estado='PENDIENTE_REVISION'
+      RETURNING id`,
+    [req.params.id]
+  );
+  res.json({
+    message: `${r.rowCount} orden(es) descartada(s).`,
+    data: { descartadas: r.rowCount },
+  });
 }));
 
 export default router;

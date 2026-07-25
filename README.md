@@ -105,6 +105,8 @@ src/
 | Config | PUT | `/settings/confidence-threshold` | admin |
 | **M2 Import** | POST | `/imports` (multipart `file`) | admin |
 | | GET | `/imports`, `/imports/:id`, `/imports/:id/status` | auth |
+| | POST | `/imports/:id/confirm` (revisado → a Órdenes) | admin |
+| | POST | `/imports/:id/discard` (descarta el lote) | admin |
 | **M2/M3 Validación** | GET | `/drafts?status=` , `/drafts/:id` | auth |
 | | PUT | `/drafts/:id` (correcciones) | admin |
 | | POST | `/drafts/:id/validate` (Validar y Guardar) | admin |
@@ -132,13 +134,18 @@ src/
 
 1. `POST /imports` con Excel/PDF → responde `202 PROCESANDO`; el worker clasifica
    la ARL (Excel determinista; PDF con Gemini/mock, PENDIENTE DE MIGRACIÓN), extrae
-   los campos con **OpenAI** (Excel = parsing determinista), deduplica y crea borradores.
-2. `POST /drafts/:id/validate` → crea la OS en `SIN PROGRAMAR` + primera auditoría.
-3. `POST /orders/:id/assign` → `PROGRAMADA`, genera PDFs, **envía correo** al
+   los campos con **OpenAI** (Excel = parsing determinista), deduplica y crea los
+   borradores en **`PENDIENTE_REVISION`** — visibles solo en la vista previa de
+   Importar, **no** en la bandeja de Órdenes.
+2. El Admin revisa la vista previa y corrige con `PUT /drafts/:id`; luego
+   `POST /imports/:id/confirm` pasa el lote a `PENDIENTE_VALIDACION` y recién ahí
+   las órdenes aparecen en Órdenes. (`/imports/:id/discard` descarta el lote.)
+3. `POST /drafts/:id/validate` → crea la OS en `SIN PROGRAMAR` + primera auditoría.
+4. `POST /orders/:id/assign` → `PROGRAMADA`, genera PDFs, **envía correo** al
    profesional con adjuntos y crea el link público.
-4. `POST /public/support/:token/files` (sin login) → sube soportes y pasa a
+5. `POST /public/support/:token/files` (sin login) → sube soportes y pasa a
    `EN VERIFICACIÓN`; avisa a los admins.
-5. `POST /orders/:id/verify` → `EJECUTADA`. (`/reject` con motivo vuelve a `PROGRAMADA`.)
+6. `POST /orders/:id/verify` → `EJECUTADA`. (`/reject` con motivo vuelve a `PROGRAMADA`.)
 
 ## Configuración externa
 

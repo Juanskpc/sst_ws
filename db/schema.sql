@@ -48,6 +48,13 @@ DO $$ BEGIN
   );
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
+-- PENDIENTE_REVISION: el borrador ya fue extraído pero AÚN NO entra a la bandeja
+-- de Órdenes. Vive solo en la vista previa de Importar, donde el Admin revisa,
+-- corrige y confirma. Al confirmar pasa a PENDIENTE_VALIDACION (IMP-03/IMP-04).
+-- Requiere PostgreSQL 12+ (permite ADD VALUE dentro de un bloque de transacción
+-- siempre que el valor nuevo no se use en la misma transacción).
+ALTER TYPE sst.estado_extraccion ADD VALUE IF NOT EXISTS 'PENDIENTE_REVISION';
+
 -- =============================================================================
 -- NÚCLEO FASE 1
 -- =============================================================================

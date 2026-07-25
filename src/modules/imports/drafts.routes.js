@@ -143,10 +143,15 @@ router.put('/:id', requireRole('admin'), asyncHandler(async (req, res) => {
   }
   merged.overall_confidence = computeOverallConfidence(merged);
   const r = await pool.query(
-    `UPDATE sst.borradores_extraccion SET metadatos_extraccion=$2, confianza_general=$3 WHERE id=$1 RETURNING *`,
+    `UPDATE sst.borradores_extraccion
+       SET metadatos_extraccion=$2, confianza_general=$3, actualizado_en=now()
+     WHERE id=$1 RETURNING id`,
     [req.params.id, merged, merged.overall_confidence]
   );
-  res.json({ data: r.rows[0] });
+  if (!r.rows[0]) throw notFound('Borrador no encontrado');
+  // Se devuelve expandido (arl_nombre, archivo, profesional) para que el cliente
+  // pueda reemplazar la fila sin perder los campos derivados del JOIN.
+  res.json({ data: await loadDraftExpanded(req.params.id) });
 }));
 
 // M3 · "Validar y Guardar" → materializa la OS con estado SIN PROGRAMAR (EST-01)

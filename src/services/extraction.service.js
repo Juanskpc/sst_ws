@@ -118,8 +118,10 @@ export async function parseExcelSipab(buffer) {
  *    `extractPdfWithOpenAI`) → 1 OS por archivo.
  * Devuelve { arlNombre, records: [{ fields, engine }] }.
  */
-export async function runExtraction({ buffer, mime, arlHint }) {
-  const isExcel = /sheet|excel/.test(mime);
+export async function runExtraction({ buffer, mime, filename, arlHint }) {
+  // Algunos clientes suben .xlsx como application/octet-stream: se cae a la
+  // extensión para no mandar un Excel por el camino de PDF.
+  const isExcel = /sheet|excel/.test(mime || '') || /\.(xlsx|xls)$/i.test(filename || '');
   if (isExcel) {
     const records = await parseExcelSipab(buffer);
     return {
