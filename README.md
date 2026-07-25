@@ -5,9 +5,15 @@ Backend Node.js (Express 5 + PostgreSQL/Neon) para la plataforma de gestión de
 completo de **Fase 1** (MVP Táctico). La BD incluye además las tablas de costura
 de Fase 2, pero **sin lógica de backend** (Regla de Oro).
 
-> 🤖 El motor de IA del **producto** es **Google Gemini**, no Claude. Si
-> `GEMINI_API_KEY` está vacío, el pipeline usa un extractor **mock** realista para
-> que todo funcione end-to-end.
+> 🤖 **Motor principal de extracción = OpenAI** (`gpt-4o-mini`, vía
+> `infrastructure/openai/openai-extraction.service.ts` + `services/openai-extraction.bridge.js`).
+> Extrae los campos de los PDF; el Excel SIPAB es parsing determinista.
+>
+> **Gemini ya NO participa en la extracción.** Permanece **solo** en componentes
+> auxiliares **PENDIENTES DE MIGRACIÓN** (clasificación de ARL, resumen ejecutivo y
+> búsqueda en lenguaje natural); si `GEMINI_API_KEY` está vacío, esos componentes
+> usan un **mock** realista. Claude/Claude Code es la herramienta de desarrollo, no
+> el producto.
 
 ## Requisitos
 
@@ -44,8 +50,12 @@ db/
 src/
   config/        env + pool de PostgreSQL (search_path = sst).
   middleware/    auth (JWT + roles), manejo de errores, uploads (multer).
-  services/      storage (local/S3), email (console/SMTP), gemini (real+mock),
-                 extraction (Excel SIPAB + orquestación), pdf (formatos), notify.
+  services/      storage (local/S3), email (console/SMTP),
+                 openai-extraction.bridge (MOTOR PRINCIPAL de extracción PDF → OpenAI),
+                 extraction (orquestación: Excel SIPAB determinista + PDF→OpenAI),
+                 gemini (AUXILIAR, PENDIENTE DE MIGRACIÓN: clasificación/resumen/búsqueda),
+                 pdf (formatos), notify.
+  infrastructure/openai/  OpenAIExtractionService (gpt-4o-mini + Structured Outputs).
   queue/         cola async de importación (worker en memoria).
   modules/       auth, professionals, catalog, imports+drafts, orders, files,
                  public (portal M6), notifications, reports.
@@ -109,8 +119,9 @@ src/
 
 ## Flujo end-to-end (criterios de aceptación Fase 1)
 
-1. `POST /imports` con Excel/PDF → responde `202 PROCESANDO`; el worker clasifica,
-   extrae con Gemini/mock, deduplica y crea borradores.
+1. `POST /imports` con Excel/PDF → responde `202 PROCESANDO`; el worker clasifica
+   la ARL (Excel determinista; PDF con Gemini/mock, PENDIENTE DE MIGRACIÓN), extrae
+   los campos con **OpenAI** (Excel = parsing determinista), deduplica y crea borradores.
 2. `POST /drafts/:id/validate` → crea la OS en `SIN PROGRAMAR` + primera auditoría.
 3. `POST /orders/:id/assign` → `PROGRAMADA`, genera PDFs, **envía correo** al
    profesional con adjuntos y crea el link público.
@@ -120,7 +131,11 @@ src/
 
 ## Configuración externa
 
-- **Gemini:** define `GEMINI_API_KEY` para activar la extracción/resúmenes reales.
+- **OpenAI (motor principal de extracción):** define `OPENAI_API_KEY` (y opcional
+  `OPENAI_MODEL`, default `gpt-4o-mini`) para la extracción real de PDF.
+- **Gemini (auxiliar, PENDIENTE DE MIGRACIÓN):** define `GEMINI_API_KEY` para activar
+  clasificación de ARL, resúmenes y búsqueda NL reales; sin la key usan mock. **No**
+  interviene en la extracción.
 - **Correo:** `EMAIL_DRIVER=smtp` + credenciales SMTP (por defecto `console`).
 - **Storage:** `STORAGE_DRIVER=local` (default, escribe en `./storage`) o `s3`
   (punto de extensión en `services/storage.service.js`).

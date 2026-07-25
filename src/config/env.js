@@ -30,6 +30,8 @@ export const env = {
     localDir: process.env.STORAGE_LOCAL_DIR || './storage',
     s3Bucket: process.env.S3_BUCKET,
     s3Region: process.env.S3_REGION,
+    // Opcional: endpoint para S3-compatible (DigitalOcean Spaces / Linode).
+    s3Endpoint: process.env.S3_ENDPOINT,
   },
 
   email: {
@@ -41,6 +43,11 @@ export const env = {
     from: process.env.EMAIL_FROM || 'JD&D Consultores <no-reply@jdd.com>',
   },
 
+  // Gemini NO es el motor principal de extracción (ese es OpenAI). Esta config
+  // solo alimenta los componentes auxiliares PENDIENTES DE MIGRACIÓN a OpenAI:
+  // clasificación de ARL, resumen ejecutivo y búsqueda en lenguaje natural
+  // (ver services/gemini.service.js). La config del motor OpenAI vive en
+  // infrastructure/openai/openai-extraction.config.js (lee OPENAI_* de process.env).
   gemini: {
     apiKey: process.env.GEMINI_API_KEY || '',
     modelPro: process.env.GEMINI_MODEL_PRO || 'gemini-2.5-pro',

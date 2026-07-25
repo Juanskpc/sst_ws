@@ -144,7 +144,7 @@ async function main() {
           (lote_importacion_id, arl_id, nombre_archivo, url_archivo_original, confianza_general, metadatos_extraccion, estado, creado_en)
          VALUES ($1,$2,$3,$4,$5,$6,'PENDIENTE_VALIDACION',$7) RETURNING id`,
         [lote.id, arlMap[arl], isPdf ? `${arl.toLowerCase()}_os_${1500 + k}.pdf` : `SIPAB_${1500 + k}.xlsx`,
-         `imports/2026/orig_${1500 + k}`, base, meta(o, base, isPdf ? 'gemini-mock' : 'excel-determinista'), iso(bi++ % 6)]
+         `imports/2026/orig_${1500 + k}`, base, meta(o, base, isPdf ? 'openai-mock' : 'excel-determinista'), iso(bi++ % 6)]
       );
       drafts.push(r.rows[0].id);
     }
@@ -157,7 +157,7 @@ async function main() {
         `INSERT INTO sst.borradores_extraccion
           (lote_importacion_id, arl_id, nombre_archivo, confianza_general, metadatos_extraccion, estado, creado_en)
          VALUES ($1,$2,$3,$4,$5,'DUPLICADA',$6)`,
-        [lotes[0].id, arlMap[arl], `dup_${k}.pdf`, 90, meta(o, 90, 'gemini-mock'), iso(k)]
+        [lotes[0].id, arlMap[arl], `dup_${k}.pdf`, 90, meta(o, 90, 'openai-mock'), iso(k)]
       );
     }
 
@@ -194,7 +194,7 @@ async function main() {
         [codigo, arlMap[arl], o.cron, o.sec, o.nit, o.empresa, o.actividad, horas, iso(dCarga), o.desc,
          o.contacto, o.tel, o.correo, estado, assigned ? prof.id : null, scheduled, ejec,
          lotes.find((l) => l.arl === arl)?.id || null, `imports/2026/orig_${1000 + idx}`,
-         meta(o, base, isPdf ? 'gemini-mock' : 'excel-determinista')]
+         meta(o, base, isPdf ? 'openai-mock' : 'excel-determinista')]
       );
       const orderId = ord.rows[0].id;
 

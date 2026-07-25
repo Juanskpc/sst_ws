@@ -22,7 +22,7 @@ async function arlIdByName(nombre) {
 }
 
 async function processBatch({ batchId, buffer, mime, arlHint }) {
-  const { arlNombre, records } = await runExtraction({ buffer, mime, arlHint });
+  const { arlNombre, arlConfidence, records } = await runExtraction({ buffer, mime, arlHint });
   const arlId = await arlIdByName(arlNombre);
 
   let created = 0;
@@ -43,7 +43,7 @@ async function processBatch({ batchId, buffer, mime, arlHint }) {
       duplicadoDe = dup.rows[0]?.id || null;
     }
 
-    const metadata = { ...fields, overall_confidence: overall, engine: rec.engine };
+    const metadata = { ...fields, overall_confidence: overall, engine: rec.engine, arl_confidence: arlConfidence };
     await pool.query(
       `INSERT INTO sst.borradores_extraccion
          (lote_importacion_id, arl_id, confianza_general, metadatos_extraccion, estado, duplicado_de)

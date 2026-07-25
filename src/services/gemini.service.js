@@ -1,11 +1,27 @@
 import { env } from '../config/env.js';
 
 /**
- * Motor de IA del PRODUCTO = Google Gemini (NO Claude).
- * Si GEMINI_API_KEY está vacío → se usa un extractor MOCK realista, de modo que
- * todo el pipeline funcione end-to-end. Enchufar Gemini real = solo poner la key.
+ * ⚠️ ESTE ARCHIVO NO ES EL MOTOR PRINCIPAL DE EXTRACCIÓN.
  *
- * ⚠️ Verificar IDs de modelo/params vigentes en la doc oficial de Gemini.
+ * El motor PRINCIPAL de extracción de documentos es **OpenAI** (`gpt-4o-mini`),
+ * implementado en `infrastructure/openai/openai-extraction.service.ts` y cableado
+ * al pipeline por `services/openai-extraction.bridge.js`. La orquestación vive en
+ * `services/extraction.service.js` (Excel determinista + PDF → OpenAI).
+ *
+ * Este módulo conserva SOLO componentes auxiliares que **continúan usando Gemini**
+ * y están **PENDIENTES DE MIGRACIÓN** a OpenAI (no hacen parte del motor principal
+ * de extracción): `classifyPdfArl` (clasificación de ARL), `executiveSummary`
+ * (resumen ejecutivo) e `interpretSearch` (búsqueda en lenguaje natural). Si
+ * `GEMINI_API_KEY` está vacío, esas tres funciones caen a un MOCK realista.
+ *
+ * `CANONICAL_FIELDS` y `computeOverallConfidence` (importado desde extraction)
+ * siguen siendo la fuente canónica de campos y se reutilizan en todo el pipeline.
+ *
+ * NOTA: `extractFromPdf` y `mockExtract` quedaron como **código muerto** tras la
+ * migración de la extracción a OpenAI (ver marca @deprecated abajo).
+ *
+ * ⚠️ Para los componentes que aún usan Gemini, verificar IDs de modelo/params
+ * vigentes en la documentación oficial de Gemini.
  */
 
 // Campos canónicos IMP-06 (cada uno { value, confidence }).
@@ -42,9 +58,20 @@ Extrae los campos canónicos del documento adjunto. Para cada campo devuelve
 o está ilegible/truncado (típico en descripción de AXA), usa el mejor valor posible
 y una confidence baja. Responde SOLO el JSON del esquema.`;
 
-/** Clasifica un PDF entre AXA Colpatria y Colmena (IMP-05). */
+/**
+ * Clasifica un PDF entre AXA Colpatria y Colmena (IMP-05 / IA-01 / IA-03).
+ *
+ * Devuelve `{ arlNombre, confidence }`. La clasificación por defecto es por
+ * CONTENIDO del documento (texto del PDF), determinista y con un nivel de
+ * confianza 0-100. Si `GEMINI_API_KEY` está definido, Gemini refina el NOMBRE de
+ * la ARL (la confianza se mantiene estimada por contenido) — esa parte sigue
+ * PENDIENTE DE MIGRACIÓN a OpenAI y no hace parte del motor principal de extracción.
+ */
 export async function classifyPdfArl(buffer) {
-  if (!env.gemini.enabled) return mockClassify(buffer);
+  // IA-01/IA-03: clasificación por contenido con confianza (reemplaza la antigua
+  // heurística aleatoria por paridad de bytes).
+  const content = await classifyByContent(buffer);
+  if (!env.gemini.enabled) return content;
   try {
     const ai = await getClient();
     const resp = await ai.models.generateContent({
@@ -55,14 +82,23 @@ export async function classifyPdfArl(buffer) {
       ],
     });
     const t = (resp.text || '').toLowerCase();
-    return t.includes('colmena') ? 'Colmena' : 'AXA Colpatria';
+    const arlNombre = t.includes('colmena') ? 'Colmena' : 'AXA Colpatria';
+    // Gemini decide el nombre; la confianza se estima por contenido.
+    return { arlNombre, confidence: content.confidence };
   } catch (e) {
-    console.warn('[gemini] clasificación falló, usando heurística:', e.message);
-    return mockClassify(buffer);
+    console.warn('[gemini] clasificación falló, usando clasificación por contenido:', e.message);
+    return content;
   }
 }
 
-/** Extrae los campos canónicos de un PDF con Gemini (o mock). */
+/**
+ * Extrae los campos canónicos de un PDF con Gemini (o mock).
+ *
+ * @deprecated CÓDIGO MUERTO. La extracción de PDF migró a OpenAI
+ * (`openai-extraction.bridge.js` → `extractPdfWithOpenAI`). Esta función ya no la
+ * invoca ningún módulo del pipeline y se conserva solo como referencia histórica
+ * de la rama Gemini; puede eliminarse en una limpieza posterior.
+ */
 export async function extractFromPdf(buffer, arlNombre) {
   if (!env.gemini.enabled) return mockExtract(arlNombre);
   try {
@@ -82,7 +118,12 @@ export async function extractFromPdf(buffer, arlNombre) {
   }
 }
 
-/** Resumen ejecutivo de 3 párrafos por OS (Informes M10, ya maquetado). */
+/**
+ * Resumen ejecutivo de 3 párrafos por OS (Informes M10, ya maquetado).
+ *
+ * PENDIENTE DE MIGRACIÓN. Este componente continúa utilizando Gemini y no hace
+ * parte del motor principal de extracción (que ya es OpenAI).
+ */
 export async function executiveSummary(order) {
   if (!env.gemini.enabled) return mockSummary(order);
   try {
@@ -104,6 +145,9 @@ destacando requisitos especiales (ej. trabajo en alturas certificado). Datos:\n$
 /**
  * Buscador en lenguaje natural → filtros estructurados (Informes M10).
  * Devuelve { arl?, minHoras?, bajaConfianza?, status?, texto? }.
+ *
+ * PENDIENTE DE MIGRACIÓN. Este componente continúa utilizando Gemini y no hace
+ * parte del motor principal de extracción (que ya es OpenAI).
  */
 export async function interpretSearch(queryText) {
   if (env.gemini.enabled) {
@@ -127,9 +171,36 @@ export async function interpretSearch(queryText) {
 
 // ============================ MOCKS realistas ================================
 
-function mockClassify(buffer) {
-  // Heurística barata por tamaño/paridad — determinista para el mismo archivo.
-  return buffer.length % 2 === 0 ? 'AXA Colpatria' : 'Colmena';
+// IA-01: clasificación de ARL por CONTENIDO del PDF (AXA Colpatria vs Colmena),
+// determinista y basada en el texto real del documento (no en el tamaño del archivo).
+// Reutiliza el PdfExtractor ya existente (pdfjs) — sin nuevas dependencias.
+let _pdfClassifier = null;
+async function extractPdfTextForArl(buffer) {
+  try {
+    if (_pdfClassifier === null) {
+      const { PdfExtractor } = await import('../infrastructure/text/pdf-extractor.js');
+      _pdfClassifier = new PdfExtractor();
+    }
+    return await _pdfClassifier.extraerTexto(new Uint8Array(buffer));
+  } catch {
+    return '';
+  }
+}
+
+/** Clasifica AXA Colpatria vs Colmena por keywords en el texto, con confianza 0-100. */
+async function classifyByContent(buffer) {
+  const text = (await extractPdfTextForArl(buffer)).toLowerCase();
+  const axa = (text.match(/axa|colpatria/g) || []).length;
+  const colmena = (text.match(/colmena/g) || []).length;
+  const total = axa + colmena;
+  if (total === 0) {
+    // Sin señales en el texto (p. ej. PDF escaneado sin capa de texto): baja confianza.
+    return { arlNombre: 'AXA Colpatria', confidence: 40 };
+  }
+  const esColmena = colmena >= axa;
+  const ganador = esColmena ? colmena : axa;
+  const confidence = Math.min(98, Math.round(60 + (ganador / total - 0.5) * 76));
+  return { arlNombre: esColmena ? 'Colmena' : 'AXA Colpatria', confidence };
 }
 
 const rand = (min, max) => Math.round(min + Math.random() * (max - min));

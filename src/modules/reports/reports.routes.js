@@ -25,7 +25,9 @@ router.get('/dashboard', asyncHandler(async (_req, res) => {
   });
 }));
 
-// Informes · Resumen ejecutivo IA (Gemini/mock) de 3 párrafos por OS.
+// Informes · Resumen ejecutivo IA de 3 párrafos por OS.
+// PENDIENTE DE MIGRACIÓN: usa executiveSummary (Gemini/mock), NO el motor
+// principal de extracción (OpenAI).
 router.post('/summary/:orderId', asyncHandler(async (req, res) => {
   const order = await getOrderExpanded(req.params.orderId);
   if (!order) throw notFound('OS no encontrada');
@@ -34,6 +36,8 @@ router.post('/summary/:orderId', asyncHandler(async (req, res) => {
 }));
 
 // Informes · Buscador en lenguaje natural → filtros → resultados.
+// PENDIENTE DE MIGRACIÓN: usa interpretSearch (Gemini/mock), NO el motor
+// principal de extracción (OpenAI).
 router.post('/search', asyncHandler(async (req, res) => {
   const { query } = req.body || {};
   const filters = await interpretSearch(query || '');

@@ -85,7 +85,9 @@ export async function parseExcelSipab(buffer) {
 /**
  * Orquesta la extracción según ARL/formato.
  *  - Excel (Bolívar): determinista → múltiples OS por archivo.
- *  - PDF (AXA/Colmena): clasifica + Gemini → 1 OS por archivo.
+ *  - PDF (AXA/Colmena): clasifica la ARL (aún Gemini — PENDIENTE DE MIGRACIÓN)
+ *    y extrae los campos con **OpenAI** (motor principal, vía
+ *    `extractPdfWithOpenAI`) → 1 OS por archivo.
  * Devuelve { arlNombre, records: [{ fields, engine }] }.
  */
 export async function runExtraction({ buffer, mime, arlHint }) {
@@ -94,11 +96,19 @@ export async function runExtraction({ buffer, mime, arlHint }) {
     const records = await parseExcelSipab(buffer);
     return {
       arlNombre: 'Bolívar',
+      arlConfidence: 99, // Excel SIPAB → Bolívar por formato (determinista).
       records: records.map((r) => ({ ...r, engine: 'excel-determinista' })),
     };
   }
-  // PDF: clasificar ARL si no viene forzada.
-  const arlNombre = arlHint || (await classifyPdfArl(buffer));
+  // PDF: clasificar ARL por contenido si no viene forzada por el usuario.
+  let arlNombre;
+  let arlConfidence;
+  if (arlHint) {
+    arlNombre = arlHint;
+    arlConfidence = 100; // ARL indicada manualmente por el usuario.
+  } else {
+    ({ arlNombre, confidence: arlConfidence } = await classifyPdfArl(buffer));
+  }
   const { fields, engine } = await extractPdfWithOpenAI(buffer);
-  return { arlNombre, records: [{ fields, engine }] };
+  return { arlNombre, arlConfidence, records: [{ fields, engine }] };
 }
