@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { pool } from '../../config/db.js';
 import { asyncHandler } from '../../utils/asyncHandler.js';
-import { authRequired, requireRole } from '../../middleware/auth.js';
+import { authRequired, requireMaestro } from '../../middleware/auth.js';
 import { badRequest } from '../../utils/httpError.js';
 
 const router = Router();
@@ -29,8 +29,11 @@ router.get('/settings', asyncHandler(async (_req, res) => {
   res.json({ data: map, raw: r.rows });
 }));
 
-// Config · Umbral de confianza de la IA (default 70). Admin.
-router.put('/settings/confidence-threshold', requireRole('admin'), asyncHandler(async (req, res) => {
+// Config · Umbral de confianza de la IA (default 70). Solo Administrador Maestro:
+// el umbral es un parámetro global del pipeline de IA (afecta qué campos se marcan
+// para revisión manual en TODAS las órdenes), no una preferencia por usuario.
+// La lectura (GET /settings) queda abierta a cualquier sesión autenticada.
+router.put('/settings/confidence-threshold', requireMaestro, asyncHandler(async (req, res) => {
   const { value } = req.body || {};
   const n = Number(value);
   if (!Number.isFinite(n) || n < 0 || n > 100) throw badRequest('El umbral debe estar entre 0 y 100');

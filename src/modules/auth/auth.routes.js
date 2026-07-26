@@ -19,6 +19,12 @@ const usuarioPublico = (u) => ({
   es_maestro: u.es_maestro === true,
 });
 
+/**
+ * Documento normalizado para comparar: sin puntos, espacios ni guiones y en
+ * mayúsculas, de modo que "1.020.304.050" y "1020304050" sean el mismo documento.
+ */
+const claveDocumento = (v) => String(v ?? '').replace(/[^0-9a-zA-Z]/g, '').toUpperCase();
+
 /** Vistas del sidebar habilitadas para la sesión. Maestro = acceso total (bypass). */
 const permisosDeSesion = (usuario) =>
   usuario.es_maestro === true ? VISTAS_SISTEMA : permisosDeRol(usuario.rol);
@@ -139,6 +145,22 @@ router.post('/usuarios', authRequired, requireMaestro, asyncHandler(async (req, 
   // Contraseña inicial = la propia cédula (documento). El usuario deberá cambiarla
   // en su primer ingreso: el login detecta que password === documento y lo avisa.
   const documentoTrim = String(documento).trim();
+  const documentoClave = claveDocumento(documentoTrim);
+  // Sin esto, un documento de solo espacios o signos ("   ", "--") normalizaría a
+  // cadena vacía y coincidiría con cualquier usuario sin documento registrado.
+  if (!documentoClave) throw badRequest('El documento de identidad debe contener números o letras');
+  // El UNIQUE de la columna ya impide el duplicado exacto; esto además atrapa el
+  // mismo documento escrito con puntos o espacios ("1.020.304.050") y devuelve a
+  // quién pertenece, que es lo que el Maestro necesita saber para resolverlo.
+  const dup = await pool.query(
+    `SELECT nombre FROM sst.usuarios
+      WHERE upper(regexp_replace(coalesce(documento_identidad,''), '[^0-9A-Za-z]', '', 'g')) = $1
+      LIMIT 1`,
+    [documentoClave]
+  );
+  if (dup.rows[0]) {
+    throw conflict(`El documento ${documentoTrim} ya está registrado a nombre de ${dup.rows[0].nombre}.`);
+  }
   const r = await pool.query(
     `INSERT INTO sst.usuarios (nombre, correo, documento_identidad, contrasena_hash, rol, telefono, especialidad)
      VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,

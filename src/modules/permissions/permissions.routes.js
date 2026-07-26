@@ -1,14 +1,17 @@
 import { Router } from 'express';
 import { pool } from '../../config/db.js';
 import { asyncHandler } from '../../utils/asyncHandler.js';
-import { authRequired, requireRole } from '../../middleware/auth.js';
+import { authRequired, requireMaestro } from '../../middleware/auth.js';
 import { badRequest } from '../../utils/httpError.js';
 import { VISTAS_SISTEMA } from '../auth/auth.service.js';
 
 const ROLES = ['admin', 'profesional', 'contador', 'auditor'];
 
 const router = Router();
-router.use(authRequired, requireRole('admin'));
+// La matriz de accesos es competencia exclusiva del Administrador Maestro: un
+// admin corriente no debe poder ampliarse a sí mismo (ni recortar) los permisos
+// de su propio rol. Mismo criterio que la gestión de usuarios internos.
+router.use(authRequired, requireMaestro);
 
 // Configuración → Roles y permisos: matriz completa (rol × vista).
 router.get('/', asyncHandler(async (_req, res) => {
