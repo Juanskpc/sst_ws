@@ -51,7 +51,15 @@ async function processBatch({ batchId, buffer, mime, filename, arlHint }) {
       duplicadoDe = dup.rows[0]?.id || null;
     }
 
-    const metadata = { ...fields, overall_confidence: overall, engine: rec.engine, arl_confidence: arlConfidence };
+    const metadata = {
+      ...fields,
+      overall_confidence: overall,
+      engine: rec.engine,
+      arl_confidence: arlConfidence,
+      // Solo Excel: fila de la hoja de la que salió esta orden. La usa la vista
+      // previa del documento para resaltarla junto a los campos extraídos.
+      source_row: rec.sourceRow ?? null,
+    };
     // El borrador nace en PENDIENTE_REVISION: se queda en la vista previa de
     // Importar y NO entra a Órdenes hasta que el Admin confirme el lote
     // (POST /imports/:id/confirm). Así la revisión humana es obligatoria.

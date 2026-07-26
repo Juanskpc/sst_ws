@@ -22,6 +22,7 @@ export const EVENTOS = {
   USUARIO_CREADO: 'usuario_creado',
   USUARIO_ACTUALIZADO: 'usuario_actualizado',
   USUARIO_ESTADO_CAMBIADO: 'usuario_estado_cambiado',
+  USUARIO_ELIMINADO: 'usuario_eliminado',
 };
 
 /** Registra un evento de autenticación. Nunca interrumpe el flujo principal. */

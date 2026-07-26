@@ -207,4 +207,22 @@ router.patch('/usuarios/:id/estado', authRequired, requireMaestro, asyncHandler(
   res.json({ usuario: usuarioPublico(r.rows[0]) });
 }));
 
+// Baja definitiva de un usuario interno.
+// Es destructiva por diseño (la UI ofrece "Desactivar" como alternativa reversible).
+// Las referencias desde otras tablas están declaradas ON DELETE SET NULL / CASCADE,
+// así que el histórico de órdenes y la auditoría sobreviven a la baja.
+router.delete('/usuarios/:id', authRequired, requireMaestro, asyncHandler(async (req, res) => {
+  const actual = (await pool.query(`SELECT * FROM sst.usuarios WHERE id=$1`, [req.params.id])).rows[0];
+  if (!actual) throw notFound('Usuario no encontrado');
+  if (actual.es_maestro) throw conflict('No es posible eliminar al Administrador Maestro');
+  if (actual.id === req.user.sub) throw conflict('No puede eliminar su propia cuenta');
+  await pool.query(`DELETE FROM sst.usuarios WHERE id=$1`, [actual.id]);
+  await auditar({
+    usuarioId: req.user.sub, correo: req.user.correo, evento: EVENTOS.USUARIO_ELIMINADO, exito: true, req,
+    // El id eliminado ya no es una FK válida: se guardan los datos en el detalle.
+    datos: { usuario_eliminado_id: actual.id, correo: actual.correo, rol: actual.rol },
+  });
+  res.json({ message: 'Usuario eliminado.' });
+}));
+
 export default router;

@@ -5,6 +5,7 @@ import { authRequired, requireRole } from '../../middleware/auth.js';
 import { uploadImport } from '../../middleware/upload.js';
 import { badRequest, notFound } from '../../utils/httpError.js';
 import { storage } from '../../services/storage.service.js';
+import { readSheetPreview } from '../../services/extraction.service.js';
 import { enqueueImport } from '../../queue/importQueue.js';
 
 const router = Router();
@@ -52,6 +53,43 @@ router.get('/:id/status', asyncHandler(async (req, res) => {
   );
   if (!r.rows[0]) throw notFound('Lote no encontrado');
   res.json({ data: r.rows[0] });
+}));
+
+// IMP-03 · Archivo ORIGINAL del lote, servido en línea (inline) para la vista
+// previa del modal de revisión. El navegador renderiza los PDF de forma nativa;
+// para Excel se usa /:id/sheet (abajo), que sí es legible en HTML.
+router.get('/:id/file', asyncHandler(async (req, res) => {
+  const r = await pool.query(
+    `SELECT nombre_archivo, url_archivo, tipo_mime FROM sst.lotes_importacion WHERE id=$1`,
+    [req.params.id]
+  );
+  const lote = r.rows[0];
+  if (!lote) throw notFound('Lote no encontrado');
+  if (!lote.url_archivo) throw notFound('El lote no conserva el archivo original');
+
+  const buffer = await storage.get(lote.url_archivo);
+  res.setHeader('Content-Type', lote.tipo_mime || 'application/octet-stream');
+  res.setHeader('Content-Disposition', `inline; filename="${lote.nombre_archivo || 'documento'}"`);
+  res.send(buffer);
+}));
+
+// IMP-03 · Hoja del Excel original como texto plano, para pintarla al lado de
+// los campos extraídos. Solo aplica a lotes de Excel (Bolívar / SIPAB).
+router.get('/:id/sheet', asyncHandler(async (req, res) => {
+  const r = await pool.query(
+    `SELECT nombre_archivo, url_archivo, tipo_mime FROM sst.lotes_importacion WHERE id=$1`,
+    [req.params.id]
+  );
+  const lote = r.rows[0];
+  if (!lote) throw notFound('Lote no encontrado');
+  if (!lote.url_archivo) throw notFound('El lote no conserva el archivo original');
+
+  const esExcel = /sheet|excel/.test(lote.tipo_mime || '') || /\.(xlsx|xls)$/i.test(lote.nombre_archivo || '');
+  if (!esExcel) throw badRequest('El archivo del lote no es una hoja de cálculo');
+
+  const buffer = await storage.get(lote.url_archivo);
+  const preview = await readSheetPreview(buffer);
+  res.json({ data: { nombre_archivo: lote.nombre_archivo, ...preview } });
 }));
 
 // Detalle del lote + borradores extraídos

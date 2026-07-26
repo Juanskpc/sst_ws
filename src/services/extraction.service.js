@@ -104,10 +104,53 @@ export async function parseExcelSipab(buffer) {
     }
     // Fila válida solo si trae al menos cronograma o secuencia.
     if (hasData && (fields.codigo_cronograma.value || fields.secuencia.value)) {
-      records.push({ fields });
+      // `sourceRow` = número de fila real en la hoja. Permite que la vista previa
+      // del documento resalte la fila de la que salió cada orden extraída.
+      records.push({ fields, sourceRow: r });
     }
   }
   return records;
+}
+
+/**
+ * Representación en texto plano de la hoja, para pintarla junto a los campos
+ * extraídos en el modal de revisión (IMP-03). No interpreta nada: devuelve las
+ * celdas tal como se ven en Excel para que el humano compare contra el original.
+ *
+ * Se acota el tamaño porque viaja por HTTP y se renderiza en el navegador.
+ */
+export async function readSheetPreview(buffer, { maxRows = 300, maxCols = 40 } = {}) {
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(buffer);
+  const ws = wb.worksheets[0];
+  if (!ws) return { hoja: null, columnas: 0, filas: [], truncado: false };
+
+  const totalCols = Math.min(ws.columnCount || 0, maxCols);
+  const totalRows = Math.min(ws.rowCount || 0, maxRows);
+  const filas = [];
+  for (let r = 1; r <= totalRows; r++) {
+    const row = ws.getRow(r);
+    const celdas = [];
+    for (let c = 1; c <= totalCols; c++) {
+      const cell = row.getCell(c);
+      // Las fechas se normalizan igual que en la extracción (ISO corto): así el
+      // valor de la hoja y el campo extraído se leen idénticos al compararlos.
+      // Para el resto, `.text` resuelve fórmulas y rich text.
+      celdas.push(
+        cell.value instanceof Date
+          ? cell.value.toISOString().slice(0, 10)
+          : String(cell.text ?? '').trim(),
+      );
+    }
+    // Se conservan las filas vacías intermedias: mantienen la numeración real.
+    filas.push({ n: r, celdas });
+  }
+  return {
+    hoja: ws.name,
+    columnas: totalCols,
+    filas,
+    truncado: (ws.rowCount || 0) > totalRows || (ws.columnCount || 0) > totalCols,
+  };
 }
 
 /**
