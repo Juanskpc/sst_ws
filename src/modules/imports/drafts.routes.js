@@ -44,19 +44,25 @@ const DRAFT_SELECT = `
 
 // Vista "Órdenes" (M3). Filtrable por estado y por soft-delete.
 //   ?estado=PENDIENTE_VALIDACION | VALIDADA | ... | ALL
+//   Admite varios separados por coma: ?estado=PENDIENTE_VALIDACION,VALIDADA.
+//   La vista Órdenes los necesita juntos: una orden validada ya no está
+//   pendiente, pero sigue viviendo en la bandeja con otro estado.
 //   ?deshabilitado=false (por defecto) | true | all
 router.get('/', asyncHandler(async (req, res) => {
   const estado = req.query.estado || req.query.status || 'PENDIENTE_VALIDACION';
   const desh = String(req.query.deshabilitado ?? 'false').toLowerCase();
 
-  const params = [estado];
+  const estados = String(estado).split(',').map((s) => s.trim()).filter(Boolean);
+  const params = [estados];
   let filtroDesh = 'AND d.deshabilitado = false';
   if (desh === 'true') filtroDesh = 'AND d.deshabilitado = true';
   else if (desh === 'all') filtroDesh = '';
 
+  // Comparación como texto (no como enum): un estado inexistente simplemente no
+  // devuelve filas, en vez de romper la consulta con un error de casteo.
   const r = await pool.query(
     `${DRAFT_SELECT}
-     WHERE ($1 = 'ALL' OR d.estado = $1::sst.estado_extraccion)
+     WHERE ('ALL' = ANY($1::text[]) OR d.estado::text = ANY($1::text[]))
      ${filtroDesh}
      ORDER BY d.creado_en DESC`,
     params

@@ -112,6 +112,25 @@ router.post('/:id/confirm', requireRole('admin'), asyncHandler(async (req, res) 
   const lote = await pool.query(`SELECT id FROM sst.lotes_importacion WHERE id=$1`, [req.params.id]);
   if (!lote.rows[0]) throw notFound('Lote no encontrado');
 
+  // La fecha de vencimiento es obligatoria: es el dato con el que se prioriza la
+  // orden en la bandeja, y una vez confirmada ya no se vuelve a pedir. Si la IA
+  // no la encontró, se diligencia en la vista previa antes de confirmar.
+  const sinVencimiento = await pool.query(
+    `SELECT coalesce(metadatos_extraccion->'empresa_nombre'->>'value', 'Sin nombre') AS empresa
+       FROM sst.borradores_extraccion
+      WHERE lote_importacion_id=$1
+        AND estado='PENDIENTE_REVISION'
+        AND btrim(coalesce(metadatos_extraccion->'fecha_vencimiento'->>'value', '')) = ''`,
+    [req.params.id]
+  );
+  if (sinVencimiento.rowCount) {
+    const nombres = sinVencimiento.rows.slice(0, 3).map((x) => x.empresa).join(', ');
+    const resto = sinVencimiento.rowCount > 3 ? ` y ${sinVencimiento.rowCount - 3} más` : '';
+    throw badRequest(
+      `${sinVencimiento.rowCount} orden(es) no tienen fecha de vencimiento: ${nombres}${resto}. Diligénciela antes de guardar.`
+    );
+  }
+
   const r = await pool.query(
     `UPDATE sst.borradores_extraccion
         SET estado='PENDIENTE_VALIDACION', actualizado_en=now()
