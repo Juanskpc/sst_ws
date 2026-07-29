@@ -10,7 +10,10 @@ export const env = {
   nodeEnv: process.env.NODE_ENV || 'development',
   port: parseInt(process.env.PORT || '4000', 10),
   corsOrigin: process.env.CORS_ORIGIN || '*',
-  publicAppUrl: process.env.PUBLIC_APP_URL || 'http://localhost:4001',
+  // Sin barra final: todos los usos la agregan al concatenar la ruta. Con
+  // PUBLIC_APP_URL="http://host/" salía "http://host//soporte?token=…", un
+  // enlace que iba dentro del correo al profesional.
+  publicAppUrl: (process.env.PUBLIC_APP_URL || 'http://localhost:4001').replace(/\/+$/, ''),
 
   databaseUrl: required('DATABASE_URL'),
   dbSchema: process.env.DB_SCHEMA || 'sst',

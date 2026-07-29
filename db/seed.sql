@@ -15,7 +15,16 @@ INSERT INTO sst.configuracion (clave, valor, descripcion) VALUES
   ('confidence_threshold', '70'::jsonb,
    'Umbral mínimo de confianza de la IA (%). Campos por debajo se marcan para revisión.'),
   ('company_name', '"JD&D Consultores en Sistemas de Gestión"'::jsonb,
-   'Razón social mostrada en formatos y correos.')
+   'Razón social mostrada en formatos y correos.'),
+  -- ENC-03 · Enunciados de la encuesta ("preguntas variables"): se editan aquí
+  -- sin tocar código ni migrar. Las dos escalas son 1-5 y alimentan el
+  -- dashboard, por eso su significado no cambia aunque cambie la redacción.
+  ('encuesta_preguntas',
+   '{"titulo":"Encuesta de satisfacción",
+     "satisfaccion":"Nivel de satisfacción de la actividad recibida",
+     "recomendacion":"¿Recomendaría a JD&D Consultores?",
+     "comentarios":"Observaciones para mejorar el servicio"}'::jsonb,
+   'ENC-03 · Textos del formulario público de satisfacción.')
 ON CONFLICT (clave) DO NOTHING;
 
 -- Roles y permisos · matriz por defecto (rol × vista) --------------------------
@@ -47,7 +56,14 @@ INSERT INTO sst.permisos_rol (rol, vista, permitido) VALUES
   ('auditor',     'ordenes',        TRUE),
   ('auditor',     'informes',       TRUE),
   ('auditor',     'profesionales',  FALSE),
-  ('auditor',     'configuracion',  TRUE)
+  ('auditor',     'configuracion',  TRUE),
+  -- M9 · Pre-cuentas: es plata. La ve quien la genera (admin), quien paga
+  -- (contador) y quien fiscaliza (auditor); el profesional responde por el
+  -- enlace del correo, no necesita la vista interna.
+  ('admin',       'precuentas',     TRUE),
+  ('contador',    'precuentas',     TRUE),
+  ('auditor',     'precuentas',     TRUE),
+  ('profesional', 'precuentas',     FALSE)
 ON CONFLICT (rol, vista) DO NOTHING;
 
 -- Plantillas de formatos precargadas (M4 / FOR) --------------------------------

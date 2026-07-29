@@ -9,6 +9,8 @@ import filesRoutes from '../modules/files/files.routes.js';
 import notificationsRoutes from '../modules/notifications/notifications.routes.js';
 import reportsRoutes from '../modules/reports/reports.routes.js';
 import publicRoutes from '../modules/public/public.routes.js';
+import surveysRoutes from '../modules/surveys/surveys.routes.js';
+import billingRoutes from '../modules/billing/billing.routes.js';
 import permissionsRoutes from '../modules/permissions/permissions.routes.js';
 
 const router = Router();
@@ -30,6 +32,10 @@ router.use('/drafts', draftsRoutes);
 router.use('/orders', ordersRoutes);
 // Descargas / visualización
 router.use('/files', filesRoutes);
+// M8
+router.use('/surveys', surveysRoutes);
+// M9
+router.use('/precuentas', billingRoutes);
 // M11
 router.use('/notifications', notificationsRoutes);
 // M10

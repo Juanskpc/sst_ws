@@ -389,12 +389,61 @@ CREATE TABLE IF NOT EXISTS sst.configuracion (
   actualizado_en TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- RPT-06 · Cartera. Que una OS ejecutada esté facturada, o validada por la ARL,
+-- es información EXTERNA: no se deduce de ningún estado del sistema, así que se
+-- marca explícitamente. Nulo = pendiente, que es justo lo que lista el reporte.
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS facturado_en      TIMESTAMPTZ;
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS validado_arl_en   TIMESTAMPTZ;
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS cartera_marcada_por UUID REFERENCES sst.usuarios(id) ON DELETE SET NULL;
+
+CREATE INDEX IF NOT EXISTS idx_ordenes_cartera
+  ON sst.ordenes_servicio(estado, facturado_en, validado_arl_en);
+
 -- =============================================================================
--- COSTURAS FASE 2  ·  Tablas creadas físicamente, SIN lógica de backend.
--- (No implementar ENC-/PRE-/RPT-03..07 según la Regla de Oro.)
+-- M8 · ENCUESTA DE SATISFACCIÓN (ENC-01..07)  ·  implementado en Fase 2
 -- =============================================================================
 
--- M9 · Pre-cuenta de cobro
+-- Una fila por OS: se crea al pasar la orden a EJECUTADA (con su token y el
+-- momento de envío) y se completa cuando el contacto responde.
+CREATE TABLE IF NOT EXISTS sst.respuestas_encuesta (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  orden_id        UUID NOT NULL REFERENCES sst.ordenes_servicio(id) ON DELETE CASCADE,
+  contacto_correo TEXT,
+  token           TEXT UNIQUE,
+  satisfaccion    SMALLINT CHECK (satisfaccion BETWEEN 1 AND 5),
+  recomendacion   SMALLINT CHECK (recomendacion BETWEEN 1 AND 5),
+  comentarios     TEXT,
+  enviado_en      TIMESTAMPTZ
+);
+
+-- Columnas añadidas sobre la costura original de Fase 1 (BD ya desplegadas).
+ALTER TABLE sst.respuestas_encuesta ADD COLUMN IF NOT EXISTS contacto_nombre TEXT;
+ALTER TABLE sst.respuestas_encuesta ADD COLUMN IF NOT EXISTS respondido_en   TIMESTAMPTZ;
+ALTER TABLE sst.respuestas_encuesta ADD COLUMN IF NOT EXISTS creado_en       TIMESTAMPTZ NOT NULL DEFAULT now();
+ALTER TABLE sst.respuestas_encuesta ADD COLUMN IF NOT EXISTS recordatorio_en TIMESTAMPTZ;
+-- ENC-04 · Snapshot de a quién/qué corresponde la calificación. Se guarda copiado
+-- y no por JOIN vivo porque la OS puede reasignarse después: la nota pertenece a
+-- quien ejecutó la actividad, no a quien figure hoy en la orden.
+ALTER TABLE sst.respuestas_encuesta ADD COLUMN IF NOT EXISTS profesional_id  UUID REFERENCES sst.profesionales(id) ON DELETE SET NULL;
+ALTER TABLE sst.respuestas_encuesta ADD COLUMN IF NOT EXISTS arl_id          UUID REFERENCES sst.arls(id);
+ALTER TABLE sst.respuestas_encuesta ADD COLUMN IF NOT EXISTS empresa_nombre  TEXT;
+-- ENC-03 · Los enunciados son configurables (`encuesta_preguntas`), así que se
+-- congela el texto que se le mostró a ESTE cliente: si mañana cambia la
+-- redacción, las respuestas viejas siguen contando lo que realmente se preguntó.
+ALTER TABLE sst.respuestas_encuesta ADD COLUMN IF NOT EXISTS preguntas       JSONB;
+
+-- ENC-06 · Una sola encuesta por OS (y un solo token): evita reenviar dos
+-- formularios distintos para la misma orden.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_encuesta_orden ON sst.respuestas_encuesta(orden_id);
+CREATE INDEX IF NOT EXISTS idx_encuesta_respondido ON sst.respuestas_encuesta(respondido_en);
+
+-- =============================================================================
+-- M9 · PRE-CUENTA DE COBRO (PRE-01..09)  ·  implementado en Fase 2
+-- =============================================================================
+
+-- PRE-02 · Valor hora por profesional y tipo de actividad. El histórico se
+-- conserva: se agregan filas con nuevo `vigente_desde` en vez de editar, para
+-- que una pre-cuenta vieja se pueda recalcular con la tarifa de su momento.
 CREATE TABLE IF NOT EXISTS sst.tarifas_actividad_profesional (
   id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   profesional_id UUID NOT NULL REFERENCES sst.profesionales(id) ON DELETE CASCADE,
@@ -424,17 +473,39 @@ CREATE TABLE IF NOT EXISTS sst.precuenta_items (
   monto               NUMERIC(14,2) NOT NULL
 );
 
--- M8 · Encuestas de satisfacción
-CREATE TABLE IF NOT EXISTS sst.respuestas_encuesta (
-  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  orden_id        UUID NOT NULL REFERENCES sst.ordenes_servicio(id) ON DELETE CASCADE,
-  contacto_correo TEXT,
-  token           TEXT UNIQUE,
-  satisfaccion    SMALLINT CHECK (satisfaccion BETWEEN 1 AND 5),
-  recomendacion   SMALLINT CHECK (recomendacion BETWEEN 1 AND 5),
-  comentarios     TEXT,
-  enviado_en      TIMESTAMPTZ
-);
+-- Columnas añadidas al implementar M9 sobre la costura de Fase 1.
+-- PRE-05 · El profesional acepta o rechaza desde un enlace del correo, sin
+-- login: el token ES la credencial (mismo patrón que M6 y M8).
+ALTER TABLE sst.precuentas ADD COLUMN IF NOT EXISTS token          TEXT UNIQUE;
+ALTER TABLE sst.precuentas ADD COLUMN IF NOT EXISTS enviado_en     TIMESTAMPTZ;
+ALTER TABLE sst.precuentas ADD COLUMN IF NOT EXISTS respondido_en  TIMESTAMPTZ;
+ALTER TABLE sst.precuentas ADD COLUMN IF NOT EXISTS generado_por   UUID REFERENCES sst.usuarios(id) ON DELETE SET NULL;
+ALTER TABLE sst.precuentas ADD COLUMN IF NOT EXISTS actualizado_en TIMESTAMPTZ NOT NULL DEFAULT now();
+
+-- Una sola pre-cuenta por profesional y periodo: regenerar actualiza la que ya
+-- existe en lugar de duplicar el cobro del mes.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_precuenta_prof_periodo
+  ON sst.precuentas(profesional_id, periodo);
+CREATE INDEX IF NOT EXISTS idx_precuentas_periodo ON sst.precuentas(periodo);
+
+-- PRE-03 · Datos de la OS congelados en el ítem: el documento que el
+-- profesional aceptó debe poder reimprimirse igual aunque la orden cambie
+-- después (o se elimine el nombre de la empresa por corrección de datos).
+ALTER TABLE sst.precuenta_items ADD COLUMN IF NOT EXISTS orden_codigo    TEXT;
+ALTER TABLE sst.precuenta_items ADD COLUMN IF NOT EXISTS empresa_nombre  TEXT;
+ALTER TABLE sst.precuenta_items ADD COLUMN IF NOT EXISTS arl_nombre      TEXT;
+ALTER TABLE sst.precuenta_items ADD COLUMN IF NOT EXISTS actividad       TEXT;
+ALTER TABLE sst.precuenta_items ADD COLUMN IF NOT EXISTS fecha_ejecucion DATE;
+-- De dónde salió el valor hora aplicado: 'tarifa' (PRE-02) o 'profesional'
+-- (valor_hora base). Se muestra en pantalla para que una cifra rara se pueda
+-- explicar sin abrir la base de datos.
+ALTER TABLE sst.precuenta_items ADD COLUMN IF NOT EXISTS origen_tarifa   TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_precuenta_items_precuenta ON sst.precuenta_items(precuenta_id);
+
+-- =============================================================================
+-- COSTURAS FASE 2  ·  (ya no queda ninguna: M8 y M9 están implementados)
+-- =============================================================================
 
 -- =============================================================================
 -- FUNCIONES Y TRIGGERS
@@ -577,6 +648,131 @@ FROM sst.arls a
 LEFT JOIN sst.ordenes_servicio o ON o.arl_id = a.id
 GROUP BY a.id, a.nombre
 ORDER BY a.nombre;
+
+-- ENC-05/07 · Encuestas con todo lo legible ya resuelto: alimenta el dashboard
+-- de satisfacción, el listado y la exportación.
+--
+-- Los nombres salen del snapshot de la encuesta y solo caen al JOIN vivo cuando
+-- falta (encuestas creadas antes de que existiera el snapshot).
+DROP VIEW IF EXISTS sst.vw_encuestas;
+CREATE VIEW sst.vw_encuestas AS
+SELECT e.id,
+       e.orden_id,
+       o.codigo                                   AS orden_codigo,
+       COALESCE(e.empresa_nombre, o.empresa_nombre) AS empresa_nombre,
+       COALESCE(e.arl_id, o.arl_id)               AS arl_id,
+       a.nombre                                   AS arl_nombre,
+       COALESCE(e.profesional_id, o.profesional_asignado_id) AS profesional_id,
+       p.nombre                                   AS profesional_nombre,
+       o.actividad_economica,
+       o.horas_asignadas,
+       o.fecha_programada,
+       e.contacto_nombre,
+       e.contacto_correo,
+       e.satisfaccion,
+       e.recomendacion,
+       e.comentarios,
+       e.preguntas,
+       e.enviado_en,
+       e.respondido_en,
+       e.respondido_en IS NOT NULL                AS respondida,
+       date_trunc('month', COALESCE(e.respondido_en, e.enviado_en, e.creado_en)) AS mes
+FROM sst.respuestas_encuesta e
+JOIN sst.ordenes_servicio o     ON o.id = e.orden_id
+LEFT JOIN sst.arls a            ON a.id = COALESCE(e.arl_id, o.arl_id)
+LEFT JOIN sst.profesionales p   ON p.id = COALESCE(e.profesional_id, o.profesional_asignado_id);
+
+-- PRE-01 · Horas ejecutadas por profesional y mes: la materia prima de la
+-- pre-cuenta.
+--
+-- El mes de una OS es el de su `fecha_programada` (cuándo se ejecutó la
+-- actividad), no el de su carga: una orden importada en junio y ejecutada en
+-- julio se le paga al profesional en julio. Si no tiene fecha programada se cae
+-- a `actualizado_en`, que en una OS EJECUTADA es su último cambio de estado.
+DROP VIEW IF EXISTS sst.vw_horas_ejecutadas;
+CREATE VIEW sst.vw_horas_ejecutadas AS
+SELECT o.id                     AS orden_id,
+       o.codigo                 AS orden_codigo,
+       o.profesional_asignado_id AS profesional_id,
+       p.nombre                 AS profesional_nombre,
+       o.empresa_nombre,
+       a.nombre                 AS arl_nombre,
+       o.tipo_actividad,
+       o.actividad_economica,
+       COALESCE(o.horas_asignadas, 0) AS horas,
+       COALESCE(o.fecha_programada, o.actualizado_en)::date AS fecha_ejecucion,
+       to_char(COALESCE(o.fecha_programada, o.actualizado_en), 'YYYY-MM') AS periodo
+FROM sst.ordenes_servicio o
+JOIN sst.arls a               ON a.id = o.arl_id
+LEFT JOIN sst.profesionales p ON p.id = o.profesional_asignado_id
+WHERE o.estado = 'EJECUTADA' AND o.profesional_asignado_id IS NOT NULL;
+
+-- RPT-03 · Órdenes vencidas: llevan demasiado tiempo sin ejecutarse.
+--
+-- La antigüedad se cuenta desde la fecha de la orden y, si la ARL no la trae,
+-- desde que se cargó al sistema. El umbral (60 días en el FRS) NO va aquí: lo
+-- aplica la consulta, para poder mirar el reporte con otro corte sin migrar.
+DROP VIEW IF EXISTS sst.vw_ordenes_vencidas;
+CREATE VIEW sst.vw_ordenes_vencidas AS
+SELECT o.id,
+       o.codigo,
+       o.estado,
+       o.empresa_nombre,
+       o.nit_nic,
+       a.nombre  AS arl_nombre,
+       o.arl_id,
+       p.nombre  AS profesional_nombre,
+       o.profesional_asignado_id AS profesional_id,
+       o.horas_asignadas,
+       o.fecha_orden,
+       o.fecha_vencimiento,
+       o.fecha_carga,
+       o.fecha_programada,
+       COALESCE(o.fecha_orden, o.fecha_carga::date)                         AS fecha_referencia,
+       (CURRENT_DATE - COALESCE(o.fecha_orden, o.fecha_carga::date))::int    AS dias_transcurridos,
+       CASE WHEN o.fecha_vencimiento IS NOT NULL
+            THEN (o.fecha_vencimiento - CURRENT_DATE)::int END               AS dias_para_vencer
+FROM sst.ordenes_servicio o
+JOIN sst.arls a               ON a.id = o.arl_id
+LEFT JOIN sst.profesionales p ON p.id = o.profesional_asignado_id
+WHERE o.estado NOT IN ('EJECUTADA', 'CANCELADA');
+
+-- RPT-06 · Cartera: ejecutadas que siguen sin facturar o sin validar la ARL.
+DROP VIEW IF EXISTS sst.vw_cartera;
+CREATE VIEW sst.vw_cartera AS
+SELECT o.id,
+       o.codigo,
+       o.empresa_nombre,
+       o.nit_nic,
+       o.arl_id,
+       a.nombre AS arl_nombre,
+       o.profesional_asignado_id AS profesional_id,
+       p.nombre AS profesional_nombre,
+       o.horas_asignadas,
+       o.valor_total,
+       COALESCE(o.fecha_programada, o.actualizado_en)::date AS fecha_ejecucion,
+       (CURRENT_DATE - COALESCE(o.fecha_programada, o.actualizado_en)::date)::int AS dias_desde_ejecucion,
+       o.facturado_en,
+       o.validado_arl_en,
+       -- Etiqueta única para agrupar y para pintar la fila.
+       CASE WHEN o.facturado_en IS NULL AND o.validado_arl_en IS NULL THEN 'sin_facturar_ni_validar'
+            WHEN o.facturado_en IS NULL                               THEN 'sin_facturar'
+            ELSE 'sin_validar_arl' END AS pendiente
+FROM sst.ordenes_servicio o
+JOIN sst.arls a               ON a.id = o.arl_id
+LEFT JOIN sst.profesionales p ON p.id = o.profesional_asignado_id
+WHERE o.estado = 'EJECUTADA'
+  AND (o.facturado_en IS NULL OR o.validado_arl_en IS NULL);
+
+-- PRE-08 · Pre-cuentas con los datos del profesional ya resueltos.
+DROP VIEW IF EXISTS sst.vw_precuentas;
+CREATE VIEW sst.vw_precuentas AS
+SELECT pc.*,
+       p.nombre  AS profesional_nombre,
+       p.correo  AS profesional_correo,
+       (SELECT count(*)::int FROM sst.precuenta_items i WHERE i.precuenta_id = pc.id) AS total_ordenes
+FROM sst.precuentas pc
+JOIN sst.profesionales p ON p.id = pc.profesional_id;
 
 -- RPT-01 · Estados dentro del mes en curso.
 CREATE OR REPLACE VIEW sst.vw_estados_mensual AS

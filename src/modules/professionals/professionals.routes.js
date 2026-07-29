@@ -210,4 +210,54 @@ router.delete('/:id/ocupaciones/:slotId', requireRole('admin'), asyncHandler(asy
   res.json({ data: { id: r.rows[0].id } });
 }));
 
+// ---------------------------------------------------------------------------
+// M9 · PRE-02 — Tarifas por tipo de actividad (valor hora del profesional).
+// ---------------------------------------------------------------------------
+
+/**
+ * Tarifas del profesional. Se devuelven todas (incluidas las históricas): la
+ * vigencia la resuelve el cálculo de la pre-cuenta según la fecha del periodo,
+ * y ver el histórico es lo que permite entender un monto ya facturado.
+ */
+router.get('/:id/tarifas', asyncHandler(async (req, res) => {
+  const r = await pool.query(
+    `SELECT id, profesional_id, actividad, valor_hora, vigente_desde, creado_en
+       FROM sst.tarifas_actividad_profesional
+      WHERE profesional_id=$1
+      ORDER BY actividad, vigente_desde DESC`,
+    [req.params.id]
+  );
+  res.json({ data: r.rows });
+}));
+
+/**
+ * Alta de tarifa (admin). Cambiar un valor NO edita la fila anterior: se agrega
+ * otra con nueva vigencia, para no alterar pre-cuentas ya calculadas. Repetir
+ * actividad + misma fecha sí sobrescribe (es corregir un error de digitación).
+ */
+router.post('/:id/tarifas', requireRole('admin'), asyncHandler(async (req, res) => {
+  const { actividad, valor_hora: valorHora, vigente_desde: vigenteDesde } = req.body || {};
+  const nombre = (actividad || '').trim();
+  if (!nombre) throw badRequest('La actividad es obligatoria');
+  const valor = Number(valorHora);
+  if (!Number.isFinite(valor) || valor <= 0) throw badRequest('El valor hora debe ser un número mayor que cero');
+
+  const r = await pool.query(
+    `INSERT INTO sst.tarifas_actividad_profesional (profesional_id, actividad, valor_hora, vigente_desde)
+     VALUES ($1,$2,$3, COALESCE($4::date, CURRENT_DATE))
+     RETURNING id, profesional_id, actividad, valor_hora, vigente_desde, creado_en`,
+    [req.params.id, nombre, valor, vigenteDesde || null]
+  );
+  res.status(201).json({ data: r.rows[0] });
+}));
+
+router.delete('/:id/tarifas/:tarifaId', requireRole('admin'), asyncHandler(async (req, res) => {
+  const r = await pool.query(
+    `DELETE FROM sst.tarifas_actividad_profesional WHERE id=$1 AND profesional_id=$2 RETURNING id`,
+    [req.params.tarifaId, req.params.id]
+  );
+  if (!r.rows[0]) throw notFound('Tarifa no encontrada');
+  res.json({ data: { id: r.rows[0].id } });
+}));
+
 export default router;

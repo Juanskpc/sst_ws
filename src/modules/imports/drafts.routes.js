@@ -34,13 +34,27 @@ function parseFechaCO(raw) {
 }
 
 // SELECT base con nombres legibles (ARL, archivo del lote y profesional asignado).
+//
+// Se trae también el estado de la OS materializada (`os_estado`/`os_codigo`): la
+// vista Órdenes muestra en la misma fila el borrador y, una vez validado, el
+// ciclo de vida real de la orden (SIN PROGRAMAR → … → EJECUTADA). Es NULL
+// mientras el borrador siga pendiente de validar.
+// La asignación real (M5) vive en la OS, no en el borrador: por eso se traen
+// también su profesional y su fecha programada, que son los que valen una vez
+// materializada la orden.
 const DRAFT_SELECT = `
   SELECT d.*, a.nombre AS arl_nombre, b.nombre_archivo, b.tipo_mime,
-         p.nombre AS profesional_nombre
+         p.nombre AS profesional_nombre,
+         o.estado::text AS os_estado, o.codigo AS os_codigo,
+         o.fecha_programada AS os_fecha_programada,
+         o.profesional_asignado_id AS os_profesional_id,
+         po.nombre AS os_profesional_nombre
   FROM sst.borradores_extraccion d
   LEFT JOIN sst.arls a ON a.id = d.arl_id
   LEFT JOIN sst.lotes_importacion b ON b.id = d.lote_importacion_id
-  LEFT JOIN sst.profesionales p ON p.id = d.profesional_asignado_id`;
+  LEFT JOIN sst.profesionales p ON p.id = d.profesional_asignado_id
+  LEFT JOIN sst.ordenes_servicio o ON o.id = d.orden_servicio_id
+  LEFT JOIN sst.profesionales po ON po.id = o.profesional_asignado_id`;
 
 // Vista "Órdenes" (M3). Filtrable por estado y por soft-delete.
 //   ?estado=PENDIENTE_VALIDACION | VALIDADA | ... | ALL

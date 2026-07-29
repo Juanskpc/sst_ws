@@ -8,6 +8,8 @@
 import crypto from 'node:crypto';
 import bcrypt from 'bcryptjs';
 import { pool, withTransaction } from '../src/config/db.js';
+import { storage } from '../src/services/storage.service.js';
+import { placeholderSoporte } from './placeholders.js';
 
 const token = () => crypto.randomBytes(18).toString('base64url');
 const iso = (daysAgo, hour = 9) => {
@@ -232,13 +234,19 @@ async function main() {
           const files = [
             ['acta_visita_firmada.pdf', 'application/pdf'],
             ['lista_asistencia.pdf', 'application/pdf'],
-            ['evidencia_fotografica.jpg', 'image/jpeg'],
+            ['evidencia_fotografica.png', 'image/png'],
           ].slice(0, 2 + (idx % 2));
           for (const [name, mime] of files) {
+            // El binario también se deja en el almacenamiento: sin él, el visor
+            // de "Verificación de soportes" (VER-01) solo puede mostrar un error.
+            // Se usa storage.put para que la key tenga el mismo formato que
+            // produce una carga real desde el enlace público.
+            const buffer = await placeholderSoporte(name, mime, codigo);
+            const key = await storage.put('supports', name, buffer);
             await client.query(
               `INSERT INTO sst.archivos_soporte (orden_id, enlace_publico_id, url_archivo, nombre_original, mime, tamano_bytes, via_enlace_publico, subido_en)
                VALUES ($1,$2,$3,$4,$5,$6,true,$7)`,
-              [orderId, link.rows[0].id, `supports/${orderId}/${name}`, name, mime, 120000 + idx * 5000, iso(Math.max(0, dCarga - 5))]
+              [orderId, link.rows[0].id, key, name, mime, buffer.length, iso(Math.max(0, dCarga - 5))]
             );
           }
         }
