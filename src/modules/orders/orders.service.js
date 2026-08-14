@@ -10,6 +10,40 @@ export async function getOrderExpanded(id, client = pool) {
   return r.rows[0];
 }
 
+/**
+ * ASG-08 · Ficha de profesional que corresponde a una cuenta de acceso.
+ *
+ * Se resuelve primero por `usuario_id` —el enlace explícito, que es el que deja
+ * el backfill del seed y el alta desde /profesionales— y solo si no hay, por
+ * correo. El segundo intento existe porque las fichas y las cuentas se crearon
+ * en pantallas distintas durante meses y nada las cruzaba: sin él, un
+ * profesional dado de alta antes que su cuenta vería el dashboard vacío.
+ *
+ * El respaldo por correo exige correspondencia 1-a-1, igual que el backfill:
+ * hay fichas que comparten buzón, y con `LIMIT 1` el profesional acabaría
+ * viendo las órdenes de un compañero. Ante ambigüedad se devuelve null y la
+ * vista pide que un administrador enlace la ficha.
+ */
+export async function profesionalDeUsuario(usuario, client = pool) {
+  // El JWT trae el id del usuario en `sub`; se acepta `id` también para poder
+  // llamar a esta función con una fila de sst.usuarios recién leída.
+  const usuarioId = usuario?.sub || usuario?.id;
+  if (!usuarioId) return null;
+  const porEnlace = await client.query(
+    `SELECT * FROM sst.profesionales WHERE usuario_id = $1 LIMIT 1`,
+    [usuarioId]
+  );
+  if (porEnlace.rows[0]) return porEnlace.rows[0];
+
+  if (!usuario.correo) return null;
+  const porCorreo = await client.query(
+    `SELECT * FROM sst.profesionales
+      WHERE lower(btrim(correo)) = lower(btrim($1))`,
+    [usuario.correo]
+  );
+  return porCorreo.rows.length === 1 ? porCorreo.rows[0] : null;
+}
+
 /** Cambia el estado usando la función de dominio (valida transición + auditoría). */
 export async function changeStatus({ orderId, newStatus, userId, motivo = null }, client = pool) {
   const r = await client.query(

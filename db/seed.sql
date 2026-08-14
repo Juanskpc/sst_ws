@@ -158,3 +158,31 @@ UPDATE sst.ordenes_servicio o
  WHERE o.empresa_id IS NULL
    AND e.nombre_normalizado <> ''
    AND e.nombre_normalizado = upper(regexp_replace(coalesce(o.empresa_nombre, ''), '[^a-zA-Z0-9]', '', 'g'));
+
+-- =============================================================================
+-- ASG-08 · Vínculo entre la cuenta de acceso y la ficha del profesional
+-- =============================================================================
+-- `profesionales.usuario_id` existía desde el principio pero nunca se llenó: las
+-- fichas se dieron de alta desde /profesionales (CFG-01) y las cuentas desde
+-- Configuración → Usuarios, sin nada que las cruzara. Sin ese enlace no hay
+-- forma de saber qué órdenes son "las mías" cuando entra un profesional, que es
+-- justo lo que pide ASG-08.
+--
+-- El cruce es por correo, en minúsculas y sin espacios, y solo cuando la
+-- correspondencia es 1-a-1: hay fichas que comparten correo (dos asesores dados
+-- de alta con el buzón de quien los registró), y enlazar ambas al mismo usuario
+-- le mostraría al profesional órdenes de un compañero. Esas quedan sin enlazar
+-- a propósito, para que un administrador las corrija a mano.
+--
+-- Solo toca filas con `usuario_id IS NULL`, así que es idempotente y nunca pisa
+-- un enlace hecho desde la UI.
+UPDATE sst.profesionales p
+   SET usuario_id = u.id, actualizado_en = now()
+  FROM sst.usuarios u
+ WHERE p.usuario_id IS NULL
+   AND lower(btrim(u.correo)) = lower(btrim(p.correo))
+   -- 1-a-1 por ambos lados: ni la ficha ni la cuenta pueden ser ambiguas.
+   AND (SELECT count(*) FROM sst.profesionales x
+         WHERE lower(btrim(x.correo)) = lower(btrim(p.correo))) = 1
+   AND (SELECT count(*) FROM sst.usuarios y
+         WHERE lower(btrim(y.correo)) = lower(btrim(p.correo))) = 1;

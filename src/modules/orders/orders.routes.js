@@ -3,7 +3,7 @@ import { pool, withTransaction } from '../../config/db.js';
 import { asyncHandler } from '../../utils/asyncHandler.js';
 import { authRequired, requireRole } from '../../middleware/auth.js';
 import { badRequest } from '../../utils/httpError.js';
-import { getOrderExpanded, changeStatus, generateOrderDocuments } from './orders.service.js';
+import { getOrderExpanded, changeStatus, generateOrderDocuments, profesionalDeUsuario } from './orders.service.js';
 import { randomToken } from '../../utils/security.js';
 import { env } from '../../config/env.js';
 import { sendEmail } from '../../services/email.service.js';
@@ -60,6 +60,53 @@ router.get('/', asyncHandler(async (req, res) => {
     params
   );
   res.json({ data: r.rows });
+}));
+
+/**
+ * ASG-08 · "Mis órdenes": las de quien está autenticado, sin poder pedir las de
+ * otro.
+ *
+ * Va deliberadamente ANTES de `/:id`: Express resuelve por orden de
+ * declaración y `/orders/mias` encajaría en el comodín, que trataría "mias"
+ * como un UUID y respondería un 500 de Postgres.
+ *
+ * El acote es del servidor, no del cliente: `GET /orders?profesional_id=...`
+ * acepta cualquier id, así que un profesional podría listar las órdenes de un
+ * compañero cambiando el parámetro. Aquí el id sale de la sesión.
+ */
+router.get('/mias', asyncHandler(async (req, res) => {
+  const profesional = await profesionalDeUsuario(req.user);
+  if (!profesional) {
+    // 200 y no 404: la cuenta es válida, lo que falta es la ficha enlazada.
+    // La vista lo explica y pide que un administrador la enlace.
+    return res.json({
+      data: [],
+      profesional: null,
+      motivo: 'Esta cuenta no tiene una ficha de profesional enlazada. Pida a un administrador que la asocie desde Profesionales.',
+    });
+  }
+  const estado = req.query.estado;
+  const params = [profesional.id];
+  let filtroEstado = '';
+  if (estado) {
+    params.push(estado);
+    filtroEstado = ` AND estado = $${params.length}::sst.estado_orden`;
+  }
+  const r = await pool.query(
+    `SELECT * FROM sst.vw_ordenes_expandidas
+      WHERE profesional_asignado_id = $1${filtroEstado}
+      -- Primero lo que aún tiene que ejecutar y por fecha de visita: es una
+      -- agenda, no un histórico. Las ya cerradas caen al final.
+      ORDER BY (estado IN ('PROGRAMADA','EN VERIFICACIÓN')) DESC,
+               fecha_programada ASC NULLS LAST,
+               fecha_carga DESC
+      LIMIT 200`,
+    params
+  );
+  res.json({
+    data: r.rows,
+    profesional: { id: profesional.id, nombre: profesional.nombre },
+  });
 }));
 
 // Detalle completo: OS + historial + documentos + soportes + enlace público.

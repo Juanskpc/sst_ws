@@ -61,6 +61,37 @@ async function assertContactoDisponible({ correo, telefono, excluirId = null }) 
   throw conflict(`El teléfono ya está registrado a nombre de ${porTelefono.nombre}.`);
 }
 
+/**
+ * ASG-08 · Enlaza la ficha con la cuenta de acceso que tenga el mismo correo.
+ *
+ * Se hace sola, como el maestro de empresas de CFG-02: la ficha (CFG-01) y la
+ * cuenta (Configuración → Usuarios) se crean en pantallas distintas y nadie iba
+ * a acordarse de cruzarlas a mano, con lo que el profesional entraba y su
+ * dashboard salía vacío.
+ *
+ * Solo enlaza si hay exactamente una cuenta con ese correo; si hay varias no
+ * hay forma de saber cuál es y enlazar la equivocada le enseñaría a alguien las
+ * órdenes de otro. Se llama después de escribir la ficha, y no lanza: fallar
+ * aquí no debe tumbar un alta de profesional válida.
+ */
+async function enlazarCuenta(profesionalId, correo) {
+  if (!correo) return;
+  try {
+    await pool.query(
+      `UPDATE sst.profesionales p
+          SET usuario_id = u.id, actualizado_en = now()
+         FROM sst.usuarios u
+        WHERE p.id = $1
+          AND lower(btrim(u.correo)) = lower(btrim($2))
+          AND (SELECT count(*) FROM sst.usuarios y
+                WHERE lower(btrim(y.correo)) = lower(btrim($2))) = 1`,
+      [profesionalId, correo]
+    );
+  } catch (e) {
+    console.warn(`[profesionales] no se pudo enlazar la cuenta de ${profesionalId}: ${e.message}`);
+  }
+}
+
 // CFG-01 · Listado (con buscador rápido opcional ?q=)
 router.get('/', asyncHandler(async (req, res) => {
   const { q } = req.query;
@@ -94,6 +125,7 @@ router.post('/', requireRole('admin'), asyncHandler(async (req, res) => {
      VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
     [nombre, correo, telefono, especialidad, valor_hora, estado]
   );
+  await enlazarCuenta(r.rows[0].id, r.rows[0].correo);
   res.status(201).json({ data: r.rows[0] });
 }));
 
@@ -116,6 +148,15 @@ router.put('/:id', requireRole('admin'), asyncHandler(async (req, res) => {
     [req.params.id, nombre, correo, telefono, especialidad, valor_hora, estado]
   );
   if (!r.rows[0]) throw notFound('Profesional no encontrado');
+  // Si cambió el correo, el enlace anterior puede haber dejado de ser cierto:
+  // se suelta y se vuelve a resolver. Corregir el correo de una ficha es
+  // precisamente como un administrador la asocia a la cuenta correcta.
+  if (correo) {
+    await pool.query(`UPDATE sst.profesionales SET usuario_id = NULL WHERE id = $1`, [req.params.id]);
+    await enlazarCuenta(req.params.id, r.rows[0].correo);
+    const refrescado = await pool.query(`SELECT * FROM sst.profesionales WHERE id=$1`, [req.params.id]);
+    return res.json({ data: refrescado.rows[0] });
+  }
   res.json({ data: r.rows[0] });
 }));
 
