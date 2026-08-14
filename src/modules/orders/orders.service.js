@@ -30,7 +30,10 @@ export async function generateOrderDocuments(orderId, client = pool) {
     : null;
 
   const tpls = await client.query(
-    `SELECT * FROM sst.plantillas WHERE activo AND (arl_id = $1 OR arl_id IS NULL) ORDER BY nombre`,
+    // CFG-03 · `orden` deja al administrador decidir en qué secuencia salen los
+    // formatos de una ARL (el correo de asignación los adjunta en este orden).
+    `SELECT * FROM sst.plantillas WHERE activo AND (arl_id = $1 OR arl_id IS NULL)
+      ORDER BY orden, nombre`,
     [order.arl_id]
   );
 

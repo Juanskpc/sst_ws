@@ -29,15 +29,20 @@ router.get('/', asyncHandler(async (req, res) => {
   res.json({ data: r.rows });
 }));
 
-/** Periodos con pre-cuentas + periodos con horas ejecutadas aún sin generar. */
+/**
+ * Periodos con horas ejecutadas, con cuántas pre-cuentas se generaron ya para
+ * cada uno. CFG-05 usa ese contador para avisar de los periodos que pasaron el
+ * día de corte y siguen sin cerrarse (el cierre se dispara a mano).
+ */
 router.get('/periodos', asyncHandler(async (_req, res) => {
   const r = await pool.query(
-    `SELECT periodo,
-            count(*)::int                       AS ordenes,
-            sum(horas)::numeric                 AS horas,
-            count(DISTINCT profesional_id)::int AS profesionales
-       FROM sst.vw_horas_ejecutadas
-      GROUP BY periodo ORDER BY periodo DESC LIMIT 24`
+    `SELECT h.periodo,
+            count(*)::int                         AS ordenes,
+            sum(h.horas)::numeric                 AS horas,
+            count(DISTINCT h.profesional_id)::int AS profesionales,
+            (SELECT count(*)::int FROM sst.precuentas p WHERE p.periodo = h.periodo) AS precuentas_generadas
+       FROM sst.vw_horas_ejecutadas h
+      GROUP BY h.periodo ORDER BY h.periodo DESC LIMIT 24`
   );
   res.json({ data: r.rows });
 }));

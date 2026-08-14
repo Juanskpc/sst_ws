@@ -12,6 +12,7 @@ import publicRoutes from '../modules/public/public.routes.js';
 import surveysRoutes from '../modules/surveys/surveys.routes.js';
 import billingRoutes from '../modules/billing/billing.routes.js';
 import permissionsRoutes from '../modules/permissions/permissions.routes.js';
+import companiesRoutes from '../modules/companies/companies.routes.js';
 
 const router = Router();
 
@@ -25,6 +26,8 @@ router.use('/public', publicRoutes);
 router.use('/auth', authRoutes);
 // CFG-01
 router.use('/professionals', professionalsRoutes);
+// CFG-02
+router.use('/empresas', companiesRoutes);
 // M2
 router.use('/imports', importsRoutes);
 router.use('/drafts', draftsRoutes);

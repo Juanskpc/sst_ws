@@ -42,7 +42,7 @@ export async function auditar({ usuarioId = null, correo = null, evento, exito =
 export const ipDe = (req) => req?.ip || req?.socket?.remoteAddress || null;
 
 /** Vistas del sidebar gestionables desde Configuración → Roles y permisos. */
-export const VISTAS_SISTEMA = ['dashboard', 'importar', 'ordenes', 'informes', 'precuentas', 'profesionales', 'configuracion'];
+export const VISTAS_SISTEMA = ['dashboard', 'importar', 'ordenes', 'informes', 'precuentas', 'empresas', 'profesionales', 'configuracion'];
 
 /** Vistas permitidas para un rol (para armar la sesión del usuario autenticado). */
 export async function permisosDeRol(rol) {

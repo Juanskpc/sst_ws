@@ -5,6 +5,7 @@ import { authRequired, requireRole } from '../../middleware/auth.js';
 import { badRequest, notFound, conflict } from '../../utils/httpError.js';
 import { computeOverallConfidence } from '../../services/extraction.service.js';
 import { CANONICAL_FIELDS } from '../../services/gemini.service.js';
+import { resolverEmpresaId } from '../companies/companies.service.js';
 
 const router = Router();
 router.use(authRequired);
@@ -219,21 +220,38 @@ router.post('/:id/validate', requireRole('admin'), asyncHandler(async (req, res)
     );
     const codigo = `OS-${year}-${String(cnt.rows[0].c + 1).padStart(4, '0')}`;
 
+    // CFG-02 · La OS queda enlazada al maestro de empresas, creando la ficha si
+    // la empresa es nueva. Los textos (nit_nic / empresa_nombre) se conservan
+    // igual: son el dato histórico de lo que decía el documento de la ARL.
+    const empresaId = await resolverEmpresaId({
+      nit: val('nit_nic'),
+      nombre: val('empresa_nombre'),
+      actividad_economica: val('actividad_economica'),
+      ciudad: val('ciudad_ejecucion'),
+      direccion: val('direccion'),
+      contacto_nombre: val('contacto_empresa_nombre'),
+      contacto_cargo: val('contacto_empresa_cargo'),
+      contacto_telefono: val('contacto_empresa_telefono'),
+      contacto_sst_nombre: val('contacto_sst_nombre'),
+      contacto_sst_telefono: val('contacto_sst_telefono'),
+      contacto_sst_correo: val('contacto_sst_correo'),
+    }, client);
+
     const ord = await client.query(
       `INSERT INTO sst.ordenes_servicio (
          codigo, arl_id, numero_orden, codigo_cronograma, secuencia, nro_afiliacion,
-         nit_nic, empresa_nombre, actividad_economica, tipo_actividad, modalidad,
+         nit_nic, empresa_nombre, empresa_id, actividad_economica, tipo_actividad, modalidad,
          horas_asignadas, valor_unitario, valor_total,
          fecha_orden, fecha_vencimiento, ciudad_ejecucion, direccion, descripcion,
          contacto_empresa_nombre, contacto_empresa_cargo, contacto_empresa_telefono,
          contacto_sst_nombre, contacto_sst_telefono, contacto_sst_correo,
          lote_importacion_id, url_archivo_original, metadatos_extraccion, estado)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,
-               $20,$21,$22,$23,$24,$25,$26,$27,$28,'SIN PROGRAMAR')
+               $20,$21,$22,$23,$24,$25,$26,$27,$28,$29,'SIN PROGRAMAR')
        RETURNING *`,
       [
         codigo, draft.arl_id, numeroOrden, cron, sec, val('nro_afiliacion'),
-        val('nit_nic'), val('empresa_nombre'), val('actividad_economica'),
+        val('nit_nic'), val('empresa_nombre'), empresaId, val('actividad_economica'),
         val('tipo_actividad'), val('modalidad'),
         parseNumeroCO(val('horas_asignadas')), parseNumeroCO(val('valor_unitario')),
         parseNumeroCO(val('valor_total')),

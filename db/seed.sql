@@ -16,6 +16,11 @@ INSERT INTO sst.configuracion (clave, valor, descripcion) VALUES
    'Umbral mínimo de confianza de la IA (%). Campos por debajo se marcan para revisión.'),
   ('company_name', '"JD&D Consultores en Sistemas de Gestión"'::jsonb,
    'Razón social mostrada en formatos y correos.'),
+  -- CFG-05 · Día del mes en que se cierra el cobro a profesionales. NO dispara
+  -- nada solo (el despliegue no tiene cron): es la fecha contra la que la vista
+  -- de Pre-cuentas avisa de los periodos que quedaron sin generar.
+  ('precuenta_dia_corte', '5'::jsonb,
+   'Día del mes en que se cierran las pre-cuentas del mes anterior (1-28).'),
   -- ENC-03 · Enunciados de la encuesta ("preguntas variables"): se editan aquí
   -- sin tocar código ni migrar. Las dos escalas son 1-5 y alimentan el
   -- dashboard, por eso su significado no cambia aunque cambie la redacción.
@@ -63,7 +68,14 @@ INSERT INTO sst.permisos_rol (rol, vista, permitido) VALUES
   ('admin',       'precuentas',     TRUE),
   ('contador',    'precuentas',     TRUE),
   ('auditor',     'precuentas',     TRUE),
-  ('profesional', 'precuentas',     FALSE)
+  ('profesional', 'precuentas',     FALSE),
+  -- CFG-02 · Empresas clientes: maestro comercial. Lo mantiene el admin; el
+  -- contador y el auditor lo consultan (aparece en cartera y pre-cuentas). El
+  -- profesional no lo necesita.
+  ('admin',       'empresas',       TRUE),
+  ('contador',    'empresas',       TRUE),
+  ('auditor',     'empresas',       TRUE),
+  ('profesional', 'empresas',       FALSE)
 ON CONFLICT (rol, vista) DO NOTHING;
 
 -- Plantillas de formatos precargadas (M4 / FOR) --------------------------------
@@ -81,3 +93,68 @@ JOIN sst.arls a ON a.nombre = v.arl_nombre
 WHERE NOT EXISTS (
   SELECT 1 FROM sst.plantillas t WHERE t.nombre = v.nombre
 );
+
+-- =============================================================================
+-- CFG-02 · Derivación del maestro de empresas desde las OS ya cargadas
+-- =============================================================================
+-- Las OS anteriores a CFG-02 solo tienen la empresa como texto. Aquí se destila
+-- el maestro y se enlazan. Solo toca filas con `empresa_id IS NULL`, así que
+-- re-ejecutar la migración no duplica nada ni pisa ediciones del administrador.
+--
+-- Se resuelve primero por NIT y solo después por nombre: el NIT es el
+-- identificador real, pero llega ilegible del OCR con suficiente frecuencia
+-- ('900.184.?52-1') como para necesitar el segundo intento.
+
+-- 1 · Alta: una empresa por nombre, con el NIT mayoritario.
+--
+-- Se agrupa por NOMBRE y no por NIT porque el mismo cliente llega con el NIT
+-- roto en algunas órdenes ('900.184.?52-1' frente a '900.184.552-1' en el resto)
+-- y agrupar por NIT crearía una ficha duplicada por cada error de lectura. Entre
+-- las variantes de NIT de un mismo nombre gana la que aparece en más órdenes;
+-- a igualdad, la más reciente.
+--
+-- Contrapartida asumida: dos empresas realmente distintas con el mismo nombre
+-- normalizado quedarían fusionadas en una sola ficha. Es mucho menos frecuente
+-- que el ruido de OCR y el administrador puede separarlas a mano.
+WITH candidatas AS (
+  SELECT o.*,
+         upper(regexp_replace(o.empresa_nombre, '[^a-zA-Z0-9]', '', 'g')) AS nombre_norm,
+         regexp_replace(split_part(coalesce(o.nit_nic, ''), '-', 1), '[^0-9]', '', 'g') AS nit_norm
+    FROM sst.ordenes_servicio o
+   WHERE o.empresa_id IS NULL
+     AND coalesce(btrim(o.empresa_nombre), '') <> ''
+), votadas AS (
+  SELECT c.*, count(*) OVER (PARTITION BY c.nombre_norm, c.nit_norm) AS votos
+    FROM candidatas c
+), elegidas AS (
+  SELECT DISTINCT ON (nombre_norm) *
+    FROM votadas
+   ORDER BY nombre_norm, votos DESC, creado_en DESC
+)
+INSERT INTO sst.empresas (
+  nit, nombre, actividad_economica, ciudad, direccion,
+  contacto_nombre, contacto_cargo, contacto_telefono,
+  contacto_sst_nombre, contacto_sst_telefono, contacto_sst_correo)
+SELECT coalesce(e.nit_nic, ''), btrim(e.empresa_nombre), e.actividad_economica, e.ciudad_ejecucion, e.direccion,
+       e.contacto_empresa_nombre, e.contacto_empresa_cargo, e.contacto_empresa_telefono,
+       e.contacto_sst_nombre, e.contacto_sst_telefono, e.contacto_sst_correo
+  FROM elegidas e
+ WHERE NOT EXISTS (SELECT 1 FROM sst.empresas x WHERE x.nombre_normalizado = e.nombre_norm)
+   AND NOT EXISTS (SELECT 1 FROM sst.empresas x WHERE x.nit_normalizado <> '' AND x.nit_normalizado = e.nit_norm)
+ON CONFLICT DO NOTHING;
+
+-- 2 · Enlace por NIT (el identificador real manda sobre el nombre).
+UPDATE sst.ordenes_servicio o
+   SET empresa_id = e.id
+  FROM sst.empresas e
+ WHERE o.empresa_id IS NULL
+   AND e.nit_normalizado <> ''
+   AND e.nit_normalizado = regexp_replace(split_part(coalesce(o.nit_nic, ''), '-', 1), '[^0-9]', '', 'g');
+
+-- 3 · Enlace por nombre: recoge las órdenes cuyo NIT llegó ilegible.
+UPDATE sst.ordenes_servicio o
+   SET empresa_id = e.id
+  FROM sst.empresas e
+ WHERE o.empresa_id IS NULL
+   AND e.nombre_normalizado <> ''
+   AND e.nombre_normalizado = upper(regexp_replace(coalesce(o.empresa_nombre, ''), '[^a-zA-Z0-9]', '', 'g'));

@@ -27,6 +27,21 @@ export async function generateFormatoPdf({ template, order, professional }) {
   line(template?.nombre || 'Formato de Gestión', { size: 16, f: bold, color: primary, gap: 28 });
   line(`ARL: ${order.arl_nombre || ''}    ·    OS: ${order.codigo || order.id}`, { color: gray, gap: 26 });
 
+  // CFG-03 · Encabezado editable desde Configuración → Formatos. Se corta a mano
+  // porque pdf-lib no ajusta texto solo; 95 caracteres es lo que entra a 10 pt.
+  const parrafo = (texto, { size = 10, ancho = 95, color = gray, gap = 13 } = {}) => {
+    for (const trozo of String(texto).split('\n')) {
+      if (!trozo.trim()) { y -= gap; continue; }
+      for (let i = 0; i < trozo.length; i += ancho) {
+        line(trozo.slice(i, i + ancho), { size, x: 50, color, gap });
+      }
+    }
+  };
+  if (template?.encabezado) {
+    parrafo(template.encabezado);
+    y -= 10;
+  }
+
   const rows = [
     ['Empresa', order.empresa_nombre],
     ['NIT / NIC', order.nit_nic],
@@ -48,6 +63,13 @@ export async function generateFormatoPdf({ template, order, professional }) {
   line('Descripción de la actividad:', { f: bold, gap: 16 });
   const desc = String(order.descripcion || '—');
   for (let i = 0; i < desc.length; i += 90) line(desc.slice(i, i + 90), { size: 10, x: 60, gap: 14 });
+
+  // CFG-03 · Nota al pie editable (compromisos, aviso legal…), justo encima de
+  // las firmas, que es donde el cliente la lee antes de firmar.
+  if (template?.nota_pie) {
+    y = 190;
+    parrafo(template.nota_pie, { size: 9, ancho: 105, gap: 11 });
+  }
 
   // Firmas físicas
   y = 140;

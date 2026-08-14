@@ -170,6 +170,52 @@ CREATE TABLE IF NOT EXISTS sst.arls (
   formato_origen  sst.formato_arl NOT NULL
 );
 
+-- CFG-02 · Empresas clientes ---------------------------------------------------
+-- Hasta ahora la empresa vivía como texto suelto dentro de cada OS
+-- (empresa_nombre + nit_nic, tal como los extrae la IA del documento de la ARL).
+-- Esta tabla la convierte en maestro editable; la OS conserva su texto original
+-- como respaldo histórico y se enlaza por `empresa_id` (ver más abajo).
+--
+-- Claves de comparación (columnas generadas, para que la BD y el backend usen
+-- exactamente la misma regla):
+--   * nit_normalizado: dígitos de la parte anterior al guion, de modo que
+--     '901.225.480-3', '901225480-3' y '901225480' sean la misma empresa. El
+--     dígito de verificación se descarta porque las ARL lo omiten a discreción.
+--   * nombre_normalizado: solo alfanuméricos en mayúscula ('Inversiones Andinas
+--     S.A.S' = 'INVERSIONES ANDINAS SAS'). Es el plan B cuando el NIT llega
+--     ilegible del OCR, que ocurre.
+CREATE TABLE IF NOT EXISTS sst.empresas (
+  id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  nit                 TEXT NOT NULL,
+  nit_normalizado     TEXT GENERATED ALWAYS AS
+                        (regexp_replace(split_part(nit, '-', 1), '[^0-9]', '', 'g')) STORED,
+  nombre              TEXT NOT NULL,
+  nombre_normalizado  TEXT GENERATED ALWAYS AS
+                        (upper(regexp_replace(nombre, '[^a-zA-Z0-9]', '', 'g'))) STORED,
+  actividad_economica TEXT,
+  ciudad              TEXT,
+  direccion           TEXT,
+  -- Contacto administrativo (quien recibe la programación de la visita).
+  contacto_nombre     TEXT,
+  contacto_cargo      TEXT,
+  contacto_telefono   TEXT,
+  contacto_correo     TEXT,
+  -- Responsable de SST (a quien se le envía la encuesta de satisfacción, M8).
+  contacto_sst_nombre   TEXT,
+  contacto_sst_telefono TEXT,
+  contacto_sst_correo   TEXT,
+  notas               TEXT,
+  activo              BOOLEAN NOT NULL DEFAULT TRUE,
+  creado_en           TIMESTAMPTZ NOT NULL DEFAULT now(),
+  actualizado_en      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- Unicidad por NIT, pero parcial: una empresa cargada sin NIT legible no debe
+-- chocar contra las demás sin NIT (todas normalizarían a la cadena vacía).
+CREATE UNIQUE INDEX IF NOT EXISTS uq_empresas_nit
+  ON sst.empresas (nit_normalizado) WHERE nit_normalizado <> '';
+CREATE INDEX IF NOT EXISTS idx_empresas_nombre_norm ON sst.empresas (nombre_normalizado);
+CREATE INDEX IF NOT EXISTS idx_empresas_activo      ON sst.empresas (activo);
+
 -- Plantillas de formatos (M4) — precargadas en Fase 1 -------------------------
 -- 🔗 costura CFG-05: en Fase 2 se vuelven editables. Aquí solo catálogo.
 CREATE TABLE IF NOT EXISTS sst.plantillas (
@@ -182,6 +228,14 @@ CREATE TABLE IF NOT EXISTS sst.plantillas (
   activo               BOOLEAN NOT NULL DEFAULT TRUE,
   creado_en            TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- CFG-03 · Textos editables que SÍ salen impresos en el PDF (pdf.service.js).
+-- El formato se dibuja con pdf-lib, no se rellena un archivo base: por eso lo
+-- editable es el contenido (título, introducción y nota al pie), no un adjunto.
+ALTER TABLE sst.plantillas ADD COLUMN IF NOT EXISTS encabezado     TEXT;
+ALTER TABLE sst.plantillas ADD COLUMN IF NOT EXISTS nota_pie       TEXT;
+-- Orden de impresión cuando una ARL tiene varios formatos (menor primero).
+ALTER TABLE sst.plantillas ADD COLUMN IF NOT EXISTS orden          INT NOT NULL DEFAULT 0;
+ALTER TABLE sst.plantillas ADD COLUMN IF NOT EXISTS actualizado_en TIMESTAMPTZ NOT NULL DEFAULT now();
 
 -- M2 · Lotes de importación ----------------------------------------------------
 CREATE TABLE IF NOT EXISTS sst.lotes_importacion (
@@ -257,6 +311,13 @@ ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS direccion TEXT;
 ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS contacto_empresa_nombre TEXT;
 ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS contacto_empresa_cargo TEXT;
 ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS contacto_empresa_telefono TEXT;
+-- CFG-02 · Enlace con el maestro de empresas. Es NULLABLE y ON DELETE SET NULL a
+-- propósito: `empresa_nombre`/`nit_nic` siguen siendo el dato histórico de lo que
+-- decía el documento de la ARL, así que una OS nunca pierde su empresa aunque el
+-- registro maestro se dé de baja.
+ALTER TABLE sst.ordenes_servicio
+  ADD COLUMN IF NOT EXISTS empresa_id UUID REFERENCES sst.empresas(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_ordenes_empresa ON sst.ordenes_servicio(empresa_id);
 ALTER TABLE sst.ordenes_servicio ALTER COLUMN codigo_cronograma DROP NOT NULL;
 ALTER TABLE sst.ordenes_servicio ALTER COLUMN secuencia DROP NOT NULL;
 -- Unicidad de AXA/Colmena por (ARL + numero_orden). Parcial: solo aplica cuando
@@ -625,13 +686,22 @@ JOIN sst.arls a               ON a.id = o.arl_id
 LEFT JOIN sst.profesionales p ON p.id = o.profesional_asignado_id;
 
 -- RPT-01 · KPIs globales del dashboard.
-CREATE OR REPLACE VIEW sst.vw_kpis_dashboard AS
+-- DROP + CREATE (y no CREATE OR REPLACE): la vista ganó `ejecutadas_mes` en medio
+-- y Postgres solo permite reemplazar añadiendo columnas al final.
+DROP VIEW IF EXISTS sst.vw_kpis_dashboard;
+CREATE VIEW sst.vw_kpis_dashboard AS
 SELECT
   count(*)                                                   AS total_ordenes,
   count(*) FILTER (WHERE estado = 'SIN PROGRAMAR')           AS sin_programar,
   count(*) FILTER (WHERE estado = 'PROGRAMADA')              AS programadas,
   count(*) FILTER (WHERE estado = 'EN VERIFICACIÓN')         AS en_verificacion,
   count(*) FILTER (WHERE estado = 'EJECUTADA')               AS ejecutadas,
+  -- RPT-01 pide "ejecutadas EN EL MES": el acumulado histórico se conserva
+  -- arriba porque lo usan los porcentajes por ARL y la cartera.
+  count(*) FILTER (
+    WHERE estado = 'EJECUTADA'
+      AND date_trunc('month', COALESCE(fecha_ejecucion, actualizado_en)) = date_trunc('month', now())
+  )                                                          AS ejecutadas_mes,
   count(*) FILTER (WHERE estado = 'CANCELADA')               AS canceladas,
   count(*) FILTER (
     WHERE (metadatos_extraccion->>'overall_confidence') IS NOT NULL
