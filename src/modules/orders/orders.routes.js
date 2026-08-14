@@ -9,6 +9,7 @@ import { env } from '../../config/env.js';
 import { sendEmail } from '../../services/email.service.js';
 import { notify } from '../../services/notification.service.js';
 import { enviarEncuesta } from '../surveys/surveys.service.js';
+import { construirInvitacion, adjuntoInvitacion } from '../../services/calendar.service.js';
 
 const router = Router();
 router.use(authRequired);
@@ -175,8 +176,16 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
       );
     }
 
-    await client.query(
-      `UPDATE sst.ordenes_servicio SET profesional_asignado_id=$2, fecha_programada=$3 WHERE id=$1`,
+    // ASG-05 · La secuencia sube en el mismo UPDATE que la fecha: si se llevara
+    // aparte, dos reprogramaciones seguidas podrían mandar el mismo SEQUENCE y
+    // el calendario del profesional ignoraría la segunda.
+    const guardada = await client.query(
+      `UPDATE sst.ordenes_servicio
+          SET profesional_asignado_id=$2,
+              fecha_programada=$3,
+              secuencia_calendario = secuencia_calendario + 1
+        WHERE id=$1
+      RETURNING secuencia_calendario`,
       [req.params.id, profesionalId, fechaProgramada]
     );
 
@@ -217,7 +226,10 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
     }
 
     const orden = await getOrderExpanded(req.params.id, client);
-    return { orden, profesional: prof.rows[0], docs, token, esReprogramacion };
+    return {
+      orden, profesional: prof.rows[0], docs, token, esReprogramacion,
+      secuenciaCalendario: guardada.rows[0].secuencia_calendario,
+    };
   });
 
   // ASG-03/04/07 · correo al profesional con PDFs + notificación interna.
@@ -228,11 +240,25 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
   // responde 200 avisando que el envío quedó pendiente.
   const supportUrl = `${env.publicAppUrl}/soporte?token=${result.token}`;
   const fecha = fechaCO(result.orden.fecha_programada);
+
+  // ASG-05 · Invitación de calendario. Devuelve null si la OS se asignó sin
+  // fecha, que está permitido: se puede decidir el profesional antes que el día.
+  const ics = construirInvitacion({
+    orden: result.orden,
+    profesional: result.profesional,
+    organizador: { nombre: req.user.nombre, correo: req.user.correo },
+    secuencia: result.secuenciaCalendario,
+  });
+  const invitacion = adjuntoInvitacion(ics, `${result.orden.codigo}.ics`);
+
   let correoEnviado = true;
   let correoError = null;
   try {
     await sendEmail({
       to: result.profesional.correo,
+      // El administrador que asigna va en copia para que la invitación entre
+      // también en SU calendario: el requisito pide los dos, no solo el asesor.
+      cc: req.user.correo || undefined,
       subject: result.esReprogramacion
         ? `OS reprogramada · ${result.orden.codigo} · ${result.orden.empresa_nombre || ''}`
         : `Nueva OS asignada · ${result.orden.codigo} · ${result.orden.empresa_nombre || ''}`,
@@ -246,8 +272,12 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
         `Fecha programada: ${fecha}\n` +
         `Horas: ${result.orden.horas_asignadas || '—'}\n\n` +
         `Adjuntamos los formatos para diligenciar y firmar.\n\n` +
-        `Al terminar, sube los soportes firmados aquí (sin login):\n${supportUrl}\n`,
-      attachments: result.docs.map((d) => ({ filename: d._filename, content: d._buffer })),
+        `Al terminar, sube los soportes firmados aquí (sin login):\n${supportUrl}\n` +
+        (invitacion ? `\nAdjuntamos también la invitación para tu calendario.\n` : ''),
+      attachments: [
+        ...result.docs.map((d) => ({ filename: d._filename, content: d._buffer })),
+        ...(invitacion ? [invitacion] : []),
+      ],
     });
   } catch (e) {
     correoEnviado = false;

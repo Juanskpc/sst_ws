@@ -15,10 +15,11 @@ if (env.email.driver === 'smtp' && env.email.host) {
  * Envía un correo. En driver 'console' (default) lo imprime en consola,
  * de modo que el flujo M5/M11 funciona end-to-end sin SMTP real.
  */
-export async function sendEmail({ to, subject, text, html, attachments }) {
+export async function sendEmail({ to, cc, subject, text, html, attachments }) {
   if (!transporter) {
     console.log('\n📧 [EMAIL · console]');
     console.log(`   Para:    ${to}`);
+    if (cc) console.log(`   Copia:   ${cc}`);
     console.log(`   Asunto:  ${subject}`);
     if (text) console.log(`   Texto:   ${text.split('\n').join('\n            ')}`);
     if (attachments?.length) console.log(`   Adjuntos: ${attachments.map((a) => a.filename).join(', ')}`);
@@ -27,7 +28,7 @@ export async function sendEmail({ to, subject, text, html, attachments }) {
   }
   const info = await transporter.sendMail({
     from: env.email.from,
-    to, subject, text, html, attachments,
+    to, cc, subject, text, html, attachments,
   });
   return { queued: true, driver: 'smtp', messageId: info.messageId };
 }

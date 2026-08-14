@@ -1,0 +1,148 @@
+/**
+ * ASG-05 · Evento de calendario para la visita programada.
+ *
+ * El requisito pide "agregar un evento al calendario del administrador y del
+ * profesional (GMAIL)". Se resuelve con una invitación iCalendar adjunta al
+ * correo de asignación y no con la API de Google Calendar: esa exige OAuth por
+ * usuario (o una cuenta de servicio con delegación en todo el dominio) y
+ * credenciales que el despliegue no tiene, y solo funcionaría si tanto el
+ * administrador como el profesional usaran cuentas del mismo dominio Google.
+ * Un .ics con METHOD:REQUEST lo entiende Gmail —lo muestra como invitación, con
+ * su botón de añadir al calendario— y también Outlook y el calendario del
+ * celular, que es donde el asesor lo va a mirar en campo.
+ *
+ * El UID es estable por orden a propósito: al reprogramar (ASG-07) se manda
+ * otra invitación con el mismo UID y un SEQUENCE mayor, así el calendario
+ * MUEVE la visita existente en vez de dejar dos eventos y que el profesional se
+ * presente el día que no es.
+ */
+
+/** Escapa el texto según RFC 5545: la coma, el punto y coma y la barra son separadores. */
+function escapar(valor) {
+  return String(valor ?? '')
+    .replace(/\\/g, '\\\\')
+    .replace(/;/g, '\\;')
+    .replace(/,/g, '\\,')
+    .replace(/\r?\n/g, '\\n');
+}
+
+/**
+ * Dobla las líneas a 75 octetos, como exige el RFC.
+ *
+ * Se cuenta en BYTES y no en caracteres porque los nombres de empresa llevan
+ * tildes y eñes: cortar por caracteres se pasa del límite y hay clientes que
+ * descartan el evento entero sin avisar.
+ */
+function doblar(linea) {
+  const bytes = Buffer.from(linea, 'utf8');
+  if (bytes.length <= 75) return linea;
+  const trozos = [];
+  let inicio = 0;
+  let limite = 75;
+  while (inicio < bytes.length) {
+    let fin = Math.min(inicio + limite, bytes.length);
+    // No partir un carácter multibyte por la mitad: retrocede hasta el inicio
+    // del carácter (los bytes de continuación UTF-8 son 10xxxxxx).
+    while (fin < bytes.length && (bytes[fin] & 0xc0) === 0x80) fin--;
+    trozos.push(bytes.subarray(inicio, fin).toString('utf8'));
+    inicio = fin;
+    limite = 74; // las líneas continuadas empiezan por un espacio
+  }
+  return trozos.join('\r\n ');
+}
+
+/** Fecha en formato UTC del RFC 5545 (20260701T140000Z). */
+function aFechaIcs(valor) {
+  return new Date(valor).toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '');
+}
+
+/**
+ * Construye el .ics de la visita.
+ *
+ * Devuelve null si la OS no tiene fecha programada: se puede asignar un
+ * profesional sin fecha, y una invitación sin cuándo no le sirve a nadie.
+ *
+ * @param {object} orden        OS expandida (vw_ordenes_expandidas).
+ * @param {object} profesional  Ficha del profesional asignado.
+ * @param {object} organizador  Quien asigna: { nombre, correo }.
+ * @param {number} secuencia    Nº de revisión; sube en cada reprogramación.
+ */
+export function construirInvitacion({ orden, profesional, organizador, secuencia = 0 }) {
+  if (!orden?.fecha_programada) return null;
+
+  const inicio = new Date(orden.fecha_programada);
+  // Las horas de la OS son las de la actividad; si no vienen se asume una hora,
+  // que es mejor que un evento de duración cero (hay calendarios que lo ocultan).
+  const horas = Number(orden.horas_asignadas) > 0 ? Number(orden.horas_asignadas) : 1;
+  const fin = new Date(inicio.getTime() + horas * 60 * 60 * 1000);
+
+  const lugar = [orden.direccion, orden.ciudad_ejecucion].filter(Boolean).join(', ');
+  const descripcion = [
+    `Orden de servicio: ${orden.codigo}`,
+    `ARL: ${orden.arl_nombre || '—'}`,
+    `Empresa: ${orden.empresa_nombre || '—'}`,
+    `Horas: ${orden.horas_asignadas || '—'}`,
+    orden.contacto_sst_nombre ? `Contacto SST: ${orden.contacto_sst_nombre} ${orden.contacto_sst_telefono || ''}`.trim() : null,
+    orden.descripcion ? `\nActividad: ${orden.descripcion}` : null,
+  ].filter(Boolean).join('\n');
+
+  const lineas = [
+    'BEGIN:VCALENDAR',
+    'VERSION:2.0',
+    'PRODID:-//JD&D Consultores//IA-Core//ES',
+    'CALSCALE:GREGORIAN',
+    // REQUEST y no PUBLISH: es una convocatoria a una persona concreta, y es lo
+    // que hace que Gmail la pinte como invitación en vez de como un adjunto.
+    'METHOD:REQUEST',
+    'BEGIN:VEVENT',
+    `UID:os-${orden.id}@jdd-iacore`,
+    `SEQUENCE:${secuencia}`,
+    `DTSTAMP:${aFechaIcs(new Date())}`,
+    `DTSTART:${aFechaIcs(inicio)}`,
+    `DTEND:${aFechaIcs(fin)}`,
+    `SUMMARY:${escapar(`${orden.codigo} · ${orden.empresa_nombre || 'Visita SST'}`)}`,
+    `DESCRIPTION:${escapar(descripcion)}`,
+    lugar ? `LOCATION:${escapar(lugar)}` : null,
+    'STATUS:CONFIRMED',
+    organizador?.correo
+      ? `ORGANIZER;CN=${escapar(organizador.nombre || 'JD&D Consultores')}:mailto:${organizador.correo}`
+      : null,
+    // RSVP para que el profesional pueda confirmar y el administrador lo vea.
+    profesional?.correo
+      ? `ATTENDEE;CN=${escapar(profesional.nombre || '')};ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:${profesional.correo}`
+      : null,
+    // El administrador va como asistente además de organizador: así el evento
+    // le entra también a SU calendario, que es la otra mitad del requisito.
+    organizador?.correo
+      ? `ATTENDEE;CN=${escapar(organizador.nombre || 'Administración')};ROLE=CHAIR;PARTSTAT=ACCEPTED:mailto:${organizador.correo}`
+      : null,
+    // Recordatorio la víspera: el riesgo del FRS es que el profesional no se
+    // presente o no suba los soportes a tiempo.
+    'BEGIN:VALARM',
+    'TRIGGER:-PT24H',
+    'ACTION:DISPLAY',
+    `DESCRIPTION:${escapar(`Visita mañana: ${orden.empresa_nombre || orden.codigo}`)}`,
+    'END:VALARM',
+    'END:VEVENT',
+    'END:VCALENDAR',
+  ].filter(Boolean);
+
+  // CRLF obligatorio: con \n suelto hay clientes que rechazan el archivo.
+  return lineas.map(doblar).join('\r\n') + '\r\n';
+}
+
+/**
+ * Adjunto listo para nodemailer.
+ *
+ * El `contentType` con `method=REQUEST` es lo que distingue una invitación de
+ * un archivo adjunto cualquiera; sin él Gmail ofrece descargar el .ics en vez
+ * de mostrar los botones de respuesta.
+ */
+export function adjuntoInvitacion(ics, nombre = 'visita.ics') {
+  if (!ics) return null;
+  return {
+    filename: nombre,
+    content: ics,
+    contentType: 'text/calendar; charset=utf-8; method=REQUEST',
+  };
+}

@@ -460,6 +460,15 @@ ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS cartera_marcada_por UU
 CREATE INDEX IF NOT EXISTS idx_ordenes_cartera
   ON sst.ordenes_servicio(estado, facturado_en, validado_arl_en);
 
+-- ASG-05 · Revisión de la invitación de calendario de la visita.
+-- El .ics que se adjunta al correo de asignación lleva un UID fijo por orden,
+-- de modo que al reprogramar el calendario MUEVA la visita en vez de crear un
+-- segundo evento. Para que el cliente de correo acepte el cambio, la nueva
+-- invitación tiene que traer un SEQUENCE mayor que la anterior; de ahí este
+-- contador, que sube en cada asignación o reprogramación.
+ALTER TABLE sst.ordenes_servicio
+  ADD COLUMN IF NOT EXISTS secuencia_calendario INT NOT NULL DEFAULT 0;
+
 -- =============================================================================
 -- M8 · ENCUESTA DE SATISFACCIÓN (ENC-01..07)  ·  implementado en Fase 2
 -- =============================================================================
