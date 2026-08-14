@@ -91,16 +91,30 @@ router.get('/mias', asyncHandler(async (req, res) => {
   let filtroEstado = '';
   if (estado) {
     params.push(estado);
-    filtroEstado = ` AND estado = $${params.length}::sst.estado_orden`;
+    filtroEstado = ` AND o.estado = $${params.length}::sst.estado_orden`;
   }
   const r = await pool.query(
-    `SELECT * FROM sst.vw_ordenes_expandidas
-      WHERE profesional_asignado_id = $1${filtroEstado}
+    `SELECT o.*,
+            -- SUP-07 · Los soportes que YA envió por el enlace público, para que
+            -- pueda comprobar qué mandó sin tener que buscar el correo. Va como
+            -- subconsulta agregada y no como JOIN para no multiplicar la orden
+            -- por cada archivo.
+            COALESCE((
+              SELECT json_agg(json_build_object(
+                       'id', s.id,
+                       'nombre', s.nombre_original,
+                       'subido_en', s.subido_en
+                     ) ORDER BY s.subido_en DESC)
+                FROM sst.archivos_soporte s
+               WHERE s.orden_id = o.id
+            ), '[]'::json) AS soportes
+       FROM sst.vw_ordenes_expandidas o
+      WHERE o.profesional_asignado_id = $1${filtroEstado}
       -- Primero lo que aún tiene que ejecutar y por fecha de visita: es una
       -- agenda, no un histórico. Las ya cerradas caen al final.
-      ORDER BY (estado IN ('PROGRAMADA','EN VERIFICACIÓN')) DESC,
-               fecha_programada ASC NULLS LAST,
-               fecha_carga DESC
+      ORDER BY (o.estado IN ('PROGRAMADA','EN VERIFICACIÓN')) DESC,
+               o.fecha_programada ASC NULLS LAST,
+               o.fecha_carga DESC
       LIMIT 200`,
     params
   );
