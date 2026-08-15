@@ -394,6 +394,25 @@ CREATE TABLE IF NOT EXISTS sst.ocupaciones_profesional (
 CREATE INDEX IF NOT EXISTS idx_ocupaciones_prof  ON sst.ocupaciones_profesional(profesional_id);
 CREATE INDEX IF NOT EXISTS idx_ocupaciones_fecha ON sst.ocupaciones_profesional(profesional_id, fecha);
 
+-- ASG-02 · Franjas en que se ejecuta la visita de una OS.
+--
+-- `ordenes_servicio.fecha_programada` solo sabe de UN instante, y una visita
+-- real se parte: mañana y tarde, o varios días. Esa columna se conserva (la usan
+-- los reportes, la cartera, el periodo de la pre-cuenta y el orden del listado)
+-- y queda igual al INICIO de la primera franja; el detalle vive aquí.
+-- Una OS sin franjas es una OS a la antigua: se lee su fecha_programada y ya.
+CREATE TABLE IF NOT EXISTS sst.franjas_visita (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  orden_id    UUID NOT NULL REFERENCES sst.ordenes_servicio(id) ON DELETE CASCADE,
+  fecha       DATE NOT NULL,
+  hora_inicio TIME NOT NULL,
+  hora_fin    TIME NOT NULL,
+  creado_por  UUID REFERENCES sst.usuarios(id) ON DELETE SET NULL,
+  creado_en   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT chk_franja_visita_rango CHECK (hora_fin > hora_inicio)
+);
+CREATE INDEX IF NOT EXISTS idx_franjas_visita_orden ON sst.franjas_visita(orden_id, fecha, hora_inicio);
+
 -- M4 · Documentos generados (formatos PDF auto-diligenciados) ------------------
 CREATE TABLE IF NOT EXISTS sst.documentos_generados (
   id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),

@@ -1,4 +1,5 @@
 import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
+import { fechaHoraCO, horasTexto } from '../utils/formato.js';
 
 /**
  * Genera un PDF de formato auto-diligenciado (M4 / FOR) a partir de la OS.
@@ -47,12 +48,14 @@ export async function generateFormatoPdf({ template, order, professional }) {
     ['NIT / NIC', order.nit_nic],
     ['Actividad económica', order.actividad_economica],
     ['Cronograma / Secuencia', `${order.codigo_cronograma || ''} / ${order.secuencia || ''}`],
-    ['Horas asignadas', order.horas_asignadas],
+    ['Horas asignadas', horasTexto(order.horas_asignadas)],
     ['Contacto SST', order.contacto_sst_nombre],
     ['Teléfono contacto', order.contacto_sst_telefono],
     ['Correo contacto', order.contacto_sst_correo],
     ['Profesional asignado', professional?.nombre || '—'],
-    ['Fecha programada', order.fecha_programada ? new Date(order.fecha_programada).toLocaleString('es-CO') : '—'],
+    // Con la zona explícita: `toLocaleString` a secas usa la del proceso, así
+    // que un servidor en UTC imprimía en el acta una hora corrida cinco horas.
+    ['Fecha programada', order.fecha_programada ? fechaHoraCO(order.fecha_programada) : '—'],
   ];
   for (const [label, value] of rows) {
     line(`${label}:`, { f: bold, size: 11, gap: 4 });

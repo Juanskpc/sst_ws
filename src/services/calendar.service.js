@@ -17,6 +17,8 @@
  * presente el día que no es.
  */
 
+import { horasTexto } from '../utils/formato.js';
+
 /** Escapa el texto según RFC 5545: la coma, el punto y coma y la barra son separadores. */
 function escapar(valor) {
   return String(valor ?? '')
@@ -56,54 +58,94 @@ function aFechaIcs(valor) {
   return new Date(valor).toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '');
 }
 
+/** 'YYYY-MM-DD' + 'HH:MM' de Colombia → Date. Ver `instanteCO` en orders.routes. */
+function fechaHoraCO(fecha, hora) {
+  return new Date(`${fecha}T${hora}:00-05:00`);
+}
+
 /**
  * Construye el .ics de la visita.
  *
- * Devuelve null si la OS no tiene fecha programada: se puede asignar un
- * profesional sin fecha, y una invitación sin cuándo no le sirve a nadie.
+ * Devuelve null si la OS no tiene ni franjas ni fecha programada: se puede
+ * asignar un profesional sin fecha, y una invitación sin cuándo no le sirve a
+ * nadie.
+ *
+ * ASG-02 · Una visita partida (mañana y tarde, o varios días) sale como **un
+ * VEVENT por franja** dentro del mismo VCALENDAR, cada uno con su propio UID
+ * (`os-<id>-<n>`). No se puede resolver con un solo evento largo: eso le
+ * ocuparía al profesional también las horas del medio, que están libres.
  *
  * @param {object} orden        OS expandida (vw_ordenes_expandidas).
  * @param {object} profesional  Ficha del profesional asignado.
  * @param {object} organizador  Quien asigna: { nombre, correo }.
  * @param {number} secuencia    Nº de revisión; sube en cada reprogramación.
+ * @param {Array}  franjas      Franjas de la visita ([] = OS a la antigua).
+ * @param {number} previas      Cuántas franjas tenía antes de reprogramar.
  */
-export function construirInvitacion({ orden, profesional, organizador, secuencia = 0 }) {
-  if (!orden?.fecha_programada) return null;
+export function construirInvitacion({
+  orden, profesional, organizador, secuencia = 0, franjas = [], previas = 0,
+}) {
+  const tramos = Array.isArray(franjas) && franjas.length
+    ? franjas.map((f, i) => ({
+        inicio: fechaHoraCO(f.fecha, f.hora_inicio),
+        fin: fechaHoraCO(f.fecha, f.hora_fin),
+        uid: `os-${orden.id}-${i + 1}@jdd-iacore`,
+        etiqueta: franjas.length > 1 ? ` (${i + 1}/${franjas.length})` : '',
+        cancelado: false,
+      }))
+    : [];
 
-  const inicio = new Date(orden.fecha_programada);
-  // Las horas de la OS son las de la actividad; si no vienen se asume una hora,
-  // que es mejor que un evento de duración cero (hay calendarios que lo ocultan).
-  const horas = Number(orden.horas_asignadas) > 0 ? Number(orden.horas_asignadas) : 1;
-  const fin = new Date(inicio.getTime() + horas * 60 * 60 * 1000);
+  // Sin franjas se mantiene el comportamiento de siempre: un evento que dura las
+  // horas de la OS. Si no vienen se asume una hora, que es mejor que un evento
+  // de duración cero (hay calendarios que lo ocultan).
+  if (!tramos.length) {
+    if (!orden?.fecha_programada) return null;
+    const inicio = new Date(orden.fecha_programada);
+    const horas = Number(orden.horas_asignadas) > 0 ? Number(orden.horas_asignadas) : 1;
+    tramos.push({
+      inicio,
+      fin: new Date(inicio.getTime() + horas * 60 * 60 * 1000),
+      uid: `os-${orden.id}@jdd-iacore`,
+      etiqueta: '',
+      cancelado: false,
+    });
+  }
+
+  // Reprogramar con MENOS franjas que antes dejaría los eventos sobrantes vivos
+  // en el calendario del profesional, y se presentaría un día que ya no toca.
+  // Se mandan cancelados con el mismo UID para que el cliente los tache.
+  for (let i = franjas.length; i < previas; i++) {
+    const ref = tramos[0];
+    tramos.push({
+      inicio: ref.inicio,
+      fin: ref.fin,
+      uid: `os-${orden.id}-${i + 1}@jdd-iacore`,
+      etiqueta: ' (cancelada)',
+      cancelado: true,
+    });
+  }
 
   const lugar = [orden.direccion, orden.ciudad_ejecucion].filter(Boolean).join(', ');
   const descripcion = [
     `Orden de servicio: ${orden.codigo}`,
     `ARL: ${orden.arl_nombre || '—'}`,
     `Empresa: ${orden.empresa_nombre || '—'}`,
-    `Horas: ${orden.horas_asignadas || '—'}`,
+    `Horas: ${horasTexto(orden.horas_asignadas)}`,
     orden.contacto_sst_nombre ? `Contacto SST: ${orden.contacto_sst_nombre} ${orden.contacto_sst_telefono || ''}`.trim() : null,
     orden.descripcion ? `\nActividad: ${orden.descripcion}` : null,
   ].filter(Boolean).join('\n');
 
-  const lineas = [
-    'BEGIN:VCALENDAR',
-    'VERSION:2.0',
-    'PRODID:-//JD&D Consultores//IA-Core//ES',
-    'CALSCALE:GREGORIAN',
-    // REQUEST y no PUBLISH: es una convocatoria a una persona concreta, y es lo
-    // que hace que Gmail la pinte como invitación en vez de como un adjunto.
-    'METHOD:REQUEST',
+  const evento = (t) => [
     'BEGIN:VEVENT',
-    `UID:os-${orden.id}@jdd-iacore`,
+    `UID:${t.uid}`,
     `SEQUENCE:${secuencia}`,
     `DTSTAMP:${aFechaIcs(new Date())}`,
-    `DTSTART:${aFechaIcs(inicio)}`,
-    `DTEND:${aFechaIcs(fin)}`,
-    `SUMMARY:${escapar(`${orden.codigo} · ${orden.empresa_nombre || 'Visita SST'}`)}`,
+    `DTSTART:${aFechaIcs(t.inicio)}`,
+    `DTEND:${aFechaIcs(t.fin)}`,
+    `SUMMARY:${escapar(`${orden.codigo} · ${orden.empresa_nombre || 'Visita SST'}${t.etiqueta}`)}`,
     `DESCRIPTION:${escapar(descripcion)}`,
     lugar ? `LOCATION:${escapar(lugar)}` : null,
-    'STATUS:CONFIRMED',
+    t.cancelado ? 'STATUS:CANCELLED' : 'STATUS:CONFIRMED',
     organizador?.correo
       ? `ORGANIZER;CN=${escapar(organizador.nombre || 'JD&D Consultores')}:mailto:${organizador.correo}`
       : null,
@@ -117,13 +159,28 @@ export function construirInvitacion({ orden, profesional, organizador, secuencia
       ? `ATTENDEE;CN=${escapar(organizador.nombre || 'Administración')};ROLE=CHAIR;PARTSTAT=ACCEPTED:mailto:${organizador.correo}`
       : null,
     // Recordatorio la víspera: el riesgo del FRS es que el profesional no se
-    // presente o no suba los soportes a tiempo.
-    'BEGIN:VALARM',
-    'TRIGGER:-PT24H',
-    'ACTION:DISPLAY',
-    `DESCRIPTION:${escapar(`Visita mañana: ${orden.empresa_nombre || orden.codigo}`)}`,
-    'END:VALARM',
+    // presente o no suba los soportes a tiempo. En las canceladas sobra.
+    ...(t.cancelado
+      ? []
+      : [
+          'BEGIN:VALARM',
+          'TRIGGER:-PT24H',
+          'ACTION:DISPLAY',
+          `DESCRIPTION:${escapar(`Visita mañana: ${orden.empresa_nombre || orden.codigo}`)}`,
+          'END:VALARM',
+        ]),
     'END:VEVENT',
+  ];
+
+  const lineas = [
+    'BEGIN:VCALENDAR',
+    'VERSION:2.0',
+    'PRODID:-//JD&D Consultores//IA-Core//ES',
+    'CALSCALE:GREGORIAN',
+    // REQUEST y no PUBLISH: es una convocatoria a una persona concreta, y es lo
+    // que hace que Gmail la pinte como invitación en vez de como un adjunto.
+    'METHOD:REQUEST',
+    ...tramos.flatMap(evento),
     'END:VCALENDAR',
   ].filter(Boolean);
 

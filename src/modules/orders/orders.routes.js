@@ -10,6 +10,7 @@ import { sendEmail } from '../../services/email.service.js';
 import { notify } from '../../services/notification.service.js';
 import { enviarEncuesta } from '../surveys/surveys.service.js';
 import { construirInvitacion, adjuntoInvitacion } from '../../services/calendar.service.js';
+import { fechaDiaCO, fechaHoraCO, horaAmPm, horasTexto } from '../../utils/formato.js';
 
 const router = Router();
 router.use(authRequired);
@@ -30,15 +31,80 @@ async function encuestaAlCerrar(orden) {
 }
 
 /**
- * Fecha/hora legible para el usuario final (correo y auditoría).
- *
- * La zona va fija en Colombia a propósito: `toLocaleString` usa la zona del
- * proceso, así que un despliegue en un VPS en UTC le enviaría al profesional
- * una hora de visita corrida cinco horas.
+ * Fecha/hora legible para el usuario final (correo y auditoría): 'vie 14 ago
+ * 2026 · 02:00 PM'. El formato vive en `utils/formato.js` porque el correo, la
+ * invitación y los PDF adjuntos tienen que decir la misma hora igual escrita.
  */
 function fechaCO(valor) {
   if (!valor) return 'por definir';
-  return new Date(valor).toLocaleString('es-CO', { timeZone: 'America/Bogota' });
+  return fechaHoraCO(valor);
+}
+
+const FRANJA_COLS = `id, orden_id,
+  to_char(fecha, 'YYYY-MM-DD') AS fecha,
+  to_char(hora_inicio, 'HH24:MI') AS hora_inicio,
+  to_char(hora_fin, 'HH24:MI')    AS hora_fin`;
+
+/**
+ * ASG-02 · Valida y ordena las franjas de una visita.
+ *
+ * Una visita se puede partir (mañana y tarde, o varios días), pero dos franjas
+ * de la MISMA orden no pueden solaparse: sería pedirle al profesional estar dos
+ * veces en el mismo rato. Tocarse en el borde (08:00–12:00 y 12:00–16:00) sí
+ * vale. Devuelve [] si no se mandó nada: asignar sin fecha sigue permitido.
+ */
+function normalizarFranjas(entrada) {
+  if (!Array.isArray(entrada)) return [];
+  const franjas = entrada.map((f, i) => {
+    const fecha = (f?.fecha || '').toString().trim();
+    const ini = (f?.hora_inicio || '').toString().trim().slice(0, 5);
+    const fin = (f?.hora_fin || '').toString().trim().slice(0, 5);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(fecha) || !/^\d{2}:\d{2}$/.test(ini) || !/^\d{2}:\d{2}$/.test(fin)) {
+      throw badRequest(`Franja ${i + 1}: se esperaba fecha (YYYY-MM-DD) y horas (HH:MM).`);
+    }
+    if (fin <= ini) throw badRequest(`Franja ${i + 1} (${fecha}): la hora de fin debe ser mayor que la de inicio.`);
+    return { fecha, hora_inicio: ini, hora_fin: fin };
+  });
+
+  franjas.sort((a, b) => (a.fecha + a.hora_inicio).localeCompare(b.fecha + b.hora_inicio));
+  for (let i = 1; i < franjas.length; i++) {
+    const prev = franjas[i - 1];
+    const act = franjas[i];
+    if (prev.fecha === act.fecha && act.hora_inicio < prev.hora_fin) {
+      throw badRequest(
+        `Las franjas del ${act.fecha} se cruzan (${prev.hora_inicio}–${prev.hora_fin} y ${act.hora_inicio}–${act.hora_fin}).`
+      );
+    }
+  }
+  return franjas;
+}
+
+/**
+ * 'YYYY-MM-DD' + 'HH:MM' de Colombia → instante ISO.
+ *
+ * El desfase va explícito (-05:00, Colombia no tiene horario de verano) y no
+ * por `new Date('...T08:00')`, que usa la zona del PROCESO: en un servidor en
+ * UTC esa lectura correría la visita cinco horas.
+ */
+function instanteCO(fecha, hora) {
+  return new Date(`${fecha}T${hora}:00-05:00`).toISOString();
+}
+
+/** Franjas de una orden, ya ordenadas. */
+async function franjasDeOrden(ordenId, client = pool) {
+  const r = await client.query(
+    `SELECT ${FRANJA_COLS} FROM sst.franjas_visita
+      WHERE orden_id=$1 ORDER BY fecha, hora_inicio`,
+    [ordenId]
+  );
+  return r.rows;
+}
+
+/** "· jue 14 ago 2026, de 08:00 AM a 12:00 PM" — la visita, franja a franja. */
+function franjasEnTexto(franjas) {
+  return franjas
+    .map((f) => `  · ${fechaDiaCO(f.fecha)}, de ${horaAmPm(f.hora_inicio)} a ${horaAmPm(f.hora_fin)}`)
+    .join('\n');
 }
 
 // M3 · Listado filtrable (EST-05): estado, arl_id, profesional_id, q.
@@ -107,7 +173,19 @@ router.get('/mias', asyncHandler(async (req, res) => {
                      ) ORDER BY s.subido_en DESC)
                 FROM sst.archivos_soporte s
                WHERE s.orden_id = o.id
-            ), '[]'::json) AS soportes
+            ), '[]'::json) AS soportes,
+            -- ASG-02 · Las franjas de la visita: al profesional le sirve más
+            -- "jueves de 8 a 12 y viernes de 8 a 12" que un único instante.
+            COALESCE((
+              SELECT json_agg(json_build_object(
+                       'id', v.id,
+                       'fecha', to_char(v.fecha, 'YYYY-MM-DD'),
+                       'hora_inicio', to_char(v.hora_inicio, 'HH24:MI'),
+                       'hora_fin', to_char(v.hora_fin, 'HH24:MI')
+                     ) ORDER BY v.fecha, v.hora_inicio)
+                FROM sst.franjas_visita v
+               WHERE v.orden_id = o.id
+            ), '[]'::json) AS franjas
        FROM sst.vw_ordenes_expandidas o
       WHERE o.profesional_asignado_id = $1${filtroEstado}
       -- Primero lo que aún tiene que ejecutar y por fecha de visita: es una
@@ -127,7 +205,7 @@ router.get('/mias', asyncHandler(async (req, res) => {
 // Detalle completo: OS + historial + documentos + soportes + enlace público.
 router.get('/:id', asyncHandler(async (req, res) => {
   const orden = await getOrderExpanded(req.params.id);
-  const [historial, docs, soportes, enlace] = await Promise.all([
+  const [historial, docs, soportes, enlace, franjas] = await Promise.all([
     pool.query(
       `SELECT h.*, u.nombre AS cambiado_por_nombre FROM sst.historial_estados_orden h
        LEFT JOIN sst.usuarios u ON u.id = h.cambiado_por
@@ -135,6 +213,7 @@ router.get('/:id', asyncHandler(async (req, res) => {
     pool.query(`SELECT * FROM sst.documentos_generados WHERE orden_id=$1 ORDER BY generado_en`, [req.params.id]),
     pool.query(`SELECT * FROM sst.archivos_soporte WHERE orden_id=$1 ORDER BY subido_en`, [req.params.id]),
     pool.query(`SELECT * FROM sst.enlaces_publicos WHERE orden_id=$1 AND activo ORDER BY creado_en DESC LIMIT 1`, [req.params.id]),
+    franjasDeOrden(req.params.id),
   ]);
   res.json({
     data: {
@@ -142,11 +221,21 @@ router.get('/:id', asyncHandler(async (req, res) => {
       historial: historial.rows,
       documentos: docs.rows,
       soportes: soportes.rows,
+      franjas,
       enlace_publico: enlace.rows[0]
         ? { ...enlace.rows[0], url: `${env.publicAppUrl}/soporte?token=${enlace.rows[0].token}` }
         : null,
     },
   });
+}));
+
+/**
+ * ASG-02 · Franjas en que se ejecuta la visita. Endpoint propio (y no dentro
+ * del detalle) porque el modal de asignación se abre desde el listado de
+ * borradores, sin haber pedido la OS completa.
+ */
+router.get('/:id/franjas', asyncHandler(async (req, res) => {
+  res.json({ data: await franjasDeOrden(req.params.id) });
 }));
 
 router.get('/:id/history', asyncHandler(async (req, res) => {
@@ -167,8 +256,16 @@ router.get('/:id/history', asyncHandler(async (req, res) => {
  */
 router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) => {
   const profesionalId = req.body?.profesional_id || req.body?.professional_id;
-  const fechaProgramada = req.body?.fecha_programada || req.body?.scheduled_at || null;
   if (!profesionalId) throw badRequest('profesional_id es obligatorio');
+
+  // ASG-02 · La visita puede venir partida en franjas (mañana y tarde, o varios
+  // días). `fecha_programada` sigue siendo el INICIO de la primera: de ella
+  // cuelgan el periodo de la pre-cuenta, la cartera, los reportes y el orden de
+  // los listados, así que se deriva aquí en vez de confiar en el cliente.
+  const franjas = normalizarFranjas(req.body?.franjas);
+  const fechaProgramada = franjas.length
+    ? instanteCO(franjas[0].fecha, franjas[0].hora_inicio)
+    : req.body?.fecha_programada || req.body?.scheduled_at || null;
 
   const result = await withTransaction(async (client) => {
     const prof = await client.query(`SELECT * FROM sst.profesionales WHERE id=$1`, [profesionalId]);
@@ -202,6 +299,26 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
       RETURNING secuencia_calendario`,
       [req.params.id, profesionalId, fechaProgramada]
     );
+
+    // ASG-02 · Las franjas se reemplazan en bloque: reprogramar es volver a
+    // decidir toda la visita, y conservar las viejas dejaría horas fantasma en
+    // la agenda del profesional. Solo se tocan si el cliente mandó franjas, para
+    // no borrar las de una asignación que solo cambia de profesional.
+    let franjasPrevias = 0;
+    if (franjas.length) {
+      const antes = await client.query(
+        `DELETE FROM sst.franjas_visita WHERE orden_id=$1 RETURNING id`,
+        [req.params.id]
+      );
+      franjasPrevias = antes.rowCount;
+      for (const f of franjas) {
+        await client.query(
+          `INSERT INTO sst.franjas_visita (orden_id, fecha, hora_inicio, hora_fin, creado_por)
+           VALUES ($1,$2,$3,$4,$5)`,
+          [req.params.id, f.fecha, f.hora_inicio, f.hora_fin, req.user.sub]
+        );
+      }
+    }
 
     if (esReprogramacion) {
       // EST-03 · La reprogramación no cambia el estado, pero sí debe quedar en
@@ -243,6 +360,8 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
     return {
       orden, profesional: prof.rows[0], docs, token, esReprogramacion,
       secuenciaCalendario: guardada.rows[0].secuencia_calendario,
+      franjas: await franjasDeOrden(req.params.id, client),
+      franjasPrevias,
     };
   });
 
@@ -262,6 +381,8 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
     profesional: result.profesional,
     organizador: { nombre: req.user.nombre, correo: req.user.correo },
     secuencia: result.secuenciaCalendario,
+    franjas: result.franjas,
+    previas: result.franjasPrevias,
   });
   const invitacion = adjuntoInvitacion(ics, `${result.orden.codigo}.ics`);
 
@@ -283,9 +404,18 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
             `fue REPROGRAMADA.\n`
           : `Se te asignó la OS ${result.orden.codigo} (${result.orden.arl_nombre}) para ` +
             `${result.orden.empresa_nombre}.\n`) +
-        `Fecha programada: ${fecha}\n` +
-        `Horas: ${result.orden.horas_asignadas || '—'}\n\n` +
-        `Adjuntamos los formatos para diligenciar y firmar.\n\n` +
+        // Con la visita partida, una sola "fecha programada" se queda corta: lo
+        // que el profesional necesita saber es cada franja.
+        (result.franjas.length > 1
+          ? `La visita se realiza en ${result.franjas.length} franjas:\n${franjasEnTexto(result.franjas)}\n`
+          : `Fecha programada: ${fecha}\n`) +
+        `Horas: ${horasTexto(result.orden.horas_asignadas)}\n\n` +
+        // Sin plantillas activas para la ARL no hay PDFs que adjuntar (CFG-03):
+        // prometer unos formatos que no van deja al profesional buscándolos.
+        (result.docs.length
+          ? `Adjuntamos los formatos para diligenciar y firmar.\n\n`
+          : `Los formatos de esta ARL todavía no están cargados en la plataforma; ` +
+            `te los haremos llegar aparte.\n\n`) +
         `Al terminar, sube los soportes firmados aquí (sin login):\n${supportUrl}\n` +
         (invitacion ? `\nAdjuntamos también la invitación para tu calendario.\n` : ''),
       attachments: [
@@ -321,7 +451,16 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
       : `OS ${accion} y formatos generados, pero el correo al profesional no salió.`,
     correo_enviado: correoEnviado,
     correo_error: correoError,
-    data: { ...result.orden, support_url: supportUrl, documentos: result.docs.map(({ _buffer, ...d }) => d) },
+    // CFG-03 · Cuántos formatos salieron adjuntos. En cero el correo llegó sin
+    // documentos porque la ARL no tiene plantillas activas, y eso hay que
+    // decírselo a quien asigna: es un vacío de configuración, no del envío.
+    formatos_generados: result.docs.length,
+    data: {
+      ...result.orden,
+      support_url: supportUrl,
+      documentos: result.docs.map(({ _buffer, ...d }) => d),
+      franjas: result.franjas,
+    },
   });
 }));
 
