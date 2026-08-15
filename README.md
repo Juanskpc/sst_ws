@@ -1,9 +1,18 @@
-# sst_ws — Backend JD&D IA-Core (Fase 1)
+# sst_ws — Backend JD&D IA-Core
 
 Backend Node.js (Express 5 + PostgreSQL/Neon) para la plataforma de gestión de
-**Órdenes de Servicio (OS)** de JD&D Consultores. Implementa el ciclo de vida
-completo de **Fase 1** (MVP Táctico). La BD incluye además las tablas de costura
-de Fase 2, pero **sin lógica de backend** (Regla de Oro).
+**Órdenes de Servicio (OS)** de JD&D Consultores.
+
+> 📍 **El estado del proyecto y lo que queda por hacer NO viven aquí**, sino en
+> `jdd_consultores_app/HANDOFF.md` (repo del frontend), que es la fuente de
+> verdad para los dos proyectos. Léelo antes de empezar: trae el estado por
+> módulo, las trampas conocidas y la lista de pendientes priorizada.
+
+> ⚠️ **"Fase 1" y la "Regla de Oro" ya no existen** (la demo se aprobó el
+> 27-jul-2026). Están construidos **los 12 módulos** del FRS, encuestas,
+> pre-cuentas y reportes incluidos; del FRS solo queda fuera ASG-06 (WhatsApp),
+> que él mismo deja en Fase 3. Si un texto de este README suena a "esto no se
+> puede tocar todavía", está viejo: manda el HANDOFF.
 
 > 🤖 **Motor principal de extracción = OpenAI** (`gpt-4o-mini`, vía
 > `infrastructure/openai/openai-extraction.service.ts` + `services/openai-extraction.bridge.js`).
@@ -24,14 +33,22 @@ de Fase 2, pero **sin lógica de backend** (Regla de Oro).
 
 ```bash
 npm install
-npm run migrate     # crea el esquema sst: tablas, vistas, funciones, seeds + admin
-npm run seed:demo   # (opcional) carga datos de DEMO ricos en TODAS las categorías
+npm run migrate     # crea/actualiza el esquema sst (idempotente, seguro de repetir)
 npm start           # levanta la API en http://localhost:4000
 # desarrollo con reload:
 npm run dev
 # prueba end-to-end del flujo completo (requiere server corriendo):
 node scripts/smoke.js
 ```
+
+> 🚨 **NUNCA correr `npm run seed:demo` contra la BD compartida.** Hace
+> **TRUNCATE** de órdenes, borradores y lotes: se lleva por delante el trabajo
+> real de los dos equipos y los datos con los que el cliente prueba. Solo tiene
+> sentido contra una base local y desechable.
+>
+> Para probar flujos que mandan correo, levantar una instancia aparte en vez de
+> tocar la de todos:
+> `PORT=4010 EMAIL_DRIVER=console SMTP_HOST="" npm run dev`
 
 Login por **documento de identidad** + contraseña. Existen **dos cuentas admin
 separadas** (configurables en `.env`, ver `docs/06-auth-y-seguridad.md`):
@@ -115,7 +132,8 @@ src/
 | | GET | `/orders/:id`, `/orders/:id/history` | auth |
 | | POST | `/orders/:id/status` (genérico) | admin |
 | | POST | `/orders/:id/cancel` (motivo) | admin |
-| **M5 Asignación** | POST | `/orders/:id/assign` | admin |
+| **M5 Asignación** | POST | `/orders/:id/assign` (acepta `franjas[]`) | admin |
+| | GET | `/orders/:id/franjas` (tramos de la visita) | auth |
 | **M4 Formatos** | POST/GET | `/orders/:id/documents` | admin/auth |
 | **M7 Verificación** | POST | `/orders/:id/verify` (→ EJECUTADA) | admin |
 | | POST | `/orders/:id/reject` (motivo → PROGRAMADA) | admin |
@@ -130,7 +148,7 @@ src/
 | | POST | `/reports/summary/:orderId` (IA) | auth |
 | | POST | `/reports/search` (lenguaje natural → filtros) | auth |
 
-## Flujo end-to-end (criterios de aceptación Fase 1)
+## Flujo end-to-end (el ciclo de vida de una OS)
 
 1. `POST /imports` con Excel/PDF → responde `202 PROCESANDO`; el worker clasifica
    la ARL (Excel determinista; PDF con Gemini/mock, PENDIENTE DE MIGRACIÓN), extrae
@@ -142,7 +160,11 @@ src/
    las órdenes aparecen en Órdenes. (`/imports/:id/discard` descarta el lote.)
 3. `POST /drafts/:id/validate` → crea la OS en `SIN PROGRAMAR` + primera auditoría.
 4. `POST /orders/:id/assign` → `PROGRAMADA`, genera PDFs, **envía correo** al
-   profesional con adjuntos y crea el link público.
+   profesional con adjuntos y crea el link público. La visita puede ir **partida
+   en franjas** (`sst.franjas_visita`: mañana y tarde, o varios días); el cuerpo
+   acepta `franjas[]`, las reemplaza en bloque y deriva `fecha_programada` del
+   inicio de la primera. Sin plantillas activas para esa ARL el correo sale **sin
+   formatos**: la respuesta lo dice en `formatos_generados`.
 5. `POST /public/support/:token/files` (sin login) → sube soportes y pasa a
    `EN VERIFICACIÓN`; avisa a los admins.
 6. `POST /orders/:id/verify` → `EJECUTADA`. (`/reject` con motivo vuelve a `PROGRAMADA`.)
@@ -161,7 +183,13 @@ src/
 - **Storage:** `STORAGE_DRIVER=local` (default, escribe en `./storage`) o `s3`
   (punto de extensión en `services/storage.service.js`).
 
-## Fuera de alcance (Fase 2 — NO implementado)
+## Fuera de alcance
 
-M8 Encuestas, M9 Pre-cuentas, RPT-03..07, CFG-02..05. Sus tablas existen en el
-esquema como costura, pero **no hay endpoints ni lógica**.
+Solo **ASG-06 (WhatsApp)**, que el propio FRS coloca en Fase 3 y declara omisible
+si la API tiene costo.
+
+> Este apartado decía que M8 Encuestas, M9 Pre-cuentas, RPT-03..07 y CFG-02..05
+> estaban "sin endpoints ni lógica". **Ya no**: los cuatro están construidos y en
+> uso (`modules/surveys/`, `modules/billing/`, `reports.routes.js` y las rutas de
+> configuración). Lo que sigue pendiente de verdad —deuda de pruebas y remates—
+> está en `jdd_consultores_app/HANDOFF.md` §3.
