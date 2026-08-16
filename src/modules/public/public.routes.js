@@ -50,13 +50,20 @@ router.get('/support/:token', asyncHandler(async (req, res) => {
   });
 }));
 
-// M6 · Subir soportes firmados (SIN login). Múltiples archivos. → EN VERIFICACIÓN.
+// M6 · Subir soportes firmados (SIN login). Múltiples archivos. → EJECUTADA.
+//
+// SUP-05 hablaba de EN VERIFICACIÓN, un estado intermedio que se eliminó: la
+// visita ya se hizo y los soportes están, así que la orden queda EJECUTADA. La
+// revisión del administrador (VER-01/02) no desaparece — sigue pudiendo abrir
+// los soportes y rechazarlos, y el rechazo devuelve la OS a PROGRAMADA.
 router.post('/support/:token/files', uploadSupports.array('files', 10), asyncHandler(async (req, res) => {
   if (!req.files?.length) throw badRequest('Adjunta al menos un archivo en "files"');
 
   const result = await withTransaction(async (client) => {
     const row = await resolveToken(req.params.token, client);
-    if (!['PROGRAMADA', 'EN VERIFICACIÓN'].includes(row.estado)) {
+    // EJECUTADA sigue admitiendo archivos: el profesional puede haber olvidado
+    // uno y volver por el mismo enlace a completarlo.
+    if (!['PROGRAMADA', 'EJECUTADA'].includes(row.estado)) {
       throw badRequest(`No se pueden subir soportes en estado ${row.estado}`);
     }
     const saved = [];
@@ -69,25 +76,26 @@ router.post('/support/:token/files', uploadSupports.array('files', 10), asyncHan
       );
       saved.push(sf.rows[0]);
     }
-    // SUP-05 · al subir, la OS pasa automáticamente a EN VERIFICACIÓN (si estaba PROGRAMADA).
+    // SUP-05 · al subir, la OS queda EJECUTADA (si estaba PROGRAMADA).
     if (row.estado === 'PROGRAMADA') {
       await changeStatus(
-        { orderId: row.id, newStatus: 'EN VERIFICACIÓN', userId: null, motivo: 'Soportes cargados por el profesional' },
+        { orderId: row.id, newStatus: 'EJECUTADA', userId: null, motivo: 'Soportes cargados por el profesional' },
         client
       );
     }
     return { orden: row, saved };
   });
 
-  // SUP-06/07 · avisar a administradores.
+  // SUP-06 · avisar a administradores. El aviso sigue siendo necesario aunque ya
+  // no haya estado intermedio: alguien tiene que mirar los soportes.
   await notifyAdmins({
     tipo: 'SOPORTE_CARGADO',
     titulo: 'Soportes recibidos',
-    mensaje: `${result.orden.codigo} · ${result.orden.empresa_nombre || ''} pasó a EN VERIFICACIÓN`,
+    mensaje: `${result.orden.codigo} · ${result.orden.empresa_nombre || ''} quedó EJECUTADA · revise los soportes`,
     datos: { orden_id: result.orden.id },
   });
 
-  res.status(201).json({ message: 'Soportes cargados. La OS pasó a verificación.', data: result.saved });
+  res.status(201).json({ message: 'Soportes cargados. La OS quedó ejecutada.', data: result.saved });
 }));
 
 // ---------------------------------------------------------------------------

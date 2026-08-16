@@ -64,16 +64,18 @@ function fechaHoraCO(fecha, hora) {
 }
 
 /**
- * Construye el .ics de la visita.
+ * Construye las invitaciones de la visita: **un archivo .ics por franja**.
  *
- * Devuelve null si la OS no tiene ni franjas ni fecha programada: se puede
- * asignar un profesional sin fecha, y una invitación sin cuándo no le sirve a
- * nadie.
+ * Devuelve un arreglo vacío si la OS no tiene ni franjas ni fecha programada: se
+ * puede asignar un profesional sin fecha, y una invitación sin cuándo no le
+ * sirve a nadie.
  *
- * ASG-02 · Una visita partida (mañana y tarde, o varios días) sale como **un
- * VEVENT por franja** dentro del mismo VCALENDAR, cada uno con su propio UID
- * (`os-<id>-<n>`). No se puede resolver con un solo evento largo: eso le
- * ocuparía al profesional también las horas del medio, que están libres.
+ * ASG-02 · Una visita partida (mañana y tarde, o varios días) genera un VEVENT
+ * por franja, cada uno con su propio UID (`os-<id>-<n>`) y en **su propio
+ * archivo**. Ninguna de las dos cosas es opcional: un solo evento largo le
+ * ocuparía al profesional también las horas del medio, que están libres, y
+ * varios VEVENT dentro de un mismo archivo hacen que Gmail muestre solo el
+ * primero (comprobado, ver el comentario del `return`).
  *
  * @param {object} orden        OS expandida (vw_ordenes_expandidas).
  * @param {object} profesional  Ficha del profesional asignado.
@@ -81,8 +83,9 @@ function fechaHoraCO(fecha, hora) {
  * @param {number} secuencia    Nº de revisión; sube en cada reprogramación.
  * @param {Array}  franjas      Franjas de la visita ([] = OS a la antigua).
  * @param {number} previas      Cuántas franjas tenía antes de reprogramar.
+ * @returns {{contenido: string, nombre: string}[]}
  */
-export function construirInvitacion({
+export function construirInvitaciones({
   orden, profesional, organizador, secuencia = 0, franjas = [], previas = 0,
 }) {
   const tramos = Array.isArray(franjas) && franjas.length
@@ -99,7 +102,7 @@ export function construirInvitacion({
   // horas de la OS. Si no vienen se asume una hora, que es mejor que un evento
   // de duración cero (hay calendarios que lo ocultan).
   if (!tramos.length) {
-    if (!orden?.fecha_programada) return null;
+    if (!orden?.fecha_programada) return [];
     const inicio = new Date(orden.fecha_programada);
     const horas = Number(orden.horas_asignadas) > 0 ? Number(orden.horas_asignadas) : 1;
     tramos.push({
@@ -172,20 +175,37 @@ export function construirInvitacion({
     'END:VEVENT',
   ];
 
-  const lineas = [
-    'BEGIN:VCALENDAR',
-    'VERSION:2.0',
-    'PRODID:-//JD&D Consultores//IA-Core//ES',
-    'CALSCALE:GREGORIAN',
-    // REQUEST y no PUBLISH: es una convocatoria a una persona concreta, y es lo
-    // que hace que Gmail la pinte como invitación en vez de como un adjunto.
-    'METHOD:REQUEST',
-    ...tramos.flatMap(evento),
-    'END:VCALENDAR',
-  ].filter(Boolean);
+  /** Envuelve uno o más VEVENT en un VCALENDAR completo. */
+  const calendario = (eventos) => {
+    const lineas = [
+      'BEGIN:VCALENDAR',
+      'VERSION:2.0',
+      'PRODID:-//JD&D Consultores//IA-Core//ES',
+      'CALSCALE:GREGORIAN',
+      // REQUEST y no PUBLISH: es una convocatoria a una persona concreta, y es lo
+      // que hace que Gmail la pinte como invitación en vez de como un adjunto.
+      'METHOD:REQUEST',
+      ...eventos,
+      'END:VCALENDAR',
+    ].filter(Boolean);
+    // CRLF obligatorio: con \n suelto hay clientes que rechazan el archivo.
+    return lineas.map(doblar).join('\r\n') + '\r\n';
+  };
 
-  // CRLF obligatorio: con \n suelto hay clientes que rechazan el archivo.
-  return lineas.map(doblar).join('\r\n') + '\r\n';
+  // Un archivo POR FRANJA, no uno con todos los eventos dentro.
+  //
+  // Se comprobó en Gmail con una visita de 2 franjas: del .ics con dos VEVENT y
+  // METHOD:REQUEST solo pintaba la tarjeta del primero ("… (1/2)"), así que la
+  // segunda mitad de la visita no llegaba nunca al calendario del profesional.
+  // Un adjunto por franja lo obliga a mostrar una tarjeta por cada una. Los UID
+  // siguen siendo los mismos (`os-<id>-<n>`), de modo que reprogramar mueve cada
+  // evento en su sitio y las franjas sobrantes se siguen cancelando.
+  return tramos.map((t, i) => ({
+    contenido: calendario(evento(t)),
+    nombre: tramos.length > 1
+      ? `${orden.codigo}-${i + 1}de${tramos.length}.ics`
+      : `${orden.codigo}.ics`,
+  }));
 }
 
 /**
@@ -195,11 +215,10 @@ export function construirInvitacion({
  * un archivo adjunto cualquiera; sin él Gmail ofrece descargar el .ics en vez
  * de mostrar los botones de respuesta.
  */
-export function adjuntoInvitacion(ics, nombre = 'visita.ics') {
-  if (!ics) return null;
-  return {
-    filename: nombre,
-    content: ics,
+export function adjuntosInvitacion(invitaciones) {
+  return (invitaciones ?? []).map((inv) => ({
+    filename: inv.nombre,
+    content: inv.contenido,
     contentType: 'text/calendar; charset=utf-8; method=REQUEST',
-  };
+  }));
 }

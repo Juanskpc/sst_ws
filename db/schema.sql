@@ -624,11 +624,20 @@ DO $$ BEGIN
     FOR EACH ROW EXECUTE FUNCTION sst.fn_tocar_actualizado_en();
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
--- EST-06: bloquear cualquier retroceso desde EJECUTADA (defensa en profundidad).
+-- EST-06: proteger el cierre de la OS (defensa en profundidad, además de la
+-- matriz de sst.cambiar_estado_orden).
+--
+-- La ÚNICA salida admitida desde EJECUTADA es volver a PROGRAMADA, que es el
+-- rechazo de soportes (VER-02). Se abrió esa rendija al eliminarse el estado
+-- EN VERIFICACIÓN: subir los soportes deja la OS EJECUTADA, así que sin ella el
+-- administrador no tendría forma de devolverle el trabajo al profesional.
+-- Cualquier otro retroceso (a SIN PROGRAMAR, por ejemplo) sigue prohibido.
 CREATE OR REPLACE FUNCTION sst.fn_bloquear_regresion_ejecutada() RETURNS trigger AS $$
 BEGIN
-  IF OLD.estado = 'EJECUTADA' AND NEW.estado <> 'EJECUTADA' THEN
-    RAISE EXCEPTION 'No se puede cambiar el estado de una OS EJECUTADA (EST-06).';
+  IF OLD.estado = 'EJECUTADA'
+     AND NEW.estado <> 'EJECUTADA'
+     AND NEW.estado <> 'PROGRAMADA' THEN
+    RAISE EXCEPTION 'Desde EJECUTADA solo se puede volver a PROGRAMADA (rechazo de soportes).';
   END IF;
   RETURN NEW;
 END; $$ LANGUAGE plpgsql;
@@ -661,26 +670,40 @@ BEGIN
     RAISE EXCEPTION 'La OS ya se encuentra en estado %.', p_estado_nuevo;
   END IF;
 
-  -- Matriz de transiciones válidas (EST-01)
+  -- Matriz de transiciones válidas.
+  --
+  -- El ciclo se redujo a TRES estados (ago-2026, a pedido del cliente):
+  --   SIN PROGRAMAR → PROGRAMADA → EJECUTADA
+  -- Se eliminaron EN VERIFICACIÓN (subir soportes deja la OS EJECUTADA
+  -- directamente) y CANCELADA (una orden anulada se DESHABILITA en la bandeja,
+  -- que es soft-delete del borrador y no un estado de la OS). Los valores siguen
+  -- existiendo en el enum `sst.estado_orden` porque Postgres no permite quitar
+  -- valores de un tipo enumerado; simplemente ya no se alcanzan.
+  --
+  -- EJECUTADA → PROGRAMADA es la única marcha atrás y existe a propósito: es el
+  -- rechazo de soportes (VER-02). Sin ella, al no haber estado intermedio, el
+  -- administrador no tendría forma de devolverle el trabajo al profesional.
+  -- Diverge de EST-06, que prohibía salir de EJECUTADA.
   v_permitido := CASE
-    WHEN v_actual = 'SIN PROGRAMAR'    AND p_estado_nuevo IN ('PROGRAMADA','CANCELADA') THEN TRUE
-    WHEN v_actual = 'PROGRAMADA'       AND p_estado_nuevo IN ('EN VERIFICACIÓN','SIN PROGRAMAR','CANCELADA') THEN TRUE
-    WHEN v_actual = 'EN VERIFICACIÓN'  AND p_estado_nuevo IN ('EJECUTADA','PROGRAMADA','CANCELADA') THEN TRUE
+    WHEN v_actual = 'SIN PROGRAMAR' AND p_estado_nuevo = 'PROGRAMADA'    THEN TRUE
+    WHEN v_actual = 'PROGRAMADA'    AND p_estado_nuevo IN ('EJECUTADA','SIN PROGRAMAR') THEN TRUE
+    WHEN v_actual = 'EJECUTADA'     AND p_estado_nuevo = 'PROGRAMADA'    THEN TRUE
     ELSE FALSE
   END;
 
-  IF v_actual = 'EJECUTADA' THEN
-    RAISE EXCEPTION 'No se puede cambiar el estado de una OS EJECUTADA (EST-06).';
-  END IF;
   IF NOT v_permitido THEN
     RAISE EXCEPTION 'Transición de estado inválida: % → %.', v_actual, p_estado_nuevo;
   END IF;
 
-  -- Motivo obligatorio: CANCELADA y rechazo de verificación (EN VERIFICACIÓN → PROGRAMADA)
-  IF (p_estado_nuevo = 'CANCELADA'
-      OR (v_actual = 'EN VERIFICACIÓN' AND p_estado_nuevo = 'PROGRAMADA'))
-     AND (p_motivo IS NULL OR btrim(p_motivo) = '') THEN
-    RAISE EXCEPTION 'El motivo es obligatorio para esta transición (% → %).', v_actual, p_estado_nuevo;
+  -- Motivo obligatorio en las marchas atrás: rechazar soportes
+  -- (EJECUTADA → PROGRAMADA) y devolver una visita a la bandeja
+  -- (PROGRAMADA → SIN PROGRAMAR). En ambas alguien deshace trabajo hecho y hay
+  -- que poder saber por qué.
+  IF (v_actual = 'EJECUTADA'  AND p_estado_nuevo = 'PROGRAMADA')
+     OR (v_actual = 'PROGRAMADA' AND p_estado_nuevo = 'SIN PROGRAMAR') THEN
+    IF p_motivo IS NULL OR btrim(p_motivo) = '' THEN
+      RAISE EXCEPTION 'El motivo es obligatorio para esta transición (% → %).', v_actual, p_estado_nuevo;
+    END IF;
   END IF;
 
   UPDATE sst.ordenes_servicio
@@ -880,3 +903,41 @@ SELECT date_trunc('month', fecha_carga) AS mes,
 FROM sst.ordenes_servicio
 GROUP BY 1, 2
 ORDER BY 1 DESC, 2;
+
+-- =============================================================================
+-- MIGRACIÓN (ago-2026) · Ciclo de vida reducido a tres estados
+-- =============================================================================
+-- El cliente pidió simplificar EST-01: SIN PROGRAMAR → PROGRAMADA → EJECUTADA.
+-- Los valores 'EN VERIFICACIÓN' y 'CANCELADA' siguen en el enum porque Postgres
+-- no permite eliminar valores de un tipo enumerado, pero ya no se alcanzan (ver
+-- la matriz de sst.cambiar_estado_orden).
+--
+-- Las órdenes que estaban EN VERIFICACIÓN ya tienen sus soportes cargados: bajo
+-- el modelo nuevo eso ES estar ejecutada, así que se convierten. Sin esto se
+-- quedarían en un estado sin transiciones válidas, imposibles de mover.
+--
+-- Las CANCELADA históricas NO se tocan a propósito: son un hecho del pasado y
+-- reinterpretarlas sería inventar. Se quedan como registro y no vuelven a
+-- producirse.
+DO $$
+DECLARE v_n INT;
+BEGIN
+  SELECT count(*) INTO v_n FROM sst.ordenes_servicio WHERE estado = 'EN VERIFICACIÓN';
+  IF v_n > 0 THEN
+    -- La auditoría primero: necesita leer el estado anterior antes de pisarlo.
+    INSERT INTO sst.historial_estados_orden (orden_id, estado_anterior, estado_nuevo, motivo)
+    SELECT id, 'EN VERIFICACIÓN', 'EJECUTADA',
+           'Migración: se eliminó el estado EN VERIFICACIÓN; los soportes ya estaban cargados.'
+      FROM sst.ordenes_servicio WHERE estado = 'EN VERIFICACIÓN';
+
+    UPDATE sst.ordenes_servicio
+       SET estado = 'EJECUTADA',
+           -- Sin fecha de ejecución la OS no entraría en la pre-cuenta del mes
+           -- ni en los reportes de ejecución; se usa la de la visita.
+           fecha_ejecucion = COALESCE(fecha_ejecucion, fecha_programada, now()),
+           actualizado_en = now()
+     WHERE estado = 'EN VERIFICACIÓN';
+
+    RAISE NOTICE 'Migración de estados: % OS pasaron de EN VERIFICACIÓN a EJECUTADA.', v_n;
+  END IF;
+END $$;

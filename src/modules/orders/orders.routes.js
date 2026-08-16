@@ -9,7 +9,10 @@ import { env } from '../../config/env.js';
 import { sendEmail } from '../../services/email.service.js';
 import { notify } from '../../services/notification.service.js';
 import { enviarEncuesta } from '../surveys/surveys.service.js';
-import { construirInvitacion, adjuntoInvitacion } from '../../services/calendar.service.js';
+import { construirInvitaciones, adjuntosInvitacion } from '../../services/calendar.service.js';
+import {
+  correoHtml, parrafo, tablaDatos, filaDato, bloqueFranjas, bloqueAviso, boton, enlaceCrudo,
+} from '../../services/email-layout.service.js';
 import { fechaDiaCO, fechaHoraCO, horaAmPm, horasTexto } from '../../utils/formato.js';
 
 const router = Router();
@@ -100,11 +103,42 @@ async function franjasDeOrden(ordenId, client = pool) {
   return r.rows;
 }
 
-/** "· jue 14 ago 2026, de 08:00 AM a 12:00 PM" — la visita, franja a franja. */
+/** 'HH:MM' → minutos desde medianoche. */
+function aMinutos(hhmm) {
+  const [h, m] = String(hhmm).split(':').map(Number);
+  return h * 60 + (m || 0);
+}
+
+/** Minutos que suman las franjas de una visita. */
+function minutosDeFranjas(franjas) {
+  return franjas.reduce((t, f) => t + (aMinutos(f.hora_fin) - aMinutos(f.hora_inicio)), 0);
+}
+
+/**
+ * ASG-02 · ¿Las franjas cubren exactamente las horas contratadas con la ARL?
+ *
+ * Es la condición para que la OS pase a PROGRAMADA: una visita a medio repartir
+ * sigue SIN PROGRAMAR, porque todavía le faltan horas por acordar y sacarla del
+ * grupo de pendientes la haría desaparecer de la bandeja de trabajo.
+ *
+ * `horas_asignadas` llega como texto ("8.00") porque es NUMERIC (ver trampa 18).
+ * Si la OS no trae horas no hay objetivo contra el que comparar, así que basta
+ * con que haya al menos una franja.
+ */
+function cuadranLasHoras(franjas, horasAsignadas) {
+  const objetivo = Math.round(Number(horasAsignadas ?? 0) * 60);
+  if (!Number.isFinite(objetivo) || objetivo <= 0) return franjas.length > 0;
+  return minutosDeFranjas(franjas) === objetivo;
+}
+
+/** "jue 14 ago 2026, de 08:00 AM a 12:00 PM" — una franja, ya legible. */
+function franjaEnTexto(f) {
+  return `${fechaDiaCO(f.fecha)}, de ${horaAmPm(f.hora_inicio)} a ${horaAmPm(f.hora_fin)}`;
+}
+
+/** La visita franja a franja, con viñeta, para la versión en texto plano. */
 function franjasEnTexto(franjas) {
-  return franjas
-    .map((f) => `  · ${fechaDiaCO(f.fecha)}, de ${horaAmPm(f.hora_inicio)} a ${horaAmPm(f.hora_fin)}`)
-    .join('\n');
+  return franjas.map((f) => `  · ${franjaEnTexto(f)}`).join('\n');
 }
 
 // M3 · Listado filtrable (EST-05): estado, arl_id, profesional_id, q.
@@ -190,7 +224,7 @@ router.get('/mias', asyncHandler(async (req, res) => {
       WHERE o.profesional_asignado_id = $1${filtroEstado}
       -- Primero lo que aún tiene que ejecutar y por fecha de visita: es una
       -- agenda, no un histórico. Las ya cerradas caen al final.
-      ORDER BY (o.estado IN ('PROGRAMADA','EN VERIFICACIÓN')) DESC,
+      ORDER BY (o.estado = 'PROGRAMADA') DESC,
                o.fecha_programada ASC NULLS LAST,
                o.fecha_carga DESC
       LIMIT 200`,
@@ -274,7 +308,7 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
 
     // Se bloquea la fila para que dos asignaciones simultáneas no se pisen.
     const actual = await client.query(
-      `SELECT estado::text AS estado, profesional_asignado_id, fecha_programada
+      `SELECT estado::text AS estado, profesional_asignado_id, fecha_programada, horas_asignadas
          FROM sst.ordenes_servicio WHERE id=$1 FOR UPDATE`,
       [req.params.id]
     );
@@ -286,6 +320,20 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
         `Una OS en estado ${estadoPrevio} no se puede asignar ni reprogramar.`
       );
     }
+
+    // ASG-02 · Nunca más horas de las contratadas con la ARL. La pre-cuenta (M9)
+    // valora `horas_asignadas`, así que programar de más es trabajo que no se
+    // factura; el modal ya lo impide, esto cierra la puerta por si acaso.
+    const horasOrden = actual.rows[0].horas_asignadas;
+    const objetivoMin = Math.round(Number(horasOrden ?? 0) * 60);
+    if (franjas.length && objetivoMin > 0 && minutosDeFranjas(franjas) > objetivoMin) {
+      throw badRequest(
+        `Las franjas suman ${horasTexto(minutosDeFranjas(franjas) / 60)} y la orden tiene ` +
+        `${horasTexto(horasOrden)} asignadas. Quite horas antes de guardar.`
+      );
+    }
+    // Solo se programa cuando la visita está repartida por completo.
+    const completa = cuadranLasHoras(franjas, horasOrden);
 
     // ASG-05 · La secuencia sube en el mismo UPDATE que la fecha: si se llevara
     // aparte, dos reprogramaciones seguidas podrían mandar el mismo SEQUENCE y
@@ -320,7 +368,10 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
       }
     }
 
-    if (esReprogramacion) {
+    // EST · El estado lo decide si la visita está COMPLETA, no el hecho de haber
+    // elegido profesional: una orden de 10 h con 6 h repartidas sigue teniendo
+    // trabajo pendiente y debe seguir apareciendo entre las que hay que programar.
+    if (esReprogramacion && completa) {
       // EST-03 · La reprogramación no cambia el estado, pero sí debe quedar en
       // la auditoría: sin esto, mover la visita de fecha sería invisible.
       const cambioProf = actual.rows[0].profesional_asignado_id !== profesionalId;
@@ -333,13 +384,25 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
           `${fechaCO(fechaProgramada)}.`,
         ]
       );
-    } else {
+    } else if (esReprogramacion && !completa) {
+      // Se le quitaron horas a una visita ya programada: vuelve a la bandeja.
+      await changeStatus({
+        orderId: req.params.id, newStatus: 'SIN PROGRAMAR', userId: req.user.sub,
+        motivo: `Reprogramación incompleta: ${horasTexto(minutosDeFranjas(franjas) / 60)} de ` +
+                `${horasTexto(horasOrden)} repartidas.`,
+      }, client);
+    } else if (completa) {
       // EST · SIN PROGRAMAR → PROGRAMADA (valida transición + auditoría).
       await changeStatus({ orderId: req.params.id, newStatus: 'PROGRAMADA', userId: req.user.sub }, client);
     }
+    // Caso restante (SIN PROGRAMAR + visita incompleta): se guardan profesional y
+    // franjas, y la OS se queda donde está a la espera de las horas que faltan.
 
-    // FOR · genera formatos auto-diligenciados (al reprogramar salen con los datos nuevos).
-    const docs = await generateOrderDocuments(req.params.id, client);
+    // FOR · genera formatos auto-diligenciados (al reprogramar salen con los
+    // datos nuevos). Solo si la visita está completa: un formato con media
+    // agenda impresa habría que rehacerlo, y quedaría archivado en
+    // `documentos_generados` como si fuera bueno.
+    const docs = completa ? await generateOrderDocuments(req.params.id, client) : [];
 
     // Enlace público de soportes (M6). Al reprogramar se conserva el enlace
     // vigente: emitir uno nuevo invalidaría el que ya se le envió al profesional.
@@ -358,12 +421,29 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
 
     const orden = await getOrderExpanded(req.params.id, client);
     return {
-      orden, profesional: prof.rows[0], docs, token, esReprogramacion,
+      orden, profesional: prof.rows[0], docs, token, esReprogramacion, completa,
       secuenciaCalendario: guardada.rows[0].secuencia_calendario,
       franjas: await franjasDeOrden(req.params.id, client),
       franjasPrevias,
     };
   });
+
+  // Visita a medio repartir: se guarda el avance, pero no se avisa a nadie. Un
+  // correo con media agenda mandaría al profesional a una visita que todavía se
+  // está armando, y el .ics le ocuparía unas horas que aún pueden cambiar.
+  if (!result.completa) {
+    return res.json({
+      message: 'Se guardó el avance de la programación. La orden sigue SIN PROGRAMAR hasta ' +
+               'repartir todas sus horas; el profesional no ha sido notificado.',
+      data: {
+        orden: result.orden,
+        franjas: result.franjas,
+        completa: false,
+        correo_enviado: false,
+        formatos_generados: 0,
+      },
+    });
+  }
 
   // ASG-03/04/07 · correo al profesional con PDFs + notificación interna.
   //
@@ -374,17 +454,24 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
   const supportUrl = `${env.publicAppUrl}/soporte?token=${result.token}`;
   const fecha = fechaCO(result.orden.fecha_programada);
 
-  // ASG-05 · Invitación de calendario. Devuelve null si la OS se asignó sin
-  // fecha, que está permitido: se puede decidir el profesional antes que el día.
-  const ics = construirInvitacion({
+  // ASG-05 · Invitaciones de calendario, UNA POR FRANJA. Arreglo vacío si la OS
+  // se asignó sin fecha, que está permitido: se puede decidir el profesional
+  // antes que el día.
+  const invitaciones = adjuntosInvitacion(construirInvitaciones({
     orden: result.orden,
     profesional: result.profesional,
     organizador: { nombre: req.user.nombre, correo: req.user.correo },
     secuencia: result.secuenciaCalendario,
     franjas: result.franjas,
     previas: result.franjasPrevias,
-  });
-  const invitacion = adjuntoInvitacion(ics, `${result.orden.codigo}.ics`);
+  }));
+
+  const o = result.orden;
+  const esRepro = result.esReprogramacion;
+  const varias = result.franjas.length > 1;
+  const lugar = [o.direccion, o.ciudad_ejecucion].filter(Boolean).join(', ');
+  const contacto = [o.contacto_sst_nombre, o.contacto_sst_telefono].filter(Boolean).join(' · ');
+  const sinFormatos = !result.docs.length;
 
   let correoEnviado = true;
   let correoError = null;
@@ -394,33 +481,76 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
       // El administrador que asigna va en copia para que la invitación entre
       // también en SU calendario: el requisito pide los dos, no solo el asesor.
       cc: req.user.correo || undefined,
-      subject: result.esReprogramacion
-        ? `OS reprogramada · ${result.orden.codigo} · ${result.orden.empresa_nombre || ''}`
-        : `Nueva OS asignada · ${result.orden.codigo} · ${result.orden.empresa_nombre || ''}`,
+      subject: esRepro
+        ? `OS reprogramada · ${o.codigo} · ${o.empresa_nombre || ''}`
+        : `Nueva OS asignada · ${o.codigo} · ${o.empresa_nombre || ''}`,
+      // La versión en texto se conserva íntegra: es lo que ve quien lee en texto
+      // plano y lo que queda en los registros del driver 'console'.
       text:
         `Hola ${result.profesional.nombre},\n\n` +
-        (result.esReprogramacion
-          ? `La OS ${result.orden.codigo} (${result.orden.arl_nombre}) para ${result.orden.empresa_nombre} ` +
-            `fue REPROGRAMADA.\n`
-          : `Se te asignó la OS ${result.orden.codigo} (${result.orden.arl_nombre}) para ` +
-            `${result.orden.empresa_nombre}.\n`) +
+        (esRepro
+          ? `La OS ${o.codigo} (${o.arl_nombre}) para ${o.empresa_nombre} fue REPROGRAMADA.\n`
+          : `Se te asignó la OS ${o.codigo} (${o.arl_nombre}) para ${o.empresa_nombre}.\n`) +
         // Con la visita partida, una sola "fecha programada" se queda corta: lo
         // que el profesional necesita saber es cada franja.
-        (result.franjas.length > 1
+        (varias
           ? `La visita se realiza en ${result.franjas.length} franjas:\n${franjasEnTexto(result.franjas)}\n`
           : `Fecha programada: ${fecha}\n`) +
-        `Horas: ${horasTexto(result.orden.horas_asignadas)}\n\n` +
+        `Horas: ${horasTexto(o.horas_asignadas)}\n` +
+        (lugar ? `Lugar: ${lugar}\n` : '') +
+        (contacto ? `Contacto SST: ${contacto}\n` : '') +
+        '\n' +
         // Sin plantillas activas para la ARL no hay PDFs que adjuntar (CFG-03):
         // prometer unos formatos que no van deja al profesional buscándolos.
-        (result.docs.length
-          ? `Adjuntamos los formatos para diligenciar y firmar.\n\n`
-          : `Los formatos de esta ARL todavía no están cargados en la plataforma; ` +
-            `te los haremos llegar aparte.\n\n`) +
+        (sinFormatos
+          ? `Los formatos de esta ARL todavía no están cargados en la plataforma; ` +
+            `te los haremos llegar aparte.\n\n`
+          : `Adjuntamos los formatos para diligenciar y firmar.\n\n`) +
         `Al terminar, sube los soportes firmados aquí (sin login):\n${supportUrl}\n` +
-        (invitacion ? `\nAdjuntamos también la invitación para tu calendario.\n` : ''),
+        (invitaciones.length
+          ? `\nAdjuntamos ${invitaciones.length === 1 ? 'la invitación' : `${invitaciones.length} invitaciones`} para tu calendario.\n`
+          : ''),
+      html: correoHtml({
+        titulo: esRepro ? 'Visita reprogramada' : 'Nueva orden de servicio asignada',
+        subtitulo: `${o.codigo} · ${o.empresa_nombre || ''}`,
+        pie: 'JD&D Consultores · Seguridad y Salud en el Trabajo',
+        cuerpo: [
+          parrafo(`Hola ${result.profesional.nombre},`),
+          parrafo(
+            esRepro
+              ? `La visita de esta orden cambió de programación. Estos son los datos vigentes; ` +
+                `los anteriores ya no aplican.`
+              : `Te asignamos la siguiente orden de servicio. Abajo tienes los formatos y el ` +
+                `enlace para subir los soportes al terminar.`,
+          ),
+          tablaDatos([
+            filaDato('Orden', o.codigo),
+            filaDato('ARL', o.arl_nombre),
+            filaDato('Empresa', o.empresa_nombre),
+            filaDato('Horas', horasTexto(o.horas_asignadas)),
+            filaDato('Lugar', lugar),
+            filaDato('Contacto SST', contacto),
+          ]),
+          // Con una sola franja el bloque igual se usa: es donde el ojo va a
+          // buscar el cuándo, y mantenerlo evita dos maquetas distintas.
+          bloqueFranjas(
+            varias ? `La visita se realiza en ${result.franjas.length} franjas` : 'Fecha de la visita',
+            result.franjas.length ? result.franjas.map(franjaEnTexto) : [fecha],
+          ),
+          sinFormatos
+            ? bloqueAviso(
+                'Los formatos de esta ARL todavía no están cargados en la plataforma. ' +
+                'Te los haremos llegar aparte.',
+              )
+            : parrafo('Adjuntamos los formatos para diligenciar y firmar.'),
+          parrafo('Cuando termines la visita, sube los soportes firmados desde aquí (no necesitas iniciar sesión):'),
+          boton('Subir soportes firmados', supportUrl),
+          enlaceCrudo(supportUrl),
+        ].join(''),
+      }),
       attachments: [
         ...result.docs.map((d) => ({ filename: d._filename, content: d._buffer })),
-        ...(invitacion ? [invitacion] : []),
+        ...invitaciones,
       ],
     });
   } catch (e) {
@@ -506,21 +636,52 @@ router.get('/:id/supports', asyncHandler(async (req, res) => {
   res.json({ data: r.rows });
 }));
 
-// M7 · Verificación — Aceptar → EJECUTADA
+/**
+ * M7 · Verificación — Aceptar los soportes.
+ *
+ * Ya no cambia el estado: al eliminarse EN VERIFICACIÓN, la OS quedó EJECUTADA
+ * en cuanto el profesional subió los archivos. Lo que hace este paso es dejar
+ * constancia de que un administrador los REVISÓ y los da por buenos, y recién
+ * ahí se le manda la encuesta al cliente (ENC-01) — antes de la revisión sería
+ * preguntarle por una visita que todavía nadie ha comprobado.
+ */
 router.post('/:id/verify', requireRole('admin'), asyncHandler(async (req, res) => {
-  const orden = await changeStatus({ orderId: req.params.id, newStatus: 'EJECUTADA', userId: req.user.sub });
+  const r = await pool.query(
+    `SELECT estado::text AS estado FROM sst.ordenes_servicio WHERE id=$1`, [req.params.id]
+  );
+  if (!r.rows[0]) throw badRequest('OS no encontrada');
+  if (r.rows[0].estado !== 'EJECUTADA') {
+    throw badRequest(
+      `Solo se pueden aceptar los soportes de una OS EJECUTADA; esta está ${r.rows[0].estado}.`
+    );
+  }
+
+  // EST-03 · La aceptación es un hecho auditable aunque no mueva el estado.
+  await pool.query(
+    `INSERT INTO sst.historial_estados_orden (orden_id, estado_anterior, estado_nuevo, cambiado_por, motivo)
+     VALUES ($1,'EJECUTADA','EJECUTADA',$2,'Soportes revisados y aceptados')`,
+    [req.params.id, req.user.sub]
+  );
+
+  const orden = await getOrderExpanded(req.params.id);
   const encuesta = await encuestaAlCerrar(orden); // ENC-01
   res.json({
     message: encuesta?.enviada
-      ? 'OS verificada y cerrada (EJECUTADA). Se envió la encuesta de satisfacción al cliente.'
-      : 'OS verificada y cerrada (EJECUTADA).',
+      ? 'Soportes aceptados. Se envió la encuesta de satisfacción al cliente.'
+      : 'Soportes aceptados.',
     encuesta_enviada: !!encuesta?.enviada,
     encuesta_error: encuesta?.enviada ? null : encuesta?.motivo ?? null,
     data: orden,
   });
 }));
 
-// M7 · Verificación — Rechazar → PROGRAMADA (motivo obligatorio)
+/**
+ * M7 · Verificación — Rechazar los soportes: EJECUTADA → PROGRAMADA.
+ *
+ * Es la única transición que retrocede, y por eso existe: sin ella, eliminar
+ * EN VERIFICACIÓN dejaría al administrador sin forma de devolverle el trabajo al
+ * profesional. Diverge de EST-06 (que prohibía salir de EJECUTADA) a propósito.
+ */
 router.post('/:id/reject', requireRole('admin'), asyncHandler(async (req, res) => {
   const { motivo } = req.body || {};
   if (!motivo || !motivo.trim()) throw badRequest('El motivo del rechazo es obligatorio');
@@ -536,13 +697,9 @@ router.post('/:id/reject', requireRole('admin'), asyncHandler(async (req, res) =
   res.json({ message: 'Soportes rechazados; OS vuelve a PROGRAMADA.', data: orden });
 }));
 
-// EST-04 · Cancelar (motivo obligatorio)
-router.post('/:id/cancel', requireRole('admin'), asyncHandler(async (req, res) => {
-  const { motivo } = req.body || {};
-  if (!motivo || !motivo.trim()) throw badRequest('El motivo de cancelación es obligatorio');
-  const orden = await changeStatus({ orderId: req.params.id, newStatus: 'CANCELADA', userId: req.user.sub, motivo });
-  res.json({ message: 'OS cancelada.', data: orden });
-}));
+// La ruta POST /:id/cancel se eliminó junto con el estado CANCELADA. Una orden
+// que la ARL anula se DESHABILITA desde la bandeja (soft-delete del borrador),
+// que es lo que el cliente pidió: un solo sitio donde sacar órdenes de circulación.
 
 // EST-02 · Cambio de estado genérico (admin) — respeta la matriz de transiciones.
 router.post('/:id/status', requireRole('admin'), asyncHandler(async (req, res) => {

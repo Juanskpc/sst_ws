@@ -149,8 +149,26 @@ router.patch('/:id/enable', requireRole('admin'), asyncHandler(async (req, res) 
 router.put('/:id', requireRole('admin'), asyncHandler(async (req, res) => {
   const { fields } = req.body || {}; // { codigo_cronograma: {value, confidence}, ... }
   if (!fields || typeof fields !== 'object') throw badRequest('Envía "fields" con los campos editados');
-  const cur = await pool.query(`SELECT metadatos_extraccion FROM sst.borradores_extraccion WHERE id=$1`, [req.params.id]);
+  const cur = await pool.query(
+    `SELECT d.metadatos_extraccion, d.estado::text AS estado, o.codigo AS os_codigo
+       FROM sst.borradores_extraccion d
+       LEFT JOIN sst.ordenes_servicio o ON o.id = d.orden_servicio_id
+      WHERE d.id=$1`,
+    [req.params.id]
+  );
   if (!cur.rows[0]) throw notFound('Borrador no encontrado');
+
+  // Un borrador YA VALIDADO no se edita: su OS existe y es la que manda. Antes
+  // el UPDATE se aceptaba y escribía en un JSON que ya no lee nadie, así que la
+  // corrección se "guardaba" sin efecto y el usuario se quedaba creyendo que el
+  // cambio estaba hecho. Caso real: se corrigió el correo del contacto SST
+  // sobre un borrador ya validado y la OS conservó el anterior.
+  if (cur.rows[0].estado === 'VALIDADA') {
+    throw conflict(
+      `Esta orden ya se guardó en Órdenes${cur.rows[0].os_codigo ? ` como ${cur.rows[0].os_codigo}` : ''}. ` +
+      'Los cambios ya no se hacen aquí: ábrala en Órdenes para editarla.'
+    );
+  }
 
   const merged = { ...cur.rows[0].metadatos_extraccion };
   for (const f of CANONICAL_FIELDS) {
@@ -175,109 +193,174 @@ router.put('/:id', requireRole('admin'), asyncHandler(async (req, res) => {
   res.json({ data: await loadDraftExpanded(req.params.id) });
 }));
 
-// M3 · "Validar y Guardar" → materializa la OS con estado SIN PROGRAMAR (EST-01)
-// y escribe la primera entrada en historial_estados_orden.
+/**
+ * M3 · Materializa la OS a partir de un borrador: la crea con estado
+ * SIN PROGRAMAR (IMP-07) y escribe la primera entrada de auditoría.
+ *
+ * Vive aparte de la ruta porque tiene DOS llamadores: la validación manual
+ * (`POST /drafts/:id/validate`) y la confirmación desde Importar, que desde
+ * ago-2026 valida sola. La revisión de fondo ya se hizo en la vista previa —
+ * campo por campo, contra el documento original—, así que volver a pedir un
+ * "validar" en la bandeja era pedir dos veces lo mismo.
+ */
+export async function materializarOrden(draftId, userId, client) {
+  const dr = await client.query(
+    `SELECT * FROM sst.borradores_extraccion WHERE id=$1 FOR UPDATE`, [draftId]
+  );
+  const draft = dr.rows[0];
+  if (!draft) throw notFound('Borrador no encontrado');
+  if (draft.estado === 'VALIDADA') throw conflict('El borrador ya fue validado');
+  if (!draft.arl_id) throw badRequest('El borrador no tiene ARL detectada');
+
+  const m = draft.metadatos_extraccion || {};
+  const val = (f) => (m[f]?.value ?? null) || null;
+  const numeroOrden = val('numero_orden');
+  const cron = val('codigo_cronograma');
+  const sec = val('secuencia');
+
+  // Identidad por ARL: Bolívar usa cronograma+secuencia; AXA/Colmena, numero_orden.
+  if (!numeroOrden && !(cron && sec)) {
+    throw badRequest('La OS necesita numero_orden, o bien codigo_cronograma + secuencia');
+  }
+
+  // Dedup IMP-09 según la identidad disponible (defensa adicional al índice UNIQUE).
+  if (numeroOrden) {
+    const dup = await client.query(
+      `SELECT id FROM sst.ordenes_servicio WHERE arl_id=$1 AND numero_orden=$2`,
+      [draft.arl_id, numeroOrden]
+    );
+    if (dup.rows[0]) throw conflict('OS duplicada por (ARL + número de orden)');
+  } else {
+    const dup = await client.query(
+      `SELECT id FROM sst.ordenes_servicio WHERE arl_id=$1 AND codigo_cronograma=$2 AND secuencia=$3`,
+      [draft.arl_id, cron, sec]
+    );
+    if (dup.rows[0]) throw conflict('OS duplicada por (ARL + cronograma + secuencia)');
+  }
+
+  // Código legible OS-YYYY-NNNN.
+  const year = new Date().getFullYear();
+  const cnt = await client.query(
+    `SELECT count(*)::int AS c FROM sst.ordenes_servicio WHERE codigo LIKE $1`, [`OS-${year}-%`]
+  );
+  const codigo = `OS-${year}-${String(cnt.rows[0].c + 1).padStart(4, '0')}`;
+
+  // CFG-02 · La OS queda enlazada al maestro de empresas, creando la ficha si
+  // la empresa es nueva. Los textos (nit_nic / empresa_nombre) se conservan
+  // igual: son el dato histórico de lo que decía el documento de la ARL.
+  const empresaId = await resolverEmpresaId({
+    nit: val('nit_nic'),
+    nombre: val('empresa_nombre'),
+    actividad_economica: val('actividad_economica'),
+    ciudad: val('ciudad_ejecucion'),
+    direccion: val('direccion'),
+    contacto_nombre: val('contacto_empresa_nombre'),
+    contacto_cargo: val('contacto_empresa_cargo'),
+    contacto_telefono: val('contacto_empresa_telefono'),
+    contacto_sst_nombre: val('contacto_sst_nombre'),
+    contacto_sst_telefono: val('contacto_sst_telefono'),
+    contacto_sst_correo: val('contacto_sst_correo'),
+  }, client);
+
+  const ord = await client.query(
+    `INSERT INTO sst.ordenes_servicio (
+       codigo, arl_id, numero_orden, codigo_cronograma, secuencia, nro_afiliacion,
+       nit_nic, empresa_nombre, empresa_id, actividad_economica, tipo_actividad, modalidad,
+       horas_asignadas, valor_unitario, valor_total,
+       fecha_orden, fecha_vencimiento, ciudad_ejecucion, direccion, descripcion,
+       contacto_empresa_nombre, contacto_empresa_cargo, contacto_empresa_telefono,
+       contacto_sst_nombre, contacto_sst_telefono, contacto_sst_correo,
+       lote_importacion_id, url_archivo_original, metadatos_extraccion, estado)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,
+             $20,$21,$22,$23,$24,$25,$26,$27,$28,$29,'SIN PROGRAMAR')
+     RETURNING *`,
+    [
+      codigo, draft.arl_id, numeroOrden, cron, sec, val('nro_afiliacion'),
+      val('nit_nic'), val('empresa_nombre'), empresaId, val('actividad_economica'),
+      val('tipo_actividad'), val('modalidad'),
+      parseNumeroCO(val('horas_asignadas')), parseNumeroCO(val('valor_unitario')),
+      parseNumeroCO(val('valor_total')),
+      parseFechaCO(val('fecha_orden')), parseFechaCO(val('fecha_vencimiento')),
+      val('ciudad_ejecucion'), val('direccion'), val('descripcion'),
+      val('contacto_empresa_nombre'), val('contacto_empresa_cargo'), val('contacto_empresa_telefono'),
+      val('contacto_sst_nombre'), val('contacto_sst_telefono'), val('contacto_sst_correo'),
+      draft.lote_importacion_id, draft.url_archivo_original, m,
+    ]
+  );
+  const orden = ord.rows[0];
+
+  // Primera entrada de auditoría (EST-03): creación → SIN PROGRAMAR.
+  await client.query(
+    `INSERT INTO sst.historial_estados_orden (orden_id, estado_anterior, estado_nuevo, cambiado_por, motivo)
+     VALUES ($1, NULL, 'SIN PROGRAMAR', $2, 'Validación IA — creación de OS')`,
+    [orden.id, userId]
+  );
+
+  await client.query(
+    `UPDATE sst.borradores_extraccion SET estado='VALIDADA', orden_servicio_id=$2 WHERE id=$1`,
+    [draft.id, orden.id]
+  );
+  return orden;
+}
+
+// M3 · "Validar y Guardar" manual. Se conserva para las órdenes que ya estaban
+// en la bandeja como PENDIENTE_VALIDACION antes del cambio de ago-2026; las
+// nuevas llegan validadas desde Importar y nunca pasan por aquí.
 router.post('/:id/validate', requireRole('admin'), asyncHandler(async (req, res) => {
-  const result = await withTransaction(async (client) => {
-    const dr = await client.query(
-      `SELECT * FROM sst.borradores_extraccion WHERE id=$1 FOR UPDATE`, [req.params.id]
-    );
-    const draft = dr.rows[0];
-    if (!draft) throw notFound('Borrador no encontrado');
-    if (draft.estado === 'VALIDADA') throw conflict('El borrador ya fue validado');
-    if (!draft.arl_id) throw badRequest('El borrador no tiene ARL detectada');
-
-    const m = draft.metadatos_extraccion || {};
-    const val = (f) => (m[f]?.value ?? null) || null;
-    const numeroOrden = val('numero_orden');
-    const cron = val('codigo_cronograma');
-    const sec = val('secuencia');
-
-    // Identidad por ARL: Bolívar usa cronograma+secuencia; AXA/Colmena, numero_orden.
-    if (!numeroOrden && !(cron && sec)) {
-      throw badRequest('La OS necesita numero_orden, o bien codigo_cronograma + secuencia');
-    }
-
-    // Dedup IMP-09 según la identidad disponible (defensa adicional al índice UNIQUE).
-    if (numeroOrden) {
-      const dup = await client.query(
-        `SELECT id FROM sst.ordenes_servicio WHERE arl_id=$1 AND numero_orden=$2`,
-        [draft.arl_id, numeroOrden]
-      );
-      if (dup.rows[0]) throw conflict('OS duplicada por (ARL + número de orden)');
-    } else {
-      const dup = await client.query(
-        `SELECT id FROM sst.ordenes_servicio WHERE arl_id=$1 AND codigo_cronograma=$2 AND secuencia=$3`,
-        [draft.arl_id, cron, sec]
-      );
-      if (dup.rows[0]) throw conflict('OS duplicada por (ARL + cronograma + secuencia)');
-    }
-
-    // Código legible OS-YYYY-NNNN.
-    const year = new Date().getFullYear();
-    const cnt = await client.query(
-      `SELECT count(*)::int AS c FROM sst.ordenes_servicio WHERE codigo LIKE $1`, [`OS-${year}-%`]
-    );
-    const codigo = `OS-${year}-${String(cnt.rows[0].c + 1).padStart(4, '0')}`;
-
-    // CFG-02 · La OS queda enlazada al maestro de empresas, creando la ficha si
-    // la empresa es nueva. Los textos (nit_nic / empresa_nombre) se conservan
-    // igual: son el dato histórico de lo que decía el documento de la ARL.
-    const empresaId = await resolverEmpresaId({
-      nit: val('nit_nic'),
-      nombre: val('empresa_nombre'),
-      actividad_economica: val('actividad_economica'),
-      ciudad: val('ciudad_ejecucion'),
-      direccion: val('direccion'),
-      contacto_nombre: val('contacto_empresa_nombre'),
-      contacto_cargo: val('contacto_empresa_cargo'),
-      contacto_telefono: val('contacto_empresa_telefono'),
-      contacto_sst_nombre: val('contacto_sst_nombre'),
-      contacto_sst_telefono: val('contacto_sst_telefono'),
-      contacto_sst_correo: val('contacto_sst_correo'),
-    }, client);
-
-    const ord = await client.query(
-      `INSERT INTO sst.ordenes_servicio (
-         codigo, arl_id, numero_orden, codigo_cronograma, secuencia, nro_afiliacion,
-         nit_nic, empresa_nombre, empresa_id, actividad_economica, tipo_actividad, modalidad,
-         horas_asignadas, valor_unitario, valor_total,
-         fecha_orden, fecha_vencimiento, ciudad_ejecucion, direccion, descripcion,
-         contacto_empresa_nombre, contacto_empresa_cargo, contacto_empresa_telefono,
-         contacto_sst_nombre, contacto_sst_telefono, contacto_sst_correo,
-         lote_importacion_id, url_archivo_original, metadatos_extraccion, estado)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,
-               $20,$21,$22,$23,$24,$25,$26,$27,$28,$29,'SIN PROGRAMAR')
-       RETURNING *`,
-      [
-        codigo, draft.arl_id, numeroOrden, cron, sec, val('nro_afiliacion'),
-        val('nit_nic'), val('empresa_nombre'), empresaId, val('actividad_economica'),
-        val('tipo_actividad'), val('modalidad'),
-        parseNumeroCO(val('horas_asignadas')), parseNumeroCO(val('valor_unitario')),
-        parseNumeroCO(val('valor_total')),
-        parseFechaCO(val('fecha_orden')), parseFechaCO(val('fecha_vencimiento')),
-        val('ciudad_ejecucion'), val('direccion'), val('descripcion'),
-        val('contacto_empresa_nombre'), val('contacto_empresa_cargo'), val('contacto_empresa_telefono'),
-        val('contacto_sst_nombre'), val('contacto_sst_telefono'), val('contacto_sst_correo'),
-        draft.lote_importacion_id, draft.url_archivo_original, m,
-      ]
-    );
-    const orden = ord.rows[0];
-
-    // Primera entrada de auditoría (EST-03): creación → SIN PROGRAMAR.
-    await client.query(
-      `INSERT INTO sst.historial_estados_orden (orden_id, estado_anterior, estado_nuevo, cambiado_por, motivo)
-       VALUES ($1, NULL, 'SIN PROGRAMAR', $2, 'Validación IA — creación de OS')`,
-      [orden.id, req.user.sub]
-    );
-
-    await client.query(
-      `UPDATE sst.borradores_extraccion SET estado='VALIDADA', orden_servicio_id=$2 WHERE id=$1`,
-      [draft.id, orden.id]
-    );
-    return orden;
-  });
+  const result = await withTransaction((client) => materializarOrden(req.params.id, req.user.sub, client));
   res.status(201).json({ message: 'OS validada y guardada', data: result });
+}));
+
+// IMP-04 · Enviar a Órdenes UN solo borrador revisado, sin arrastrar el resto
+// del lote. Un SIPAB trae decenas de órdenes y revisarlas todas antes de poder
+// guardar cualquiera obliga a hacerlo de una sentada; así se van cerrando de a
+// una y lo que quede a medias sigue en la vista previa.
+//
+// Confirmar YA VALIDA: la OS se materializa aquí mismo y entra a la bandeja
+// como SIN PROGRAMAR (IMP-07), lista para asignarle profesional y horario.
+// Antes quedaba PENDIENTE_VALIDACION y había que volver a "validarla" en
+// Órdenes, un segundo repaso de lo mismo que se acababa de revisar campo por
+// campo en la vista previa. Sin fecha de vencimiento no entra: después ya no se
+// vuelve a pedir y la orden quedaría sin fecha de control.
+router.post('/:id/confirm', requireRole('admin'), asyncHandler(async (req, res) => {
+  const orden = await withTransaction(async (client) => {
+    const cur = await client.query(
+      `SELECT estado::text AS estado, metadatos_extraccion, orden_servicio_id
+         FROM sst.borradores_extraccion WHERE id=$1 FOR UPDATE`,
+      [req.params.id]
+    );
+    const draft = cur.rows[0];
+    if (!draft) throw notFound('Borrador no encontrado');
+    if (draft.estado === 'DUPLICADA') throw conflict('La orden ya existe: no se puede enviar a Órdenes');
+    // Ya guardada (doble clic, reintento tras un error de red, o el usuario que
+    // no vio el aviso de éxito): NO es un fallo. Se responde con la OS que se
+    // creó para que la vista quite la fila igual que en el camino normal. Antes
+    // devolvía 400 "ya no está pendiente de revisión", que sonaba a que algo
+    // había ido mal cuando en realidad estaba hecho.
+    if (draft.estado === 'VALIDADA') {
+      const os = await client.query(
+        `SELECT * FROM sst.ordenes_servicio WHERE id=$1`, [draft.orden_servicio_id]
+      );
+      return { orden: os.rows[0], yaEstaba: true };
+    }
+    if (draft.estado !== 'PENDIENTE_REVISION') {
+      throw badRequest(
+        `Esta orden está en estado ${draft.estado} y ya no se puede enviar a Órdenes.`
+      );
+    }
+    if (!String(draft.metadatos_extraccion?.fecha_vencimiento?.value ?? '').trim()) {
+      throw badRequest('La orden no tiene fecha de vencimiento. Diligénciela antes de guardar.');
+    }
+    return { orden: await materializarOrden(req.params.id, req.user.sub, client), yaEstaba: false };
+  });
+
+  res.status(orden.yaEstaba ? 200 : 201).json({
+    message: orden.yaEstaba
+      ? `${orden.orden?.codigo ?? 'Esta orden'} ya estaba guardada en Órdenes.`
+      : `${orden.orden.codigo} entró a Órdenes como SIN PROGRAMAR.`,
+    ya_estaba: orden.yaEstaba,
+    data: orden.orden,
+  });
 }));
 
 // Descartar un borrador

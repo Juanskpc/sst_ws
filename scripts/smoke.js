@@ -79,7 +79,7 @@ async function main() {
   const token6 = detail.enlace_publico.token;
   log('Enlace público', { token: token6.slice(0, 12) + '…', estado: detail.estado });
 
-  // 8 · Portal público: ver OS + subir soporte (SIN login) → EN VERIFICACIÓN
+  // 8 · Portal público: ver OS + subir soporte (SIN login) → EJECUTADA
   const pub = await (await fetch(`${BASE}/public/support/${token6}`)).json();
   log('Portal público (GET)', { empresa: pub.data.empresa_nombre, estado: pub.data.estado });
   const sfd = new FormData();

@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { pool } from '../../config/db.js';
+import { pool, withTransaction } from '../../config/db.js';
 import { asyncHandler } from '../../utils/asyncHandler.js';
 import { authRequired, requireRole } from '../../middleware/auth.js';
 import { uploadImport } from '../../middleware/upload.js';
@@ -7,6 +7,7 @@ import { badRequest, notFound } from '../../utils/httpError.js';
 import { storage } from '../../services/storage.service.js';
 import { readSheetPreview } from '../../services/extraction.service.js';
 import { enqueueImport } from '../../queue/importQueue.js';
+import { materializarOrden } from './drafts.routes.js';
 
 const router = Router();
 router.use(authRequired);
@@ -92,22 +93,44 @@ router.get('/:id/sheet', asyncHandler(async (req, res) => {
   res.json({ data: { nombre_archivo: lote.nombre_archivo, ...preview } });
 }));
 
-// Detalle del lote + borradores extraídos
+// Detalle del lote + borradores extraídos.
+//
+// IMP-07/09 · Un borrador DUPLICADA viaja con la ficha de la OS que ya existe
+// (código, estado, profesional y si está deshabilitada). Decir solo "duplicada"
+// obliga a quien importa a ir a Órdenes a buscarla para entender por qué su
+// archivo no entra; con el estado a la vista decide en el momento. El
+// `deshabilitado` vive en el BORRADOR que materializó la OS, no en la OS: por
+// eso se lee aparte, y con LIMIT 1 porque nada impide que dos borradores
+// apunten a la misma orden.
 router.get('/:id', asyncHandler(async (req, res) => {
   const b = await pool.query(`SELECT * FROM sst.lotes_importacion WHERE id=$1`, [req.params.id]);
   if (!b.rows[0]) throw notFound('Lote no encontrado');
   const borradores = await pool.query(
-    `SELECT d.*, a.nombre AS arl_nombre FROM sst.borradores_extraccion d
-     LEFT JOIN sst.arls a ON a.id = d.arl_id
-     WHERE d.lote_importacion_id=$1 ORDER BY d.creado_en`,
+    `SELECT d.*, a.nombre AS arl_nombre,
+            od.codigo             AS duplicado_codigo,
+            od.estado::text       AS duplicado_estado,
+            od.fecha_programada   AS duplicado_fecha_programada,
+            od.fecha_carga        AS duplicado_fecha_carga,
+            pd.nombre             AS duplicado_profesional,
+            COALESCE((SELECT bd.deshabilitado
+                        FROM sst.borradores_extraccion bd
+                       WHERE bd.orden_servicio_id = od.id
+                       ORDER BY bd.creado_en LIMIT 1), false) AS duplicado_deshabilitado
+       FROM sst.borradores_extraccion d
+       LEFT JOIN sst.arls a ON a.id = d.arl_id
+       LEFT JOIN sst.ordenes_servicio od ON od.id = d.duplicado_de
+       LEFT JOIN sst.profesionales pd ON pd.id = od.profesional_asignado_id
+      WHERE d.lote_importacion_id=$1 ORDER BY d.creado_en`,
     [req.params.id]
   );
   res.json({ data: { ...b.rows[0], borradores: borradores.rows } });
 }));
 
 // IMP-04 · Confirmar el lote tras la revisión humana en la vista previa.
-// Los borradores pasan de PENDIENTE_REVISION → PENDIENTE_VALIDACION y recién
-// entonces aparecen en la bandeja de Órdenes. Los DUPLICADA no se tocan.
+// Cada borrador se MATERIALIZA como OS en estado SIN PROGRAMAR (IMP-07): la
+// revisión ya se hizo aquí, campo por campo contra el documento, así que la
+// orden entra a la bandeja lista para asignar y no vuelve a pedir un "validar".
+// Los DUPLICADA no se tocan.
 router.post('/:id/confirm', requireRole('admin'), asyncHandler(async (req, res) => {
   const lote = await pool.query(`SELECT id FROM sst.lotes_importacion WHERE id=$1`, [req.params.id]);
   if (!lote.rows[0]) throw notFound('Lote no encontrado');
@@ -131,18 +154,54 @@ router.post('/:id/confirm', requireRole('admin'), asyncHandler(async (req, res) 
     );
   }
 
-  const r = await pool.query(
-    `UPDATE sst.borradores_extraccion
-        SET estado='PENDIENTE_VALIDACION', actualizado_en=now()
+  const pendientes = await pool.query(
+    `SELECT id FROM sst.borradores_extraccion
       WHERE lote_importacion_id=$1 AND estado='PENDIENTE_REVISION'
-      RETURNING id`,
+      ORDER BY creado_en`,
     [req.params.id]
   );
-  if (!r.rowCount) throw badRequest('El lote no tiene órdenes pendientes de revisión');
+  // Sin pendientes NO es un error: significa que las órdenes de este archivo ya
+  // se guardaron (de a una, con el botón de la fila, o en un intento anterior).
+  // Antes esto respondía 400 y hacía fracasar el "Guardar todo" completo aunque
+  // el resto de archivos estuviera bien; el usuario veía un fallo donde en
+  // realidad no quedaba nada por hacer.
+  if (!pendientes.rowCount) {
+    const ya = await pool.query(
+      `SELECT count(*)::int AS n FROM sst.borradores_extraccion
+        WHERE lote_importacion_id=$1 AND estado='VALIDADA'`,
+      [req.params.id]
+    );
+    return res.json({
+      message: ya.rows[0].n
+        ? `Las ${ya.rows[0].n} orden(es) de este archivo ya estaban guardadas.`
+        : 'Este archivo no tiene órdenes por guardar.',
+      data: { confirmadas: 0, ya_guardadas: ya.rows[0].n, codigos: [], fallidas: [] },
+    });
+  }
 
+  // Cada orden se materializa en SU PROPIA transacción, no todas en una.
+  // Un lote SIPAB trae decenas: si una sola choca (una identidad que se coló
+  // duplicada entre la extracción y ahora), con una transacción única se caerían
+  // las cuarenta. Así entran las que puedan y se informa de las que no.
+  const creadas = [];
+  const fallidas = [];
+  for (const { id } of pendientes.rows) {
+    try {
+      const orden = await withTransaction((client) => materializarOrden(id, req.user.sub, client));
+      creadas.push(orden.codigo);
+    } catch (e) {
+      fallidas.push(e?.message || 'No se pudo crear la OS');
+    }
+  }
+
+  if (!creadas.length) {
+    throw badRequest(`Ninguna orden pudo guardarse. ${fallidas[0] ?? ''}`.trim());
+  }
   res.json({
-    message: `${r.rowCount} orden(es) enviada(s) a Órdenes.`,
-    data: { confirmadas: r.rowCount },
+    message: fallidas.length
+      ? `${creadas.length} orden(es) guardada(s) en Órdenes; ${fallidas.length} no se pudieron guardar.`
+      : `${creadas.length} orden(es) guardada(s) en Órdenes como SIN PROGRAMAR.`,
+    data: { confirmadas: creadas.length, codigos: creadas, fallidas },
   });
 }));
 
