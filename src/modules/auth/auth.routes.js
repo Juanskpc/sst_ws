@@ -116,14 +116,20 @@ router.post('/forgot-password', asyncHandler(async (req, res) => {
 // AUTH-03 · Confirmación de nueva contraseña con token de un solo uso
 router.post('/reset-password', asyncHandler(async (req, res) => {
   const { token, password } = req.body || {};
-  if (!token || !password) throw badRequest('token y password son obligatorios');
+  // Nombres de campo del cuerpo de la petición: quien lee esto está en una
+  // pantalla que ni siquiera enseña un campo llamado "token".
+  if (!token || !password) {
+    throw badRequest('Falta la contraseña nueva, o el enlace llegó incompleto. Ábralo otra vez desde el correo.');
+  }
   const errorPolicy = validarPolicyPassword(password);
   if (errorPolicy) throw badRequest(errorPolicy);
 
   const usuario = await canjearTokenRecuperacion(String(token), password, req);
   if (!usuario) {
     await auditar({ evento: EVENTOS.RECUPERACION_TOKEN_INVALIDO, exito: false, req });
-    throw badRequest('Token inválido o expirado');
+    throw badRequest(
+      'Este enlace ya se usó o venció (dura una hora). Pida uno nuevo desde "¿Olvidó su contraseña?".',
+    );
   }
   await auditar({ usuarioId: usuario.id, correo: usuario.correo, evento: EVENTOS.RECUPERACION_COMPLETADA, exito: true, req });
   res.json({ message: 'Contraseña actualizada.' });

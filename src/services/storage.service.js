@@ -27,6 +27,10 @@ async function localGet(key) {
   return fs.readFile(path.join(localRoot, key));
 }
 
+async function localDel(key) {
+  await fs.unlink(path.join(localRoot, key));
+}
+
 // --- Driver S3 (nube) ---
 // Cliente perezoso: el SDK oficial solo se carga si STORAGE_DRIVER=s3, sin afectar
 // la ruta 'local'. Credenciales vía AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
@@ -50,6 +54,12 @@ async function s3Put(key, buffer) {
   return key;
 }
 
+async function s3Del(key) {
+  const { DeleteObjectCommand } = await import('@aws-sdk/client-s3');
+  const client = await s3Client();
+  await client.send(new DeleteObjectCommand({ Bucket: env.storage.s3Bucket, Key: key }));
+}
+
 async function s3Get(key) {
   const { GetObjectCommand } = await import('@aws-sdk/client-s3');
   const client = await s3Client();
@@ -69,5 +79,26 @@ export const storage = {
   async get(key) {
     if (env.storage.driver === 's3') return s3Get(key);
     return localGet(key);
+  },
+
+  /**
+   * Borra un objeto. Devuelve `true` si lo borró y `false` si no estaba.
+   *
+   * Que el binario no esté NO es un error: se llama al reemplazar un soporte
+   * que el profesional vuelve a subir, y la fila de BD es la que manda. Si el
+   * archivo ya no estaba (borrado a mano, sembrado sin subir), el reemplazo
+   * tiene que seguir adelante igual — lo contrario dejaría al profesional sin
+   * poder subsanar por culpa de un fichero que ya no existe.
+   */
+  async remove(key) {
+    if (!key) return false;
+    try {
+      if (env.storage.driver === 's3') await s3Del(key);
+      else await localDel(key);
+      return true;
+    } catch (err) {
+      if (err?.code === 'ENOENT' || err?.name === 'NoSuchKey') return false;
+      throw err;
+    }
   },
 };

@@ -51,15 +51,21 @@ router.get('/stats', asyncHandler(async (req, res) => {
       `SELECT count(*)::int                                   AS enviadas,
               count(*) FILTER (WHERE respondida)::int         AS respondidas,
               round(avg(satisfaccion)  FILTER (WHERE respondida)::numeric, 2) AS promedio_satisfaccion,
+              round(avg(nota_profesional) FILTER (WHERE respondida)::numeric, 2) AS promedio_profesional,
               round(avg(recomendacion) FILTER (WHERE respondida)::numeric, 2) AS promedio_recomendacion
          FROM sst.vw_encuestas ${where}`, params),
     pool.query(
+      // `promedio_profesional` es la nota del asesor (la pregunta nueva de ENC-03),
+      // no la de la actividad: son dos cosas distintas y la tabla las enseña
+      // separadas para que una capacitación floja no manche a quien la dictó
+      // bien, ni al revés.
       `SELECT profesional_id, COALESCE(profesional_nombre, 'Sin profesional') AS profesional_nombre,
               count(*)::int AS enviadas, count(*) FILTER (WHERE respondida)::int AS respondidas,
               round(avg(satisfaccion)  FILTER (WHERE respondida)::numeric, 2) AS promedio_satisfaccion,
+              round(avg(nota_profesional) FILTER (WHERE respondida)::numeric, 2) AS promedio_profesional,
               round(avg(recomendacion) FILTER (WHERE respondida)::numeric, 2) AS promedio_recomendacion
          FROM sst.vw_encuestas ${where}
-        GROUP BY 1, 2 ORDER BY promedio_satisfaccion DESC NULLS LAST`, params),
+        GROUP BY 1, 2 ORDER BY promedio_profesional DESC NULLS LAST`, params),
     pool.query(
       `SELECT arl_id, COALESCE(arl_nombre, 'Sin ARL') AS arl_nombre,
               count(*)::int AS enviadas, count(*) FILTER (WHERE respondida)::int AS respondidas,

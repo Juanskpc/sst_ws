@@ -11,23 +11,71 @@ import { notify } from '../../services/notification.service.js';
 import { enviarEncuesta } from '../surveys/surveys.service.js';
 import { construirInvitaciones, adjuntosInvitacion } from '../../services/calendar.service.js';
 import {
-  correoHtml, parrafo, tablaDatos, filaDato, bloqueFranjas, bloqueAviso, boton, enlaceCrudo,
+  correoHtml, parrafo, tablaDatos, filaDato, bloqueLista, bloqueAviso, boton, enlaceCrudo,
 } from '../../services/email-layout.service.js';
 import { fechaDiaCO, fechaHoraCO, horaAmPm, horasTexto } from '../../utils/formato.js';
+import { parseNumeroCO, parseFechaCO } from '../../utils/parseo.js';
+import { resolverEmpresaId } from '../companies/companies.service.js';
+import {
+  CATEGORIAS_SOPORTE, esCategoriaValida, listaEtiquetas, normalizarCategoria,
+} from '../../services/soportes.service.js';
 
 const router = Router();
 router.use(authRequired);
 
 /**
- * ENC-01 · Dispara la encuesta de satisfacción cuando una OS queda EJECUTADA.
+ * PRE-02 · Qué valor hora le corresponde a una orden con este profesional.
+ *
+ * Orden de resolución, de lo más específico a lo más general:
+ *   1. tarifa del PROFESIONAL para ese tipo de orden (la excepción negociada),
+ *   2. valor hora del TIPO DE ORDEN (el catálogo de Configuración, el camino
+ *      normal desde que la categoría es obligatoria),
+ *   3. valor hora base del profesional (lo que había antes de todo esto).
+ *
+ * Devuelve también el origen para poder explicar la cifra en pantalla — "85.000
+ * por ser Capacitación" se entiende; "85.000" a secas, no.
+ */
+async function valorHoraDeOrden({ ordenId, profesional }, client) {
+  const r = await client.query(
+    `SELECT t.id, t.nombre, t.valor_hora
+       FROM sst.ordenes_servicio o
+       LEFT JOIN sst.tipos_orden t ON t.id = o.tipo_orden_id
+      WHERE o.id = $1`,
+    [ordenId]
+  );
+  const tipo = r.rows[0];
+
+  if (tipo?.nombre) {
+    const propia = await client.query(
+      `SELECT valor_hora FROM sst.tarifas_actividad_profesional
+        WHERE profesional_id=$1 AND lower(actividad)=lower($2) AND vigente_desde <= CURRENT_DATE
+        ORDER BY vigente_desde DESC LIMIT 1`,
+      [profesional.id, tipo.nombre]
+    );
+    if (propia.rows[0]) {
+      return { valorHora: Number(propia.rows[0].valor_hora), origen: 'tarifa' };
+    }
+  }
+  if (Number(tipo?.valor_hora) > 0) {
+    return { valorHora: Number(tipo.valor_hora), origen: 'tipo' };
+  }
+  return { valorHora: Number(profesional.valor_hora) || 0, origen: 'profesional' };
+}
+
+/**
+ * ENC-01 · Dispara la encuesta de satisfacción cuando una OS queda FINALIZADA.
+ *
+ * El disparador es el cierre REAL del ciclo, no la subida de soportes: mandarla
+ * al pasar a EJECUTADA sería preguntarle al cliente por una visita cuyos
+ * documentos todavía no ha mirado nadie.
  *
  * Se llama DESPUÉS de cerrar el cambio de estado y nunca lanza: el correo al
  * cliente es un efecto secundario del cierre, no parte de él. Si el SMTP falla,
- * la OS igual queda verificada y el administrador puede reintentar con
+ * la OS igual queda finalizada y el administrador puede reintentar con
  * `POST /surveys/:ordenId/send`.
  */
 async function encuestaAlCerrar(orden) {
-  if (orden?.estado !== 'EJECUTADA') return null;
+  if (orden?.estado !== 'FINALIZADA') return null;
   const r = await enviarEncuesta(orden.id);
   if (!r.enviada) console.warn(`[encuesta] ${orden.codigo}: ${r.motivo}`);
   return r;
@@ -264,6 +312,121 @@ router.get('/:id', asyncHandler(async (req, res) => {
 }));
 
 /**
+ * Columnas de la OS que la vista Órdenes deja corregir, y cómo se convierte
+ * cada una antes de guardarla.
+ *
+ * Es una lista blanca a propósito: el resto de columnas tiene dueño y no se
+ * toca por aquí. `estado` se mueve con `POST /:id/status` (que valida la
+ * transición y deja auditoría), y el profesional y la fecha programada, con
+ * `POST /:id/assign` (que además regenera formatos y reenvía el correo).
+ * Dejarlas entrar en un UPDATE plano sería saltarse las dos cosas.
+ */
+const CAMPOS_EDITABLES = {
+  numero_orden: String,
+  codigo_cronograma: String,
+  secuencia: String,
+  nro_afiliacion: String,
+  nit_nic: String,
+  empresa_nombre: String,
+  actividad_economica: String,
+  tipo_actividad: String,
+  modalidad: String,
+  ciudad_ejecucion: String,
+  direccion: String,
+  descripcion: String,
+  contacto_empresa_nombre: String,
+  contacto_empresa_cargo: String,
+  contacto_empresa_telefono: String,
+  contacto_sst_nombre: String,
+  contacto_sst_telefono: String,
+  contacto_sst_correo: String,
+  horas_asignadas: parseNumeroCO,
+  valor_unitario: parseNumeroCO,
+  valor_total: parseNumeroCO,
+  fecha_orden: parseFechaCO,
+  fecha_vencimiento: parseFechaCO,
+  // CFG-04 · La categoría con la que se cobra. Es un id del catálogo, así que se
+  // guarda tal cual (el conversor de String lo dejaría igual, pero nombrarlo
+  // aparte deja claro que no es texto libre).
+  tipo_orden_id: (v) => (String(v ?? '').trim() || null),
+};
+
+/** Texto del formulario → lo que va a la columna ('' se guarda como NULL). */
+function valorEditable(campo, bruto) {
+  const conversor = CAMPOS_EDITABLES[campo];
+  if (conversor !== String) return conversor(bruto);
+  const s = String(bruto ?? '').trim();
+  return s === '' ? null : s;
+}
+
+/**
+ * Corrección de los datos de una OS ya materializada, en CUALQUIER estado.
+ *
+ * Antes solo se podía corregir el borrador y únicamente mientras seguía sin
+ * validar: en cuanto la OS existía, el dato malo se quedaba dentro para siempre
+ * —el borrador ya no es la fuente de verdad, así que editarlo no cambiaba nada
+ * (`PUT /drafts/:id` responde 409 justo por eso)—. Un teléfono mal leído por el
+ * OCR se descubre casi siempre DESPUÉS, cuando hay que llamar al contacto.
+ *
+ * Editar no mueve el ciclo de vida: una OS EJECUTADA sigue EJECUTADA. Lo que sí
+ * se rehace es el enlace con el maestro de empresas (CFG-02), porque corregir el
+ * NIT o la razón social suele ser precisamente lo que arregla una OS colgada de
+ * la ficha equivocada.
+ */
+router.put('/:id', requireRole('admin'), asyncHandler(async (req, res) => {
+  const body = req.body || {};
+  const campos = Object.keys(CAMPOS_EDITABLES).filter((c) => c in body);
+  if (!campos.length) throw badRequest('No se envió ningún campo editable de la orden');
+
+  const orden = await withTransaction(async (client) => {
+    const actual = (await client.query(
+      `SELECT * FROM sst.ordenes_servicio WHERE id=$1 FOR UPDATE`, [req.params.id]
+    )).rows[0];
+    if (!actual) throw badRequest('Orden de servicio no encontrada');
+
+    const valores = {};
+    for (const campo of campos) valores[campo] = valorEditable(campo, body[campo]);
+
+    // La identidad de la OS no puede quedar vacía: sin ella no hay forma de
+    // reconocerla contra el documento de la ARL ni de detectar duplicados
+    // (Bolívar usa cronograma+secuencia; AXA y Colmena, numero_orden).
+    const tras = (c) => (c in valores ? valores[c] : actual[c]);
+    if (!tras('numero_orden') && !(tras('codigo_cronograma') && tras('secuencia'))) {
+      throw badRequest('La OS necesita número de orden, o bien código de cronograma + secuencia');
+    }
+
+    // CFG-02 · Si cambió la identidad de la empresa, se recalcula a qué ficha
+    // del maestro cuelga la orden (creándola si hace falta, igual que al
+    // validar). Los textos de la OS se conservan: son lo que decía el documento.
+    if ('nit_nic' in valores || 'empresa_nombre' in valores) {
+      valores.empresa_id = await resolverEmpresaId({
+        nit: tras('nit_nic'),
+        nombre: tras('empresa_nombre'),
+        actividad_economica: tras('actividad_economica'),
+        ciudad: tras('ciudad_ejecucion'),
+        direccion: tras('direccion'),
+        contacto_nombre: tras('contacto_empresa_nombre'),
+        contacto_cargo: tras('contacto_empresa_cargo'),
+        contacto_telefono: tras('contacto_empresa_telefono'),
+        contacto_sst_nombre: tras('contacto_sst_nombre'),
+        contacto_sst_telefono: tras('contacto_sst_telefono'),
+        contacto_sst_correo: tras('contacto_sst_correo'),
+      }, client);
+    }
+
+    const columnas = Object.keys(valores);
+    const sets = columnas.map((c, i) => `${c} = $${i + 2}`);
+    await client.query(
+      `UPDATE sst.ordenes_servicio SET ${sets.join(', ')}, actualizado_en = now() WHERE id = $1`,
+      [req.params.id, ...columnas.map((c) => valores[c])]
+    );
+    return actual;
+  });
+
+  res.json({ data: await getOrderExpanded(orden.id) });
+}));
+
+/**
  * ASG-02 · Franjas en que se ejecuta la visita. Endpoint propio (y no dentro
  * del detalle) porque el modal de asignación se abre desde el listado de
  * borradores, sin haber pedido la OS completa.
@@ -338,14 +501,27 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
     // ASG-05 · La secuencia sube en el mismo UPDATE que la fecha: si se llevara
     // aparte, dos reprogramaciones seguidas podrían mandar el mismo SEQUENCE y
     // el calendario del profesional ignoraría la segunda.
+    // PRE-02 · La orden se queda con el valor hora que le corresponde HOY a este
+    // profesional, congelado. Si mañana cambia el catálogo o su tarifa, lo ya
+    // asignado sigue valiendo lo mismo: una cuenta de cobro no puede moverse
+    // sola por un ajuste de precios posterior.
+    //
+    // Se recalcula en cada asignación a propósito: cambiar de profesional cambia
+    // lo que se paga, y la orden todavía no se ha ejecutado.
+    const tarifa = await valorHoraDeOrden(
+      { ordenId: req.params.id, profesional: prof.rows[0] }, client,
+    );
+
     const guardada = await client.query(
       `UPDATE sst.ordenes_servicio
           SET profesional_asignado_id=$2,
               fecha_programada=$3,
+              valor_hora_cobro=$4,
+              valor_hora_origen=$5,
               secuencia_calendario = secuencia_calendario + 1
         WHERE id=$1
       RETURNING secuencia_calendario`,
-      [req.params.id, profesionalId, fechaProgramada]
+      [req.params.id, profesionalId, fechaProgramada, tarifa.valorHora, tarifa.origen]
     );
 
     // ASG-02 · Las franjas se reemplazan en bloque: reprogramar es volver a
@@ -432,16 +608,26 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
   // correo con media agenda mandaría al profesional a una visita que todavía se
   // está armando, y el .ics le ocuparía unas horas que aún pueden cambiar.
   if (!result.completa) {
+    // La forma de la respuesta es la MISMA que la del caso completo —`data` es
+    // la orden y los indicadores van arriba—. Cuando divergían, el frontend
+    // leía `correo_enviado` en la raíz, lo encontraba `undefined` y anunciaba
+    // "el profesional recibió el correo" de un correo que nunca salió.
+    // Cuánto falta lo dice QUIEN decide, no el cliente. La app calculaba su
+    // propia cuenta y llegó a anunciar "faltan 0 h por repartir" junto a un
+    // avance guardado, porque su idea de las horas de la orden no coincidía con
+    // la del servidor. Con el dato aquí, el aviso no puede contradecirse.
+    const repartidos = minutosDeFranjas(result.franjas);
+    const objetivo = Math.round(Number(result.orden.horas_asignadas ?? 0) * 60);
     return res.json({
       message: 'Se guardó el avance de la programación. La orden sigue SIN PROGRAMAR hasta ' +
                'repartir todas sus horas; el profesional no ha sido notificado.',
-      data: {
-        orden: result.orden,
-        franjas: result.franjas,
-        completa: false,
-        correo_enviado: false,
-        formatos_generados: 0,
-      },
+      completa: false,
+      correo_enviado: false,
+      formatos_generados: 0,
+      minutos_programados: repartidos,
+      minutos_orden: objetivo,
+      faltan_minutos: Math.max(0, objetivo - repartidos),
+      data: { ...result.orden, franjas: result.franjas },
     });
   }
 
@@ -505,7 +691,9 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
         (sinFormatos
           ? `Los formatos de esta ARL todavía no están cargados en la plataforma; ` +
             `te los haremos llegar aparte.\n\n`
-          : `Adjuntamos los formatos para diligenciar y firmar.\n\n`) +
+          : `Adjuntamos los formatos de ${o.arl_nombre} ya diligenciados con los datos de ` +
+            `esta orden: imprímelos y completa en la sesión lo que falta ` +
+            `(asistentes, temas desarrollados, observaciones y firmas).\n\n`) +
         `Al terminar, sube los soportes firmados aquí (sin login):\n${supportUrl}\n` +
         (invitaciones.length
           ? `\nAdjuntamos ${invitaciones.length === 1 ? 'la invitación' : `${invitaciones.length} invitaciones`} para tu calendario.\n`
@@ -533,7 +721,7 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
           ]),
           // Con una sola franja el bloque igual se usa: es donde el ojo va a
           // buscar el cuándo, y mantenerlo evita dos maquetas distintas.
-          bloqueFranjas(
+          bloqueLista(
             varias ? `La visita se realiza en ${result.franjas.length} franjas` : 'Fecha de la visita',
             result.franjas.length ? result.franjas.map(franjaEnTexto) : [fecha],
           ),
@@ -542,7 +730,11 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
                 'Los formatos de esta ARL todavía no están cargados en la plataforma. ' +
                 'Te los haremos llegar aparte.',
               )
-            : parrafo('Adjuntamos los formatos para diligenciar y firmar.'),
+            : parrafo(
+                `Adjuntamos los formatos de ${o.arl_nombre} ya diligenciados con ` +
+                `los datos de esta orden. Solo tienes que imprimirlos y completar en la sesión ` +
+                `lo que falta: asistentes, temas desarrollados, observaciones y firmas.`,
+              ),
           parrafo('Cuando termines la visita, sube los soportes firmados desde aquí (no necesitas iniciar sesión):'),
           boton('Subir soportes firmados', supportUrl),
           enlaceCrudo(supportUrl),
@@ -579,6 +771,7 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
     message: correoEnviado
       ? `OS ${accion}, formatos generados y correo enviado.`
       : `OS ${accion} y formatos generados, pero el correo al profesional no salió.`,
+    completa: true,
     correo_enviado: correoEnviado,
     correo_error: correoError,
     // CFG-03 · Cuántos formatos salieron adjuntos. En cero el correo llegó sin
@@ -631,19 +824,34 @@ router.get('/:id/documents', asyncHandler(async (req, res) => {
   res.json({ data: r.rows });
 }));
 
+/**
+ * VER-01 · Soportes de la OS, **ordenados por categoría**: primero el acta (es
+ * la que decide si la visita se da por buena), luego la asistencia y luego las
+ * evidencias. Antes salían por hora de subida, que es el orden en que el
+ * profesional los fue eligiendo en el móvil y no le sirve a quien revisa.
+ */
 router.get('/:id/supports', asyncHandler(async (req, res) => {
-  const r = await pool.query(`SELECT * FROM sst.archivos_soporte WHERE orden_id=$1 ORDER BY subido_en`, [req.params.id]);
+  const r = await pool.query(
+    `SELECT * FROM sst.archivos_soporte WHERE orden_id=$1
+      ORDER BY CASE categoria
+                 WHEN 'acta' THEN 1 WHEN 'asistencia' THEN 2 WHEN 'evidencias' THEN 3
+                 ELSE 9 END,
+               subido_en`,
+    [req.params.id]
+  );
   res.json({ data: r.rows });
 }));
 
 /**
- * M7 · Verificación — Aceptar los soportes.
+ * M7 · Verificación — Aceptar los soportes: EJECUTADA → FINALIZADA.
  *
- * Ya no cambia el estado: al eliminarse EN VERIFICACIÓN, la OS quedó EJECUTADA
- * en cuanto el profesional subió los archivos. Lo que hace este paso es dejar
- * constancia de que un administrador los REVISÓ y los da por buenos, y recién
- * ahí se le manda la encuesta al cliente (ENC-01) — antes de la revisión sería
- * preguntarle por una visita que todavía nadie ha comprobado.
+ * EJECUTADA la pone el profesional al subir los archivos; este paso es el del
+ * ADMINISTRADOR, que los revisa y los da por buenos. Antes no movía el estado y
+ * la orden se quedaba en EJECUTADA para siempre: mirando la bandeja no había
+ * forma de distinguir lo revisado de lo que nadie había abierto todavía.
+ *
+ * Al cerrarse el ciclo se le manda la encuesta al cliente (ENC-01) — antes de la
+ * revisión sería preguntarle por una visita que todavía nadie ha comprobado.
  */
 router.post('/:id/verify', requireRole('admin'), asyncHandler(async (req, res) => {
   const r = await pool.query(
@@ -652,23 +860,50 @@ router.post('/:id/verify', requireRole('admin'), asyncHandler(async (req, res) =
   if (!r.rows[0]) throw badRequest('OS no encontrada');
   if (r.rows[0].estado !== 'EJECUTADA') {
     throw badRequest(
-      `Solo se pueden aceptar los soportes de una OS EJECUTADA; esta está ${r.rows[0].estado}.`
+      r.rows[0].estado === 'FINALIZADA'
+        ? 'Los soportes de esta orden ya se aceptaron: la OS está FINALIZADA.'
+        : `Solo se pueden aceptar los soportes de una OS EJECUTADA; esta está ${r.rows[0].estado}.`
     );
   }
 
-  // EST-03 · La aceptación es un hecho auditable aunque no mueva el estado.
+  // PRE-01 · Queda marcado en la propia orden, que es lo que la hace entrar en
+  // la cuenta de cobro del profesional. `soportes_aceptados_en` solo se pone la
+  // primera vez: si los soportes se rechazan y se vuelven a aceptar, la fecha
+  // que vale para el cobro es la de la primera aceptación.
+  //
+  // Y se borra el rechazo pendiente si lo había: aceptar los soportes cierra
+  // cualquier devolución anterior, así que el portal deja de pedirle al
+  // profesional que suba nada.
   await pool.query(
-    `INSERT INTO sst.historial_estados_orden (orden_id, estado_anterior, estado_nuevo, cambiado_por, motivo)
-     VALUES ($1,'EJECUTADA','EJECUTADA',$2,'Soportes revisados y aceptados')`,
+    `UPDATE sst.ordenes_servicio
+        SET soportes_aceptados_en  = COALESCE(soportes_aceptados_en, now()),
+            soportes_aceptados_por = COALESCE(soportes_aceptados_por, $2),
+            soportes_rechazados      = NULL,
+            soportes_rechazo_motivo  = NULL,
+            soportes_rechazados_en   = NULL,
+            actualizado_en = now()
+      WHERE id = $1`,
     [req.params.id, req.user.sub]
   );
+
+  // EST-01/03 · Y AHORA sí se mueve el estado: la orden queda FINALIZADA, con su
+  // fila de auditoría escrita por la función de dominio (que además comprueba
+  // que la transición sea legal). Va después de marcar la aceptación para que,
+  // si algo fallara aquí, no quede una OS finalizada sin fecha de aceptación —
+  // que es el dato del que cuelga la cuenta de cobro.
+  await changeStatus({
+    orderId: req.params.id,
+    newStatus: 'FINALIZADA',
+    userId: req.user.sub,
+    motivo: 'Soportes revisados y aceptados',
+  });
 
   const orden = await getOrderExpanded(req.params.id);
   const encuesta = await encuestaAlCerrar(orden); // ENC-01
   res.json({
     message: encuesta?.enviada
-      ? 'Soportes aceptados. Se envió la encuesta de satisfacción al cliente.'
-      : 'Soportes aceptados.',
+      ? 'Soportes aceptados. La orden queda FINALIZADA y se envió la encuesta al cliente.'
+      : 'Soportes aceptados. La orden queda FINALIZADA.',
     encuesta_enviada: !!encuesta?.enviada,
     encuesta_error: encuesta?.enviada ? null : encuesta?.motivo ?? null,
     data: orden,
@@ -685,16 +920,147 @@ router.post('/:id/verify', requireRole('admin'), asyncHandler(async (req, res) =
 router.post('/:id/reject', requireRole('admin'), asyncHandler(async (req, res) => {
   const { motivo } = req.body || {};
   if (!motivo || !motivo.trim()) throw badRequest('El motivo del rechazo es obligatorio');
+
+  // VER-04 · QUÉ se devuelve, no solo que se devuelve.
+  //
+  // Sin lista, el rechazo era total: el profesional volvía a subirlo todo,
+  // incluido lo que ya estaba bien, y el administrador tenía que revisar otra
+  // vez documentos que ya había dado por buenos. Si no llega ninguna categoría
+  // (cliente antiguo), se devuelven las que hoy tienen archivo — el
+  // comportamiento de siempre.
+  const pedidas = Array.isArray(req.body?.categorias) ? req.body.categorias : null;
+  let categorias;
+  if (pedidas) {
+    const invalidas = pedidas.filter((c) => !esCategoriaValida(c));
+    if (invalidas.length) throw badRequest(`Documento desconocido: ${invalidas.join(', ')}.`);
+    categorias = [...new Set(pedidas.map((c) => normalizarCategoria(c)))];
+    if (!categorias.length) {
+      throw badRequest('Marque al menos un documento para devolver al profesional.');
+    }
+  } else {
+    const conArchivo = (await pool.query(
+      `SELECT DISTINCT COALESCE(categoria,'otros') AS categoria
+         FROM sst.archivos_soporte WHERE orden_id=$1`, [req.params.id]
+    )).rows.map((r) => normalizarCategoria(r.categoria));
+    categorias = conArchivo.length ? conArchivo : CATEGORIAS_SOPORTE.map((c) => c.clave);
+  }
+  const listaDocs = listaEtiquetas(categorias);
+
   const orden = await changeStatus({ orderId: req.params.id, newStatus: 'PROGRAMADA', userId: req.user.sub, motivo });
   // Reabrir enlace público para re-cargar soportes.
   await pool.query(`UPDATE sst.enlaces_publicos SET activo=true WHERE orden_id=$1`, [req.params.id]);
-  if (orden.profesional_asignado_id) {
-    const prof = await pool.query(`SELECT usuario_id FROM sst.profesionales WHERE id=$1`, [orden.profesional_asignado_id]);
-    if (prof.rows[0]?.usuario_id) {
-      await notify({ userId: prof.rows[0].usuario_id, tipo: 'RECHAZO', titulo: 'Soportes rechazados', mensaje: motivo, datos: { orden_id: orden.id } });
+  // Solo estas casillas quedan abiertas en el portal; las demás, bloqueadas.
+  await pool.query(
+    `UPDATE sst.ordenes_servicio
+        SET soportes_rechazados     = $2,
+            soportes_rechazo_motivo = $3,
+            soportes_rechazados_en  = now(),
+            actualizado_en = now()
+      WHERE id = $1`,
+    [req.params.id, categorias, motivo.trim()]
+  );
+
+  const expandida = await getOrderExpanded(req.params.id);
+  const prof = orden.profesional_asignado_id
+    ? (await pool.query(
+        `SELECT nombre, correo, usuario_id FROM sst.profesionales WHERE id=$1`,
+        [orden.profesional_asignado_id]
+      )).rows[0]
+    : null;
+
+  // La campanita solo llega si la ficha del profesional está enlazada con una
+  // cuenta de acceso, y muchas no lo están; además el profesional trabaja en
+  // campo y no vive dentro de la plataforma. Sin correo, un rechazo podía
+  // quedarse semanas sin que se enterara nadie.
+  let correoEnviado = false;
+  let correoError = null;
+  if (prof?.correo) {
+    const enlace = await pool.query(
+      `SELECT token FROM sst.enlaces_publicos
+        WHERE orden_id=$1 AND activo ORDER BY creado_en DESC LIMIT 1`,
+      [req.params.id]
+    );
+    const token = enlace.rows[0]?.token;
+    const supportUrl = token ? `${env.publicAppUrl}/soporte?token=${token}` : null;
+    try {
+      await sendEmail({
+        to: prof.correo,
+        cc: req.user.correo || undefined,
+        subject: `Soportes devueltos · ${expandida.codigo} · ${expandida.empresa_nombre || ''}`,
+        text:
+          `Hola ${prof.nombre},\n\n` +
+          `Revisamos los soportes de la OS ${expandida.codigo} (${expandida.arl_nombre}) ` +
+          `para ${expandida.empresa_nombre} y hay algo que corregir:\n\n` +
+          `${motivo.trim()}\n\n` +
+          `Documento(s) por volver a subir: ${listaDocs}.\n` +
+          `Los demás quedaron aceptados: no hay que repetirlos.\n\n` +
+          `La orden vuelve a PROGRAMADA.\n` +
+          (supportUrl
+            ? `Sube los soportes corregidos por el mismo enlace (sin login):\n${supportUrl}\n`
+            : `Solicita un enlace nuevo al equipo administrativo para volver a subirlos.\n`),
+        html: correoHtml({
+          titulo: 'Soportes devueltos para corregir',
+          subtitulo: `${expandida.codigo} · ${expandida.empresa_nombre || ''}`,
+          pie: 'JD&D Consultores · Seguridad y Salud en el Trabajo',
+          cuerpo: [
+            parrafo(`Hola ${prof.nombre},`),
+            parrafo(
+              `Revisamos los soportes que enviaste y hay algo que corregir antes de poder ` +
+              `dar la visita por cerrada.`,
+            ),
+            // El motivo es lo único que el profesional necesita leer sí o sí:
+            // va destacado y con las palabras exactas del administrador.
+            bloqueAviso(motivo.trim()),
+            // Lo que hay que repetir va en la tabla, no diluido en el texto:
+            // es el dato que el profesional vuelve a mirar al abrir el correo.
+            tablaDatos([
+              filaDato('Orden', expandida.codigo),
+              filaDato('ARL', expandida.arl_nombre),
+              filaDato('Empresa', expandida.empresa_nombre),
+              filaDato('Por volver a subir', listaDocs),
+              filaDato('Estado', 'PROGRAMADA'),
+            ]),
+            parrafo(
+              'Los demás documentos quedaron aceptados. Al abrir el enlace solo ' +
+              'podrás reemplazar los que aparecen arriba: el archivo anterior de ' +
+              'cada uno se sustituye por el que subas.',
+            ),
+            supportUrl
+              ? parrafo('Sube los soportes corregidos desde aquí (no necesitas iniciar sesión):')
+              : parrafo(
+                  'Solicita un enlace nuevo al equipo administrativo para volver a subirlos.',
+                ),
+            supportUrl ? boton('Subir soportes corregidos', supportUrl) : '',
+            supportUrl ? enlaceCrudo(supportUrl) : '',
+          ].join(''),
+        }),
+      });
+      correoEnviado = true;
+    } catch (e) {
+      // El rechazo YA está guardado: si el correo falla no puede devolverse un
+      // error, o el administrador lo intentaría otra vez sobre una orden que ya
+      // volvió a PROGRAMADA.
+      correoError = e?.message || 'No fue posible entregar el correo.';
+      console.error('[reject] correo no enviado:', correoError);
     }
   }
-  res.json({ message: 'Soportes rechazados; OS vuelve a PROGRAMADA.', data: orden });
+
+  if (prof?.usuario_id) {
+    await notify({
+      userId: prof.usuario_id, tipo: 'RECHAZO', titulo: 'Soportes rechazados',
+      mensaje: motivo, datos: { orden_id: orden.id },
+    }).catch((e) => console.error('[reject] notificación interna no creada:', e?.message));
+  }
+
+  res.json({
+    message: correoEnviado
+      ? 'Soportes rechazados; la OS vuelve a PROGRAMADA y el profesional fue avisado por correo.'
+      : 'Soportes rechazados; la OS vuelve a PROGRAMADA.',
+    correo_enviado: correoEnviado,
+    correo_error: correoError,
+    categorias_rechazadas: categorias,
+    data: orden,
+  });
 }));
 
 // La ruta POST /:id/cancel se eliminó junto con el estado CANCELADA. Una orden
@@ -708,7 +1074,7 @@ router.post('/:id/status', requireRole('admin'), asyncHandler(async (req, res) =
   if (!estado) throw badRequest('estado es obligatorio');
   const orden = await changeStatus({ orderId: req.params.id, newStatus: estado, userId: req.user.sub, motivo });
   // ENC-01 · Cerrar la OS a mano también dispara la encuesta: el disparador es
-  // el estado EJECUTADA, no la pantalla desde la que se llegó a él.
+  // el estado FINALIZADA, no la pantalla desde la que se llegó a él.
   const encuesta = await encuestaAlCerrar(orden);
   res.json({
     encuesta_enviada: !!encuesta?.enviada,

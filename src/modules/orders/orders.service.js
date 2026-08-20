@@ -2,6 +2,9 @@ import { pool } from '../../config/db.js';
 import { notFound } from '../../utils/httpError.js';
 import { storage } from '../../services/storage.service.js';
 import { generateFormatoPdf } from '../../services/pdf.service.js';
+import {
+  ALIADO_POR_DEFECTO, generarFormatosArl, tieneFormatosPropios,
+} from '../../services/formatos-arl.service.js';
 
 /** Carga una OS expandida (con nombres de ARL/profesional) o lanza 404. */
 export async function getOrderExpanded(id, client = pool) {
@@ -53,15 +56,61 @@ export async function changeStatus({ orderId, newStatus, userId, motivo = null }
   return r.rows[0];
 }
 
+/** Identidad de JD&D ante las ARL, editable desde `sst.configuracion`. */
+async function aliadoEstrategico(client = pool) {
+  const r = await client.query(`SELECT valor FROM sst.configuracion WHERE clave='aliado_estrategico'`);
+  const guardado = r.rows[0]?.valor;
+  return guardado && typeof guardado === 'object' ? { ...ALIADO_POR_DEFECTO, ...guardado } : ALIADO_POR_DEFECTO;
+}
+
 /**
- * M4/FOR · Genera los formatos PDF auto-diligenciados para la OS a partir de
- * las plantillas de su ARL. Persiste en generated_documents y devuelve la lista.
+ * M4/FOR · Genera los formatos auto-diligenciados de la OS y los archiva en
+ * `documentos_generados`. Devuelve la lista, con el contenido en `_buffer` para
+ * que el correo de asignación los adjunte sin volver a bajarlos del storage.
+ *
+ * Hay dos orígenes posibles y NO se mezclan:
+ *
+ *  1. El formato oficial de la ARL (`assets/formatos-arl/`), cuando existe. Es
+ *     el que la ARL acepta radicado, así que manda sobre cualquier otra cosa.
+ *  2. Las plantillas genéricas de `sst.plantillas` (CFG-03), para las ARL cuyos
+ *     formatos todavía no están cargados.
+ *
+ * Adjuntar los dos a la vez dejaría al profesional eligiendo entre dos hojas
+ * parecidas sin saber cuál vale, así que en cuanto una ARL tiene formato propio
+ * sus plantillas genéricas dejan de emitirse.
  */
 export async function generateOrderDocuments(orderId, client = pool) {
   const order = await getOrderExpanded(orderId, client);
   const professional = order.profesional_asignado_id
     ? (await client.query(`SELECT * FROM sst.profesionales WHERE id=$1`, [order.profesional_asignado_id])).rows[0]
     : null;
+
+  // Se leen aquí y no se reciben por parámetro para que el formato salga con lo
+  // que quedó guardado en esta misma transacción, no con lo que traía el body.
+  const franjas = (await client.query(
+    `SELECT fecha::text AS fecha, hora_inicio::text AS hora_inicio, hora_fin::text AS hora_fin
+       FROM sst.franjas_visita WHERE orden_id=$1 ORDER BY fecha, hora_inicio`,
+    [orderId]
+  )).rows;
+
+  const propios = tieneFormatosPropios(order.arl_nombre)
+    ? await generarFormatosArl({
+        orden: order, profesional: professional, franjas, aliado: await aliadoEstrategico(client),
+      })
+    : [];
+
+  const created = [];
+
+  for (const formato of propios) {
+    const key = await storage.put('documents', `${order.codigo || order.id}_${formato.filename}`, formato.buffer);
+    const doc = await client.query(
+      `INSERT INTO sst.documentos_generados (orden_id, plantilla_id, tipo, url_pdf)
+       VALUES ($1,NULL,$2,$3) RETURNING *`,
+      [orderId, formato.tipo, key]
+    );
+    created.push({ ...doc.rows[0], _buffer: formato.buffer, _filename: formato.filename });
+  }
+  if (created.length) return created;
 
   const tpls = await client.query(
     // CFG-03 · `orden` deja al administrador decidir en qué secuencia salen los
@@ -71,7 +120,6 @@ export async function generateOrderDocuments(orderId, client = pool) {
     [order.arl_id]
   );
 
-  const created = [];
   for (const template of tpls.rows) {
     const buffer = await generateFormatoPdf({ template, order, professional });
     const key = await storage.put('documents', `${order.codigo || order.id}_${template.tipo}.pdf`, buffer);

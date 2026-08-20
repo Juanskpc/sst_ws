@@ -65,7 +65,7 @@ router.get('/', asyncHandler(async (req, res) => {
   const r = await pool.query(
     `SELECT ${EMPRESA_COLS.split(',').map((c) => `e.${c.trim()}`).join(', ')},
             (count(o.id))::int AS total_ordenes,
-            (count(o.id) FILTER (WHERE o.estado = 'EJECUTADA'))::int AS ordenes_ejecutadas,
+            (count(o.id) FILTER (WHERE o.estado IN ('EJECUTADA','FINALIZADA')))::int AS ordenes_ejecutadas,
             max(o.fecha_carga) AS ultima_orden
        FROM sst.empresas e
        LEFT JOIN sst.ordenes_servicio o ON o.empresa_id = e.id

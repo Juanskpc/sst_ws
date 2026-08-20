@@ -5,11 +5,23 @@ import { authRequired, requireRole } from '../../middleware/auth.js';
 import { badRequest } from '../../utils/httpError.js';
 import { generatePrecuentaPdf } from '../../services/pdf.service.js';
 import {
-  ESTADOS_PRECUENTA, enviarPrecuenta, generarPrecuentas, obtenerPrecuenta, urlPrecuenta,
+  ESTADOS_PRECUENTA, aniosConTrabajo, enviarPrecuenta, generarPrecuentas, obtenerPrecuenta,
+  resumenPorMes, urlPrecuenta,
 } from './billing.service.js';
 
 const router = Router();
 router.use(authRequired);
+
+/**
+ * Un filtro de la query solo cuenta si trae valor real. Los clientes que arman
+ * la URL con un valor ausente pueden mandar literalmente `?estado=undefined`, y
+ * eso no es "sin filtrar": entra al WHERE y, contra una columna uuid, Postgres
+ * responde 400 y la pantalla se queda vacía sin poder revisarse.
+ */
+function filtro(valor) {
+  const v = String(valor ?? '').trim();
+  return v && v !== 'undefined' && v !== 'null' ? v : null;
+}
 
 /**
  * PRE-08 · Histórico de pre-cuentas por profesional, periodo y estado.
@@ -18,15 +30,37 @@ router.use(authRequired);
 router.get('/', asyncHandler(async (req, res) => {
   const clauses = [];
   const params = [];
-  if (req.query.periodo) { params.push(req.query.periodo); clauses.push(`periodo = $${params.length}`); }
-  if (req.query.profesional_id) { params.push(req.query.profesional_id); clauses.push(`profesional_id = $${params.length}`); }
-  if (req.query.estado) { params.push(req.query.estado); clauses.push(`estado = $${params.length}`); }
+  const periodo = filtro(req.query.periodo);
+  const profesionalId = filtro(req.query.profesional_id);
+  const estado = filtro(req.query.estado);
+  if (periodo) { params.push(periodo); clauses.push(`periodo = $${params.length}`); }
+  if (profesionalId) { params.push(profesionalId); clauses.push(`profesional_id = $${params.length}`); }
+  if (estado) { params.push(estado); clauses.push(`estado = $${params.length}`); }
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
   const r = await pool.query(
     `SELECT * FROM sst.vw_precuentas ${where} ORDER BY periodo DESC, profesional_nombre LIMIT 500`,
     params
   );
   res.json({ data: r.rows });
+}));
+
+/**
+ * PRE-01 · Lo que pinta la vista: una fila por profesional y mes del año pedido,
+ * exista o no cuenta de cobro generada. Es lo que permite entrar y ver de un
+ * vistazo qué meses quedan por cobrar.
+ */
+router.get('/resumen', asyncHandler(async (req, res) => {
+  const anio = filtro(req.query.anio) ?? String(new Date().getFullYear());
+  res.json({ data: await resumenPorMes({ anio }) });
+}));
+
+/** Años con trabajo por cobrar, para el selector de la vista. */
+router.get('/anios', asyncHandler(async (_req, res) => {
+  const anios = await aniosConTrabajo();
+  const actual = new Date().getFullYear();
+  // El año en curso siempre está, aunque todavía no tenga nada: es el que se
+  // muestra al entrar y un selector sin su propio valor se ve roto.
+  res.json({ data: anios.includes(actual) ? anios : [actual, ...anios] });
 }));
 
 /**
@@ -56,7 +90,7 @@ router.get('/:id/pdf', asyncHandler(async (req, res) => {
   const pc = await obtenerPrecuenta(req.params.id);
   const pdf = await generatePrecuentaPdf(pc);
   res.setHeader('Content-Type', 'application/pdf');
-  res.setHeader('Content-Disposition', `inline; filename="precuenta_${pc.periodo}.pdf"`);
+  res.setHeader('Content-Disposition', `inline; filename="cuenta_cobro_${pc.periodo}.pdf"`);
   res.send(pdf);
 }));
 
@@ -70,9 +104,13 @@ router.post('/generate', requireRole('admin'), asyncHandler(async (req, res) => 
   const { periodo, profesional_id: profesionalId } = req.body || {};
   const r = await generarPrecuentas({ periodo, profesionalId: profesionalId || null, userId: req.user.sub });
   res.status(201).json({
+    // Las omitidas importan tanto como las generadas: son las que el usuario
+    // esperaba ver y no aparecieron, casi siempre por falta de tarifa.
     message: r.generadas.length
-      ? `Se generaron ${r.generadas.length} pre-cuenta(s) para ${periodo}.`
-      : `No hay horas ejecutadas sin facturar en ${periodo}.`,
+      ? `Se generaron ${r.generadas.length} cuenta(s) de cobro para ${periodo}.`
+      : r.omitidas.length
+        ? `No se generó ninguna cuenta: ${r.omitidas[0].motivo}`
+        : `No hay órdenes con soportes aceptados sin cobrar en ${periodo}.`,
     data: r,
   });
 }));
@@ -81,7 +119,7 @@ router.post('/generate', requireRole('admin'), asyncHandler(async (req, res) => 
 router.post('/:id/send', requireRole('admin'), asyncHandler(async (req, res) => {
   const r = await enviarPrecuenta(req.params.id);
   res.status(r.enviada ? 200 : 409).json({
-    message: r.enviada ? 'Pre-cuenta enviada al profesional.' : r.motivo,
+    message: r.enviada ? 'Cuenta de cobro enviada al profesional.' : r.motivo,
     data: r.precuenta ? { ...r.precuenta, url: urlPrecuenta(r.precuenta.token) } : null,
   });
 }));
@@ -100,7 +138,7 @@ router.patch('/:id/estado', requireRole('admin'), asyncHandler(async (req, res) 
       WHERE id=$1 RETURNING id`,
     [req.params.id, estado, observaciones ?? null]
   );
-  if (!r.rows[0]) throw badRequest('Pre-cuenta no encontrada');
+  if (!r.rows[0]) throw badRequest('Cuenta de cobro no encontrada');
   res.json({ data: await obtenerPrecuenta(req.params.id) });
 }));
 

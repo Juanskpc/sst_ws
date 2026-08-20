@@ -110,3 +110,20 @@ export function horasTexto(valor) {
   if (!horas) return `${minutos} min`;
   return `${horas} y ${minutos} min`;
 }
+
+/**
+ * La misma cantidad pero con la unidad puesta: `4 h`, `4 h 30 min`, `45 min`.
+ *
+ * `horasTexto` da "4" a secas porque siempre va bajo una etiqueta que ya dice
+ * "Horas". Cuando la cifra viaja suelta dentro de una línea —el listado de
+ * órdenes de la pre-cuenta— ese "4" no se entiende, y "4 y 30 min h" tampoco.
+ */
+export function horasConUnidad(valor) {
+  const n = Number(valor);
+  if (!Number.isFinite(n) || n <= 0) return '—';
+  const total = Math.round(n * 60);
+  const horas = Math.floor(total / 60);
+  const minutos = total % 60;
+  if (!horas) return `${minutos} min`;
+  return minutos ? `${horas} h ${minutos} min` : `${horas} h`;
+}

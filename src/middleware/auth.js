@@ -5,12 +5,16 @@ import { unauthorized, forbidden } from '../utils/httpError.js';
 export function authRequired(req, _res, next) {
   const header = req.headers.authorization || '';
   const [scheme, token] = header.split(' ');
-  if (scheme !== 'Bearer' || !token) return next(unauthorized('Falta el token Bearer'));
+  // El texto lo lee el usuario final, no quien depura: "Falta el token Bearer"
+  // no le dice a nadie que tiene que volver a entrar.
+  if (scheme !== 'Bearer' || !token) {
+    return next(unauthorized('Su sesión no está activa. Vuelva a iniciar sesión para continuar.'));
+  }
   try {
     req.user = verifyToken(token);
     next();
   } catch {
-    next(unauthorized('Token inválido o expirado'));
+    next(unauthorized('Su sesión expiró. Vuelva a iniciar sesión para continuar.'));
   }
 }
 
@@ -18,7 +22,11 @@ export function authRequired(req, _res, next) {
 export function requireRole(...roles) {
   return (req, _res, next) => {
     if (!req.user) return next(unauthorized());
-    if (!roles.includes(req.user.rol)) return next(forbidden('Rol insuficiente'));
+    if (!roles.includes(req.user.rol)) {
+      return next(forbidden(
+        'Su usuario no tiene permiso para esta acción. Pídale a un administrador que le habilite el acceso.',
+      ));
+    }
     next();
   };
 }
@@ -30,7 +38,9 @@ export function requireRole(...roles) {
 export function requireMaestro(req, _res, next) {
   if (!req.user) return next(unauthorized());
   if (req.user.es_maestro !== true) {
-    return next(forbidden('Operación exclusiva del Administrador Maestro'));
+    return next(forbidden(
+      'Esta operación es exclusiva del Administrador Maestro (el equipo de desarrollo).',
+    ));
   }
   next();
 }

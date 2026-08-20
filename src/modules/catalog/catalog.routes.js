@@ -3,14 +3,22 @@ import { pool } from '../../config/db.js';
 import { asyncHandler } from '../../utils/asyncHandler.js';
 import { authRequired, requireRole, requireMaestro } from '../../middleware/auth.js';
 import { badRequest, conflict, notFound } from '../../utils/httpError.js';
+import { tieneFormatosPropios } from '../../services/formatos-arl.service.js';
 
 const router = Router();
 router.use(authRequired);
 
-// Catálogo de ARLs
+// Catálogo de ARLs.
+//
+// `formatos_propios` dice si la ARL trae sus formatos oficiales cargados
+// (`assets/formatos-arl/`). Va aquí porque quien asigna necesita saberlo: sin
+// este dato la vista avisaría de que "la ARL no tiene formatos configurados"
+// justo para las dos ARL cuyos formatos son los buenos, los de la ARL misma.
 router.get('/arls', asyncHandler(async (_req, res) => {
   const r = await pool.query(`SELECT * FROM sst.arls ORDER BY nombre`);
-  res.json({ data: r.rows });
+  res.json({
+    data: r.rows.map((a) => ({ ...a, formatos_propios: tieneFormatosPropios(a.nombre) })),
+  });
 }));
 
 // ---------------------------------------------------------------------------
@@ -214,6 +222,96 @@ router.put('/settings/precuenta-dia-corte', requireRole('admin'), asyncHandler(a
     data: await guardarConfig('precuenta_dia_corte', n,
       'Día del mes en que se cierran las pre-cuentas del mes anterior (1-28).'),
   });
+}));
+
+// ---------------------------------------------------------------------------
+// CFG-04 · Tipos de orden y su valor hora ("Valores por hora según actividad")
+//
+// Es la lista con la que se categoriza CADA orden al cargarla, y de la que sale
+// lo que se le paga al profesional por hora. Hasta ahora vivía escrita a mano en
+// la pantalla de Configuración y no se guardaba en ninguna parte, así que la
+// orden no podía apuntar a nada.
+// ---------------------------------------------------------------------------
+
+/** Los tipos que se pueden elegir hoy; los inactivos solo salen si se piden. */
+router.get('/tipos-orden', asyncHandler(async (req, res) => {
+  const incluirInactivos = req.query.todos === 'true';
+  const r = await pool.query(
+    `SELECT t.id, t.nombre, t.valor_hora, t.activo, t.creado_en, t.actualizado_en,
+            (SELECT count(*)::int FROM sst.ordenes_servicio o WHERE o.tipo_orden_id = t.id) AS ordenes
+       FROM sst.tipos_orden t
+      ${incluirInactivos ? '' : 'WHERE t.activo'}
+      ORDER BY t.activo DESC, t.nombre`
+  );
+  res.json({ data: r.rows });
+}));
+
+router.post('/tipos-orden', requireRole('admin'), asyncHandler(async (req, res) => {
+  const nombre = limpiar(req.body?.nombre);
+  const valor = Number(req.body?.valor_hora);
+  if (!nombre) throw badRequest('El nombre del tipo de orden es obligatorio.');
+  if (!Number.isFinite(valor) || valor < 0) throw badRequest('El valor hora debe ser un número mayor o igual que cero.');
+  try {
+    const r = await pool.query(
+      `INSERT INTO sst.tipos_orden (nombre, valor_hora) VALUES ($1,$2)
+       RETURNING id, nombre, valor_hora, activo, creado_en, actualizado_en`,
+      [nombre, valor]
+    );
+    res.status(201).json({ data: { ...r.rows[0], ordenes: 0 } });
+  } catch (e) {
+    // El índice único es sobre el nombre en minúsculas: 'Asesoría' y 'asesoría'
+    // son el mismo tipo, y dos filas iguales harían ambigua la elección.
+    if (e.code === '23505') throw conflict(`Ya existe un tipo de orden llamado "${nombre}".`);
+    throw e;
+  }
+}));
+
+/**
+ * Cambiar el valor hora NO reescribe lo ya trabajado: cada orden se quedó con su
+ * copia al asignarse el profesional. Este valor manda sobre las órdenes que se
+ * asignen a partir de ahora.
+ */
+router.put('/tipos-orden/:id', requireRole('admin'), asyncHandler(async (req, res) => {
+  const nombre = req.body?.nombre === undefined ? null : limpiar(req.body.nombre);
+  if (req.body?.nombre !== undefined && !nombre) throw badRequest('El nombre no puede quedar vacío.');
+  const valor = req.body?.valor_hora === undefined ? null : Number(req.body.valor_hora);
+  if (valor !== null && (!Number.isFinite(valor) || valor < 0)) {
+    throw badRequest('El valor hora debe ser un número mayor o igual que cero.');
+  }
+  const activo = req.body?.activo === undefined ? null : Boolean(req.body.activo);
+
+  try {
+    const r = await pool.query(
+      `UPDATE sst.tipos_orden
+          SET nombre     = COALESCE($2, nombre),
+              valor_hora = COALESCE($3, valor_hora),
+              activo     = COALESCE($4, activo),
+              actualizado_en = now()
+        WHERE id = $1
+        RETURNING id, nombre, valor_hora, activo, creado_en, actualizado_en`,
+      [req.params.id, nombre, valor, activo]
+    );
+    if (!r.rows[0]) throw notFound('Tipo de orden no encontrado');
+    res.json({ data: r.rows[0] });
+  } catch (e) {
+    if (e.code === '23505') throw conflict(`Ya existe un tipo de orden llamado "${nombre}".`);
+    throw e;
+  }
+}));
+
+/**
+ * "Eliminar" es desactivar. Un tipo con órdenes detrás no se puede borrar sin
+ * dejar sin explicación su historial —ni el valor hora con el que se cobraron—,
+ * así que sale de la lista de elección y se queda en la base.
+ */
+router.delete('/tipos-orden/:id', requireRole('admin'), asyncHandler(async (req, res) => {
+  const r = await pool.query(
+    `UPDATE sst.tipos_orden SET activo = FALSE, actualizado_en = now()
+      WHERE id = $1 RETURNING id, nombre`,
+    [req.params.id]
+  );
+  if (!r.rows[0]) throw notFound('Tipo de orden no encontrado');
+  res.json({ message: `"${r.rows[0].nombre}" ya no se puede elegir en órdenes nuevas.` });
 }));
 
 export default router;

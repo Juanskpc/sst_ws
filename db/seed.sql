@@ -24,11 +24,21 @@ INSERT INTO sst.configuracion (clave, valor, descripcion) VALUES
   -- ENC-03 · Enunciados de la encuesta ("preguntas variables"): se editan aquí
   -- sin tocar código ni migrar. Las dos escalas son 1-5 y alimentan el
   -- dashboard, por eso su significado no cambia aunque cambie la redacción.
+  -- FOR · Cómo identifican las ARL a JD&D en SUS formatos. Va aquí y no en el
+  -- código porque el código de aliado lo asigna cada ARL y puede cambiar sin que
+  -- cambie nada más del sistema.
+  ('aliado_estrategico',
+   '{"nombre":"JD Y D CONSULTORES","codigo_bolivar":"6484","plan_bolivar":"PECAT"}'::jsonb,
+   'FOR · Nombre, código de aliado y plan impresos en los formatos de la ARL.'),
+  -- ENC-03 · Cuatro enunciados: los dos primeros califican al PROFESIONAL que
+  -- dictó la actividad (de ahí sale su promedio en el listado de asesores) y el
+  -- tercero a JD&D como empresa.
   ('encuesta_preguntas',
    '{"titulo":"Encuesta de satisfacción",
-     "satisfaccion":"Nivel de satisfacción de la actividad recibida",
+     "satisfaccion":"¿Qué tan satisfecho quedó con la actividad que dictó el profesional?",
+     "profesional":"Califique al profesional según: puntualidad, dominio del tema y claridad al resolver dudas",
      "recomendacion":"¿Recomendaría a JD&D Consultores?",
-     "comentarios":"Observaciones para mejorar el servicio"}'::jsonb,
+     "comentarios":"Observaciones sobre el profesional o el servicio"}'::jsonb,
    'ENC-03 · Textos del formulario público de satisfacción.')
 ON CONFLICT (clave) DO NOTHING;
 

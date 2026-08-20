@@ -4,6 +4,11 @@ import { randomToken } from '../../utils/security.js';
 import { badRequest, notFound } from '../../utils/httpError.js';
 import { sendEmail } from '../../services/email.service.js';
 import { generatePrecuentaPdf } from '../../services/pdf.service.js';
+import {
+  correoHtml, parrafo, tablaDatos, filaDato, bloqueTotal, bloqueLista, bloqueAviso,
+  boton, enlaceCrudo,
+} from '../../services/email-layout.service.js';
+import { fechaDiaCO, horasConUnidad } from '../../utils/formato.js';
 
 /** Estados de una pre-cuenta. Desde aceptada/rechazada no se regenera sola. */
 export const ESTADOS_PRECUENTA = ['generada', 'enviada', 'aceptada', 'rechazada'];
@@ -28,26 +33,144 @@ export const enPesos = (v) =>
     .format(Number(v) || 0);
 
 /**
- * PRE-02 · Valor hora aplicable a una orden.
+ * PRE-02 · Valor hora con el que se cobra una orden.
  *
- * Orden de resolución: tarifa del profesional para el tipo de actividad vigente
- * al cierre del periodo → valor_hora base del profesional. Se devuelve también
- * el origen para poder explicar la cifra en pantalla.
+ * Lo primero que se mira es lo que la ORDEN trae congelado (`valor_hora_cobro`,
+ * copiado al asignar el profesional). Ese es el punto de todo el cambio: subir
+ * mañana la hora de "Capacitación" no puede reescribir lo que ya se trabajó, y
+ * menos lo que ya se le envió al profesional.
  *
- * Hoy la mayoría de OS llega sin `tipo_actividad` (la extracción no siempre lo
- * trae), así que el fallback es el camino normal, no la excepción.
+ * Solo si la orden no lo trae —las anteriores a la columna— se resuelve al
+ * vuelo, con el mismo orden que usa la asignación: tarifa del profesional para
+ * ese tipo → valor del tipo → valor base del profesional.
  */
-async function resolverValorHora({ profesionalId, tipoActividad, hasta, valorHoraBase }, client = pool) {
-  if (tipoActividad) {
+async function resolverValorHora(
+  { profesionalId, valorHoraCongelado, origenCongelado, tipoOrden, tipoActividad, hasta, valorHoraBase },
+  client = pool,
+) {
+  if (Number(valorHoraCongelado) > 0) {
+    return { valorHora: Number(valorHoraCongelado), origen: origenCongelado || 'orden' };
+  }
+
+  // El nombre del TIPO DE ORDEN es el que casa con las tarifas por profesional;
+  // `tipo_actividad` (el título que trae la ARL, "CAP SEGURIDAD VIAL") se sigue
+  // mirando después por las órdenes viejas, que es de donde salía antes.
+  for (const clave of [tipoOrden, tipoActividad].filter(Boolean)) {
     const r = await client.query(
       `SELECT valor_hora FROM sst.tarifas_actividad_profesional
         WHERE profesional_id=$1 AND lower(actividad)=lower($2) AND vigente_desde <= $3::date
         ORDER BY vigente_desde DESC LIMIT 1`,
-      [profesionalId, tipoActividad, hasta]
+      [profesionalId, clave, hasta]
     );
     if (r.rows[0]) return { valorHora: Number(r.rows[0].valor_hora), origen: 'tarifa' };
   }
+  if (tipoOrden) {
+    const t = await client.query(
+      `SELECT valor_hora FROM sst.tipos_orden WHERE lower(btrim(nombre))=lower(btrim($1))`,
+      [tipoOrden]
+    );
+    if (Number(t.rows[0]?.valor_hora) > 0) {
+      return { valorHora: Number(t.rows[0].valor_hora), origen: 'tipo' };
+    }
+  }
   return { valorHora: Number(valorHoraBase) || 0, origen: 'profesional' };
+}
+
+/**
+ * PRE-01 · Lo que se ve al entrar en Cuentas de cobro: una fila por
+ * **profesional y mes** con trabajo por cobrar del año pedido.
+ *
+ * La fila existe desde que se aceptan los soportes de la primera orden de ese
+ * mes; no hace falta "generar" nada para verla. Si ya hay cuenta creada, la fila
+ * trae su id y su estado; si no, `estado` viene nulo y se entiende como
+ * pendiente de generar.
+ *
+ * Los totales se calculan al vuelo con las tarifas de HOY, así que una fila sin
+ * cuenta refleja siempre lo último. En cuanto la cuenta existe manda su cifra
+ * congelada: es la que el profesional recibió y sobre la que respondió.
+ */
+export async function resumenPorMes({ anio, client = pool }) {
+  const y = Number(anio);
+  if (!Number.isInteger(y) || y < 2000 || y > 2100) {
+    throw badRequest('El año debe ser un número de cuatro cifras.');
+  }
+
+  const trabajo = await client.query(
+    `SELECT h.*, p.valor_hora AS valor_hora_base
+       FROM sst.vw_horas_por_cobrar h
+       JOIN sst.profesionales p ON p.id = h.profesional_id
+      WHERE h.periodo LIKE $1
+      ORDER BY h.periodo DESC, h.profesional_nombre, h.fecha_ejecucion`,
+    [`${y}-%`]
+  );
+
+  const cuentas = await client.query(
+    `SELECT * FROM sst.vw_precuentas WHERE periodo LIKE $1`, [`${y}-%`]
+  );
+  const porClave = new Map(cuentas.rows.map((c) => [`${c.periodo}|${c.profesional_id}`, c]));
+
+  const grupos = new Map();
+  for (const o of trabajo.rows) {
+    const clave = `${o.periodo}|${o.profesional_id}`;
+    if (!grupos.has(clave)) {
+      grupos.set(clave, {
+        periodo: o.periodo,
+        profesional_id: o.profesional_id,
+        profesional_nombre: o.profesional_nombre,
+        total_horas: 0,
+        total_monto: 0,
+        total_ordenes: 0,
+        // Cuántas de sus órdenes quedarían valoradas en cero: es lo que impide
+        // generar la cuenta, y hay que poder señalarlo antes de intentarlo.
+        ordenes_sin_tarifa: 0,
+      });
+    }
+    const g = grupos.get(clave);
+    const { valorHora } = await resolverValorHora({
+      profesionalId: o.profesional_id,
+      valorHoraCongelado: o.valor_hora_cobro,
+      origenCongelado: o.valor_hora_origen,
+      tipoOrden: o.tipo_orden,
+      tipoActividad: o.tipo_actividad,
+      hasta: rangoPeriodo(o.periodo).fin,
+      valorHoraBase: o.valor_hora_base,
+    }, client);
+    const horas = Number(o.horas) || 0;
+    g.total_horas += horas;
+    g.total_monto += Math.round(horas * valorHora);
+    g.total_ordenes += 1;
+    if (!(valorHora > 0)) g.ordenes_sin_tarifa += 1;
+  }
+
+  const filas = [...grupos.values()].map((g) => {
+    const cuenta = porClave.get(`${g.periodo}|${g.profesional_id}`);
+    return {
+      ...g,
+      // Con cuenta ya creada mandan sus cifras: son las que se le enviaron.
+      total_horas: cuenta ? Number(cuenta.total_horas) : g.total_horas,
+      total_monto: cuenta ? Number(cuenta.total_monto) : g.total_monto,
+      total_ordenes: cuenta ? cuenta.total_ordenes : g.total_ordenes,
+      precuenta_id: cuenta?.id ?? null,
+      estado: cuenta?.estado ?? null,
+      enviado_en: cuenta?.enviado_en ?? null,
+      respondido_en: cuenta?.respondido_en ?? null,
+      observaciones: cuenta?.observaciones ?? null,
+    };
+  });
+
+  filas.sort((a, b) =>
+    b.periodo.localeCompare(a.periodo) || a.profesional_nombre.localeCompare(b.profesional_nombre));
+  return filas;
+}
+
+/** Años en los que hay trabajo por cobrar, para el selector de la vista. */
+export async function aniosConTrabajo(client = pool) {
+  const r = await client.query(
+    `SELECT DISTINCT left(periodo, 4) AS anio FROM sst.vw_horas_por_cobrar
+      UNION SELECT DISTINCT left(periodo, 4) FROM sst.precuentas
+      ORDER BY anio DESC`
+  );
+  return r.rows.map((x) => Number(x.anio)).filter(Number.isInteger);
 }
 
 /**
@@ -70,11 +193,11 @@ export async function generarPrecuentas({ periodo, profesionalId = null, userId 
     filtroProf = ` AND h.profesional_id = $${params.length}`;
   }
 
-  // Todas las OS ejecutadas del mes, con lo necesario para valorarlas.
+  // Las OS del mes con los soportes ya aceptados, con lo necesario para
+  // valorarlas. `profesional_nombre` ya viene en la vista.
   const trabajo = await pool.query(
-    // `profesional_nombre` ya viene en la vista; aquí solo se agrega la tarifa base.
     `SELECT h.*, p.valor_hora AS valor_hora_base
-       FROM sst.vw_horas_ejecutadas h
+       FROM sst.vw_horas_por_cobrar h
        JOIN sst.profesionales p ON p.id = h.profesional_id
       WHERE h.fecha_ejecucion BETWEEN $1::date AND $2::date${filtroProf}
       ORDER BY h.profesional_id, h.fecha_ejecucion`,
@@ -116,6 +239,9 @@ export async function generarPrecuentas({ periodo, profesionalId = null, userId 
     for (const o of ordenes) {
       const { valorHora, origen } = await resolverValorHora({
         profesionalId: profId,
+        valorHoraCongelado: o.valor_hora_cobro,
+        origenCongelado: o.valor_hora_origen,
+        tipoOrden: o.tipo_orden,
         tipoActividad: o.tipo_actividad,
         hasta: fin,
         valorHoraBase: o.valor_hora_base,
@@ -129,13 +255,33 @@ export async function generarPrecuentas({ periodo, profesionalId = null, userId 
         orden_codigo: o.orden_codigo,
         empresa_nombre: o.empresa_nombre,
         arl_nombre: o.arl_nombre,
-        actividad: o.tipo_actividad || o.actividad_economica,
+        actividad: o.tipo_orden || o.tipo_actividad || o.actividad_economica,
         fecha_ejecucion: o.fecha_ejecucion,
         horas,
         valor_hora_snapshot: valorHora,
         monto,
         origen_tarifa: origen,
       });
+    }
+
+    // PRE-02 · Una cuenta de cobro en cero no es una cuenta de cobro. Pasa
+    // cuando el profesional tiene horas pero ninguna tarifa aplicable —ficha sin
+    // `valor_hora` y sin tarifa por actividad—, y hasta ahora se generaba igual:
+    // se le mandaba al profesional un documento pidiéndole que aceptara cobrar
+    // $0. Se omite y se dice qué hay que arreglar.
+    const sinTarifa = items.filter((it) => !(Number(it.valor_hora_snapshot) > 0)).length;
+    if (totalMonto <= 0) {
+      omitidas.push({
+        precuenta_id: existente?.id ?? null,
+        profesional_id: profId,
+        profesional_nombre: ordenes[0].profesional_nombre,
+        estado: existente?.estado ?? null,
+        motivo: sinTarifa
+          ? `${sinTarifa} de sus ${items.length} orden(es) no tienen valor hora. ` +
+            `Defina la tarifa del profesional (o la de la actividad) antes de generar.`
+          : 'El total quedaría en $0; revise las horas y la tarifa antes de generar.',
+      });
+      continue;
     }
 
     const precuenta = await withTransaction(async (client) => {
@@ -177,12 +323,51 @@ export async function generarPrecuentas({ periodo, profesionalId = null, userId 
 /** Pre-cuenta + sus ítems, o 404. */
 export async function obtenerPrecuenta(id, client = pool) {
   const pc = (await client.query(`SELECT * FROM sst.vw_precuentas WHERE id=$1`, [id])).rows[0];
-  if (!pc) throw notFound('Pre-cuenta no encontrada');
+  if (!pc) throw notFound('Cuenta de cobro no encontrada');
   const items = await client.query(
     `SELECT * FROM sst.precuenta_items WHERE precuenta_id=$1 ORDER BY fecha_ejecucion, orden_codigo`,
     [id]
   );
   return { ...pc, items: items.rows };
+}
+
+/**
+ * Día de ejecución de un ítem, tal como se imprime en el correo.
+ *
+ * `fecha_ejecucion` es DATE y el driver la entrega como un `Date` a medianoche
+ * **local del proceso**: pasarla por un formateador con zona horaria la correría
+ * un día en un servidor en UTC, y el profesional vería su visita del 1 de agosto
+ * fechada el 31 de julio, fuera del periodo que está cobrando. Por eso la fecha
+ * se arma con los componentes del calendario, sin convertir nada.
+ */
+function diaEjecucion(valor) {
+  if (!valor) return '';
+  if (typeof valor === 'string') return fechaDiaCO(valor.slice(0, 10));
+  const d = valor instanceof Date ? valor : new Date(valor);
+  if (Number.isNaN(d.getTime())) return '';
+  const iso = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  return fechaDiaCO(iso);
+}
+
+/**
+ * Las órdenes que sostienen la cifra, una por línea. El correo enseña las
+ * primeras y remite al PDF para el resto: un profesional con treinta visitas
+ * recibiría si no un correo de tres pantallas, y el detalle completo —con el
+ * valor hora aplicado a cada una— ya va adjunto.
+ */
+const MAX_ORDENES_CORREO = 8;
+
+function lineasOrdenes(items = []) {
+  const lineas = items.slice(0, MAX_ORDENES_CORREO).map((it) => [
+    it.orden_codigo,
+    it.empresa_nombre,
+    diaEjecucion(it.fecha_ejecucion),
+    horasConUnidad(it.horas),
+    enPesos(it.monto),
+  ].filter(Boolean).join(' · '));
+  const resto = items.length - lineas.length;
+  if (resto > 0) lineas.push(`y ${resto} orden(es) más, en el PDF adjunto`);
+  return lineas;
 }
 
 /** Mes legible para correos y documento ("julio de 2026"). */
@@ -204,27 +389,73 @@ export async function enviarPrecuenta(id) {
   try {
     const pc = await obtenerPrecuenta(id);
     if (CERRADAS.includes(pc.estado)) {
-      return { enviada: false, motivo: `La pre-cuenta ya fue ${pc.estado} por el profesional` };
+      return { enviada: false, motivo: `La cuenta de cobro ya fue ${pc.estado} por el profesional` };
     }
     if (!pc.profesional_correo) return { enviada: false, motivo: 'El profesional no tiene correo registrado' };
+    // PRE-02 · Segundo cierre de la misma puerta: una cuenta puede haber quedado
+    // en cero antes de que se prohibiera generarlas así, y mandarla sería pedirle
+    // al profesional que acepte cobrar $0.
+    if (!(Number(pc.total_monto) > 0)) {
+      return {
+        enviada: false,
+        motivo: 'La cuenta de cobro está en $0. Defina el valor hora del profesional y vuelva a generarla.',
+      };
+    }
 
     const pdf = await generatePrecuentaPdf(pc);
     const url = urlPrecuenta(pc.token);
     const mes = periodoLargo(pc.periodo);
 
+    const ordenes = lineasOrdenes(pc.items);
+    const resumen = `${pc.total_ordenes} orden(es) · ${horasConUnidad(pc.total_horas)}`;
+
     await sendEmail({
       to: pc.profesional_correo,
-      subject: `Pre-cuenta de cobro · ${mes} — JD&D Consultores`,
+      subject: `Cuenta de cobro · ${mes} — JD&D Consultores`,
+      // La versión en texto se conserva íntegra: es lo que ve quien lee en texto
+      // plano y lo que queda en el log del driver 'console'.
       text:
         `Sr(a). ${pc.profesional_nombre},\n\n` +
-        `Adjuntamos la pre-cuenta de cobro correspondiente a ${mes}:\n\n` +
+        `Adjuntamos la cuenta de cobro correspondiente a ${mes}:\n\n` +
         `  · Órdenes ejecutadas: ${pc.total_ordenes}\n` +
         `  · Total de horas:     ${Number(pc.total_horas)}\n` +
         `  · Total a pagar:      ${enPesos(pc.total_monto)}\n\n` +
+        (ordenes.length ? `${ordenes.map((l) => `  · ${l}`).join('\n')}\n\n` : '') +
         `Por favor revísela y acéptela o recházala (indicando el motivo) en el siguiente enlace:\n${url}\n\n` +
         `Si algo no cuadra, el rechazo con observaciones nos permite revisarlo antes de facturar.\n\n` +
         `JD&D Consultores en Sistemas de Gestión\n`,
-      attachments: [{ filename: `precuenta_${pc.periodo}.pdf`, content: pdf }],
+      // Misma maqueta de marca que el correo de asignación (M5): el profesional
+      // recibe los dos y no tiene por qué reconocer solo uno como nuestro.
+      html: correoHtml({
+        titulo: 'Cuenta de cobro',
+        subtitulo: `${mes} · ${pc.profesional_nombre}`,
+        pie: 'JD&D Consultores · Seguridad y Salud en el Trabajo',
+        cuerpo: [
+          parrafo(`Sr(a). ${pc.profesional_nombre},`),
+          parrafo(
+            `Esta es la cuenta de cobro por las órdenes de servicio que ejecutó en ${mes}. ` +
+            `Revísela y respóndanos desde el enlace; el detalle completo, con el valor hora ` +
+            `aplicado a cada orden, va en el PDF adjunto.`,
+          ),
+          bloqueTotal('Total a pagar', enPesos(pc.total_monto), resumen),
+          tablaDatos([
+            filaDato('Periodo', mes),
+            filaDato('Órdenes ejecutadas', pc.total_ordenes),
+            filaDato('Total de horas', horasConUnidad(pc.total_horas)),
+          ]),
+          bloqueLista('Órdenes incluidas', ordenes),
+          parrafo('Acéptela o recházela desde aquí (no necesita iniciar sesión):'),
+          boton('Revisar y responder', url),
+          enlaceCrudo(url),
+          // El rechazo sin motivo lo bloquea `responderPrecuenta`: más vale
+          // decirlo antes de que el profesional se tope con el error.
+          bloqueAviso(
+            'Si algo no cuadra, rechácela indicando el motivo: con esas observaciones ' +
+            'podemos revisarlo y corregirlo antes de facturar.',
+          ),
+        ].join(''),
+      }),
+      attachments: [{ filename: `cuenta_cobro_.pdf`, content: pdf }],
     });
 
     const upd = (await pool.query(
@@ -234,14 +465,14 @@ export async function enviarPrecuenta(id) {
     return { enviada: true, precuenta: upd, url };
   } catch (e) {
     console.error('[precuenta] no se pudo enviar:', e?.message);
-    return { enviada: false, motivo: e?.message || 'Error enviando la pre-cuenta' };
+    return { enviada: false, motivo: e?.message || 'Error enviando la cuenta de cobro' };
   }
 }
 
 /** Resuelve el token del enlace público → pre-cuenta con ítems. */
 export async function resolverToken(token) {
   const pc = (await pool.query(`SELECT id FROM sst.precuentas WHERE token=$1`, [token])).rows[0];
-  if (!pc) throw notFound('Pre-cuenta no encontrada o enlace inválido');
+  if (!pc) throw notFound('Cuenta de cobro no encontrada o enlace inválido');
   return obtenerPrecuenta(pc.id);
 }
 
@@ -258,7 +489,7 @@ export async function responderPrecuenta(token, { decision, observaciones }) {
   }
   const obs = (observaciones || '').trim();
   if (decision === 'rechazada' && !obs) {
-    throw badRequest('Para rechazar la pre-cuenta debe indicar las observaciones');
+    throw badRequest('Para rechazar la cuenta de cobro debe indicar las observaciones');
   }
 
   const r = await pool.query(
@@ -270,7 +501,7 @@ export async function responderPrecuenta(token, { decision, observaciones }) {
   );
   if (!r.rows[0]) {
     const existe = await pool.query(`SELECT estado FROM sst.precuentas WHERE token=$1`, [token]);
-    if (!existe.rows[0]) throw notFound('Pre-cuenta no encontrada o enlace inválido');
+    if (!existe.rows[0]) throw notFound('Cuenta de cobro no encontrada o enlace inválido');
     throw badRequest(`Esta pre-cuenta ya fue ${existe.rows[0].estado}.`);
   }
   return obtenerPrecuenta(r.rows[0].id);

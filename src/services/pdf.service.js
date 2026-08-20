@@ -86,7 +86,17 @@ export async function generateFormatoPdf({ template, order, professional }) {
 }
 
 /**
- * PRE-03 · Documento de la pre-cuenta de cobro: profesional, mes, detalle de
+ * Estado de una cuenta de cobro tal como se escribe de cara a una persona.
+ * En la BD son minúsculas ('aceptada'); imprimirlas así deja el documento con
+ * un "Estado: aceptada" que parece a medio escribir.
+ */
+function etiquetaEstado(estado) {
+  const t = String(estado ?? '').trim();
+  return t ? t.charAt(0).toUpperCase() + t.slice(1) : '—';
+}
+
+/**
+ * PRE-03 · Documento de la cuenta de cobro: profesional, mes, detalle de
  * órdenes (fecha, empresa, ARL, horas, valor) y totales.
  *
  * Se pagina sola: un mes cargado puede pasar de 25 órdenes y en una sola página
@@ -144,7 +154,7 @@ export async function generatePrecuentaPdf(precuenta) {
 
   nuevaPagina();
 
-  page.drawText('Pre-cuenta de cobro', { x: 45, y, size: 17, font: bold, color: primary });
+  page.drawText('Cuenta de cobro', { x: 45, y, size: 17, font: bold, color: primary });
   y -= 24;
   page.drawText(`Periodo: ${periodoLargo}`, { x: 45, y, size: 11, font, color: gray });
   y -= 16;
@@ -200,20 +210,13 @@ export async function generatePrecuentaPdf(precuenta) {
   page.drawText('Total a pagar:', { x: 380, y, size: 11, font: bold, color: primary });
   page.drawText(pesos(precuenta.total_monto), { x: 480, y, size: 11, font: bold, color: primary });
 
-  // Estado y observaciones del profesional (PRE-06/07), si ya respondió.
+  // Estado de la cuenta (PRE-06). Las observaciones NO se imprimen: son notas
+  // internas del seguimiento —lo que anotó quien revisó un rechazo— y este
+  // documento es el que se le manda al profesional y el que acompaña el pago.
   y -= 34;
   if (precuenta.estado) {
-    page.drawText(`Estado: ${String(precuenta.estado).toUpperCase()}`, { x: 45, y, size: 10, font: bold });
+    page.drawText(`Estado: ${etiquetaEstado(precuenta.estado)}`, { x: 45, y, size: 10, font: bold });
     y -= 14;
-  }
-  if (precuenta.observaciones) {
-    page.drawText('Observaciones del profesional:', { x: 45, y, size: 9.5, font: bold, color: gray });
-    y -= 13;
-    const obs = String(precuenta.observaciones);
-    for (let i = 0; i < obs.length && i < 600; i += 95) {
-      page.drawText(obs.slice(i, i + 95), { x: 45, y, size: 9, font, color: gray });
-      y -= 12;
-    }
   }
 
   const bytes = await doc.save();

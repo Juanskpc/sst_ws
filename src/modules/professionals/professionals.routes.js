@@ -99,12 +99,50 @@ router.get('/', asyncHandler(async (req, res) => {
   let where = '';
   if (q) {
     params.push(`%${q}%`);
-    where = `WHERE nombre ILIKE $1 OR correo ILIKE $1 OR especialidad ILIKE $1`;
+    where = `WHERE p.nombre ILIKE $1 OR p.correo ILIKE $1 OR p.especialidad ILIKE $1`;
   }
+  // CFG-01 / ENC-05 · La ficha viaja con lo que se hace con ella: cuántas
+  // órdenes cerró y cómo lo califican los clientes. Son datos de dos módulos
+  // distintos, pero se leen juntos —una nota sin saber sobre cuántas visitas no
+  // dice nada— y pedirlos en dos viajes obligaría a la vista a cruzarlos.
   const r = await pool.query(
-    `SELECT * FROM sst.profesionales ${where} ORDER BY nombre`, params
+    `SELECT p.*,
+            d.ordenes_ejecutadas,
+            d.encuestas_enviadas,
+            d.encuestas_respondidas,
+            d.calificacion_promedio,
+            d.ultima_calificacion_en
+       FROM sst.profesionales p
+       JOIN sst.vw_profesionales_desempeno d ON d.profesional_id = p.id
+       ${where}
+      ORDER BY p.nombre`, params
   );
   res.json({ data: r.rows });
+}));
+
+/**
+ * ENC-05 · Las encuestas de UN profesional, con su comentario.
+ *
+ * El promedio de la lista dice "4,6"; esto dice por qué. Sin este detalle, una
+ * nota baja no se puede accionar: no se sabe de qué visita salió, ni si el
+ * cliente escribió el motivo. Solo se devuelven las RESPONDIDAS — una encuesta
+ * enviada y sin contestar no es una calificación.
+ */
+router.get('/:id/encuestas', asyncHandler(async (req, res) => {
+  const r = await pool.query(
+    `SELECT id, orden_id, orden_codigo, empresa_nombre, arl_nombre, actividad_economica,
+            satisfaccion, calificacion_profesional, nota_profesional, recomendacion,
+            comentarios, respondido_en
+       FROM sst.vw_encuestas
+      WHERE profesional_id = $1 AND respondida
+      ORDER BY respondido_en DESC
+      LIMIT 200`,
+    [req.params.id]
+  );
+  const resumen = await pool.query(
+    `SELECT * FROM sst.vw_profesionales_desempeno WHERE profesional_id = $1`, [req.params.id]
+  );
+  res.json({ data: r.rows, resumen: resumen.rows[0] || null });
 }));
 
 router.get('/:id', asyncHandler(async (req, res) => {

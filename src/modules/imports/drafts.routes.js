@@ -6,33 +6,12 @@ import { badRequest, notFound, conflict } from '../../utils/httpError.js';
 import { computeOverallConfidence } from '../../services/extraction.service.js';
 import { CANONICAL_FIELDS } from '../../services/gemini.service.js';
 import { resolverEmpresaId } from '../companies/companies.service.js';
+// Los mismos parsers los usa la edición de una OS ya materializada
+// (`PUT /orders/:id`): viven en utils para que no puedan divergir.
+import { parseNumeroCO, parseFechaCO } from '../../utils/parseo.js';
 
 const router = Router();
 router.use(authRequired);
-
-/** "588.560,00" | "$ 58.856" | 588560 → 588560. Devuelve number o null. */
-function parseNumeroCO(raw) {
-  if (raw == null || raw === '') return null;
-  let s = String(raw).trim().replace(/[^\d.,-]/g, '');
-  if (!s) return null;
-  const hasComma = s.includes(',');
-  const hasDot = s.includes('.');
-  if (hasComma && hasDot) s = s.replace(/\./g, '').replace(',', '.'); // CO: . miles, , decimal
-  else if (hasComma) s = s.replace(',', '.');
-  const n = parseFloat(s);
-  return Number.isFinite(n) ? n : null;
-}
-
-/** "26/06/2026" | "2026-06-26" → "YYYY-MM-DD". Devuelve string ISO o null. */
-function parseFechaCO(raw) {
-  if (!raw) return null;
-  const s = String(raw).trim();
-  let m = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(s);
-  if (m) return `${m[3]}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}`;
-  m = /^(\d{4})-(\d{2})-(\d{2})/.exec(s);
-  if (m) return `${m[1]}-${m[2]}-${m[3]}`;
-  return null;
-}
 
 // SELECT base con nombres legibles (ARL, archivo del lote y profesional asignado).
 //
@@ -49,13 +28,25 @@ const DRAFT_SELECT = `
          o.estado::text AS os_estado, o.codigo AS os_codigo,
          o.fecha_programada AS os_fecha_programada,
          o.profesional_asignado_id AS os_profesional_id,
-         po.nombre AS os_profesional_nombre
+         po.nombre AS os_profesional_nombre,
+         -- Con la OS ya materializada, la empresa que vale es la suya: es la que
+         -- se corrige desde el detalle (PUT /orders/:id) y la que sale en los
+         -- formatos y los correos. El nombre del borrador es lo que leyó la IA
+         -- del documento, y tras una corrección deja de ser cierto.
+         o.empresa_nombre AS os_empresa_nombre,
+         -- CFG-04 · La categoría con la que se cobra. Manda la de la OS cuando
+         -- existe: el borrador es lo que se eligió al importar, y la orden pudo
+         -- corregirse después.
+         COALESCE(o.tipo_orden_id, d.tipo_orden_id) AS tipo_orden_id,
+         tp.nombre AS tipo_orden,
+         o.valor_hora_cobro, o.valor_hora_origen, o.valor_cobro_total
   FROM sst.borradores_extraccion d
   LEFT JOIN sst.arls a ON a.id = d.arl_id
   LEFT JOIN sst.lotes_importacion b ON b.id = d.lote_importacion_id
   LEFT JOIN sst.profesionales p ON p.id = d.profesional_asignado_id
   LEFT JOIN sst.ordenes_servicio o ON o.id = d.orden_servicio_id
-  LEFT JOIN sst.profesionales po ON po.id = o.profesional_asignado_id`;
+  LEFT JOIN sst.profesionales po ON po.id = o.profesional_asignado_id
+  LEFT JOIN sst.tipos_orden tp ON tp.id = COALESCE(o.tipo_orden_id, d.tipo_orden_id)`;
 
 // Vista "Órdenes" (M3). Filtrable por estado y por soft-delete.
 //   ?estado=PENDIENTE_VALIDACION | VALIDADA | ... | ALL
@@ -148,7 +139,16 @@ router.patch('/:id/enable', requireRole('admin'), asyncHandler(async (req, res) 
 // IMP-03/04 · Guardar correcciones manuales del split-view (sin validar aún).
 router.put('/:id', requireRole('admin'), asyncHandler(async (req, res) => {
   const { fields } = req.body || {}; // { codigo_cronograma: {value, confidence}, ... }
-  if (!fields || typeof fields !== 'object') throw badRequest('Envía "fields" con los campos editados');
+  // CFG-04 · El tipo de orden viaja aparte de `fields`: no lo dice el documento
+  // de la ARL, lo decide quien revisa, y por eso vive en su propia columna y no
+  // en el JSON de la extracción.
+  const tipoOrdenId = req.body?.tipo_orden_id === undefined
+    ? undefined
+    : (String(req.body.tipo_orden_id ?? '').trim() || null);
+  if (!fields && tipoOrdenId === undefined) {
+    throw badRequest('Envía "fields" con los campos editados, o "tipo_orden_id".');
+  }
+  if (fields && typeof fields !== 'object') throw badRequest('"fields" debe ser un objeto');
   const cur = await pool.query(
     `SELECT d.metadatos_extraccion, d.estado::text AS estado, o.codigo AS os_codigo
        FROM sst.borradores_extraccion d
@@ -171,7 +171,7 @@ router.put('/:id', requireRole('admin'), asyncHandler(async (req, res) => {
   }
 
   const merged = { ...cur.rows[0].metadatos_extraccion };
-  for (const f of CANONICAL_FIELDS) {
+  for (const f of fields ? CANONICAL_FIELDS : []) {
     if (fields[f]) {
       merged[f] = {
         value: fields[f].value ?? merged[f]?.value ?? '',
@@ -183,9 +183,11 @@ router.put('/:id', requireRole('admin'), asyncHandler(async (req, res) => {
   merged.overall_confidence = computeOverallConfidence(merged);
   const r = await pool.query(
     `UPDATE sst.borradores_extraccion
-       SET metadatos_extraccion=$2, confianza_general=$3, actualizado_en=now()
+       SET metadatos_extraccion=$2, confianza_general=$3,
+           tipo_orden_id = CASE WHEN $4::boolean THEN $5::uuid ELSE tipo_orden_id END,
+           actualizado_en=now()
      WHERE id=$1 RETURNING id`,
-    [req.params.id, merged, merged.overall_confidence]
+    [req.params.id, merged, merged.overall_confidence, tipoOrdenId !== undefined, tipoOrdenId ?? null]
   );
   if (!r.rows[0]) throw notFound('Borrador no encontrado');
   // Se devuelve expandido (arl_nombre, archivo, profesional) para que el cliente
@@ -211,6 +213,14 @@ export async function materializarOrden(draftId, userId, client) {
   if (!draft) throw notFound('Borrador no encontrado');
   if (draft.estado === 'VALIDADA') throw conflict('El borrador ya fue validado');
   if (!draft.arl_id) throw badRequest('El borrador no tiene ARL detectada');
+  // CFG-04 · Sin tipo de orden no se puede crear: es lo que decide el valor hora
+  // con el que se le pagará al profesional, y descubrirlo al generar la cuenta
+  // de cobro —tres pantallas más adelante— es demasiado tarde.
+  if (!draft.tipo_orden_id) {
+    throw badRequest(
+      'Falta el tipo de orden. Elíjalo en la vista previa: de él sale el valor hora con el que se cobra la visita.',
+    );
+  }
 
   const m = draft.metadatos_extraccion || {};
   const val = (f) => (m[f]?.value ?? null) || null;
@@ -265,19 +275,19 @@ export async function materializarOrden(draftId, userId, client) {
   const ord = await client.query(
     `INSERT INTO sst.ordenes_servicio (
        codigo, arl_id, numero_orden, codigo_cronograma, secuencia, nro_afiliacion,
-       nit_nic, empresa_nombre, empresa_id, actividad_economica, tipo_actividad, modalidad,
+       nit_nic, empresa_nombre, empresa_id, actividad_economica, tipo_actividad, tipo_orden_id, modalidad,
        horas_asignadas, valor_unitario, valor_total,
        fecha_orden, fecha_vencimiento, ciudad_ejecucion, direccion, descripcion,
        contacto_empresa_nombre, contacto_empresa_cargo, contacto_empresa_telefono,
        contacto_sst_nombre, contacto_sst_telefono, contacto_sst_correo,
        lote_importacion_id, url_archivo_original, metadatos_extraccion, estado)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,
-             $20,$21,$22,$23,$24,$25,$26,$27,$28,$29,'SIN PROGRAMAR')
+             $20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,'SIN PROGRAMAR')
      RETURNING *`,
     [
       codigo, draft.arl_id, numeroOrden, cron, sec, val('nro_afiliacion'),
       val('nit_nic'), val('empresa_nombre'), empresaId, val('actividad_economica'),
-      val('tipo_actividad'), val('modalidad'),
+      val('tipo_actividad'), draft.tipo_orden_id, val('modalidad'),
       parseNumeroCO(val('horas_asignadas')), parseNumeroCO(val('valor_unitario')),
       parseNumeroCO(val('valor_total')),
       parseFechaCO(val('fecha_orden')), parseFechaCO(val('fecha_vencimiento')),

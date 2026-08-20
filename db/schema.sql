@@ -31,9 +31,18 @@ DO $$ BEGIN
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 -- EST-01: estados obligatorios de la Orden de Servicio.
+--
+-- FINALIZADA es el final REAL del ciclo (ago-2026): EJECUTADA solo dice que el
+-- profesional subió los soportes, y ahí se quedaba la orden para siempre, sin
+-- forma de distinguir la que nadie ha revisado de la que ya se dio por buena.
+-- Se alcanza al aceptar los soportes y de ahí no se sale.
+--
+-- El valor se añade también en `db/migrate.js` para las bases que ya existen:
+-- Postgres no deja USAR un valor de enum en la misma transacción en que se
+-- agrega, así que no puede ir aquí dentro (las vistas de abajo lo nombran).
 DO $$ BEGIN
   CREATE TYPE sst.estado_orden AS ENUM (
-    'SIN PROGRAMAR', 'PROGRAMADA', 'EN VERIFICACIÓN', 'EJECUTADA', 'CANCELADA'
+    'SIN PROGRAMAR', 'PROGRAMADA', 'EN VERIFICACIÓN', 'EJECUTADA', 'FINALIZADA', 'CANCELADA'
   );
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
@@ -252,6 +261,17 @@ CREATE TABLE IF NOT EXISTS sst.lotes_importacion (
 );
 CREATE INDEX IF NOT EXISTS idx_lotes_importacion_estado ON sst.lotes_importacion(estado);
 
+-- IMP-09 · Huella SHA-256 del archivo subido.
+--
+-- Sirve para responder ANTES de gastar una petición de IA la única pregunta que
+-- importa al volver a soltar un documento en Importar: "¿este archivo ya se
+-- procesó?". El mismo PDF de la ARL se descarga y se vuelve a cargar con
+-- normalidad —en la bandeja actual hay uno repetido cuatro veces—, y cada
+-- repetición costaba una extracción completa para acabar en "ya existe".
+ALTER TABLE sst.lotes_importacion ADD COLUMN IF NOT EXISTS hash_archivo TEXT;
+CREATE INDEX IF NOT EXISTS idx_lotes_importacion_hash
+  ON sst.lotes_importacion(hash_archivo) WHERE hash_archivo IS NOT NULL;
+
 -- ⭐ ordenes_servicio · La OS (tabla central, M2/M3) ---------------------------
 CREATE TABLE IF NOT EXISTS sst.ordenes_servicio (
   id                       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -328,6 +348,98 @@ CREATE INDEX IF NOT EXISTS idx_ordenes_estado      ON sst.ordenes_servicio(estad
 CREATE INDEX IF NOT EXISTS idx_ordenes_arl         ON sst.ordenes_servicio(arl_id);
 CREATE INDEX IF NOT EXISTS idx_ordenes_prof        ON sst.ordenes_servicio(profesional_asignado_id);
 CREATE INDEX IF NOT EXISTS idx_ordenes_fecha_carga ON sst.ordenes_servicio(fecha_carga);
+-- VER-01 / PRE-01 · Cuándo un administrador dio por buenos los soportes.
+--
+-- No mueve el estado (la OS ya está EJECUTADA desde que el profesional subió los
+-- archivos), pero es LA condición para que la orden entre a la cuenta de cobro
+-- del profesional: se le paga por trabajo revisado, no por trabajo subido. Antes
+-- ese hecho solo quedaba como una fila de historial con un motivo de texto, que
+-- no es algo sobre lo que se pueda construir una consulta de cobro.
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS soportes_aceptados_en  TIMESTAMPTZ;
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS soportes_aceptados_por UUID REFERENCES sst.usuarios(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_ordenes_soportes_aceptados
+  ON sst.ordenes_servicio(soportes_aceptados_en) WHERE soportes_aceptados_en IS NOT NULL;
+
+-- ⭐ CFG-04 · Catálogo de TIPOS DE ORDEN con su valor hora.
+--
+-- Es la lista de "Valores por hora según actividad" de Configuración, que hasta
+-- ahora vivía escrita a mano en la pantalla y no se guardaba en ninguna parte.
+-- Al pasar a ser tabla, cada OS apunta a un tipo y de ahí sale lo que se le
+-- paga al profesional por hora.
+--
+-- OJO con el histórico: la orden NO lee el valor por la clave foránea, sino que
+-- se queda con una COPIA (`ordenes_servicio.valor_hora_cobro`) en el momento en
+-- que se asigna el profesional. Si mañana sube la hora de "Capacitación", las
+-- órdenes ya asignadas siguen valiendo lo que valían — que es justo lo que una
+-- cuenta de cobro ya enviada necesita para no cambiar sola.
+CREATE TABLE IF NOT EXISTS sst.tipos_orden (
+  id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  nombre         TEXT NOT NULL,
+  valor_hora     NUMERIC(12,2) NOT NULL DEFAULT 0,
+  -- No se borran: una orden vieja puede seguir apuntando a un tipo que ya no se
+  -- usa, y perder el nombre dejaría su historial sin explicación.
+  activo         BOOLEAN NOT NULL DEFAULT TRUE,
+  creado_en      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  actualizado_en TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_tipos_orden_nombre
+  ON sst.tipos_orden (lower(btrim(nombre)));
+
+-- Los tres que ya estaban escritos en la pantalla (y que coinciden con las
+-- tarifas por profesional cargadas). Van aquí y no en seed.sql porque el relleno
+-- de las órdenes los necesita ya creados.
+INSERT INTO sst.tipos_orden (nombre, valor_hora) VALUES
+  ('Capacitación', 85000),
+  ('Asesoría',    120000),
+  ('Inspección',   95000)
+ON CONFLICT DO NOTHING;
+
+-- ⭐ CFG-04 / PRE-02 · Categoría de la orden y lo que se paga por ella.
+--
+-- `tipo_orden_id` es OBLIGATORIO al cargar una OS (lo exige el backend, no un
+-- NOT NULL: las órdenes anteriores al cambio se rellenaron con el bloque del
+-- final y una restricción dura habría hecho fallar la migración a mitad).
+--
+-- `valor_hora_cobro` es la COPIA del valor vigente cuando se asignó al
+-- profesional, y `valor_hora_origen` de dónde salió ('tarifa' del profesional,
+-- 'tipo' del catálogo o 'profesional' por su valor base). Congelarlo es el
+-- punto: un cambio de tarifa no puede reescribir lo que ya se trabajó.
+--
+-- El total va como columna GENERADA: se recalcula solo si cambian las horas de
+-- la orden y no puede quedar desincronizado por olvidar actualizarlo.
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS tipo_orden_id     UUID REFERENCES sst.tipos_orden(id);
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS valor_hora_cobro  NUMERIC(12,2);
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS valor_hora_origen TEXT;
+DO $$ BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+     WHERE table_schema='sst' AND table_name='ordenes_servicio' AND column_name='valor_cobro_total'
+  ) THEN
+    ALTER TABLE sst.ordenes_servicio
+      ADD COLUMN valor_cobro_total NUMERIC(14,2)
+      GENERATED ALWAYS AS (round(COALESCE(horas_asignadas,0) * COALESCE(valor_hora_cobro,0), 2)) STORED;
+  END IF;
+END $$;
+CREATE INDEX IF NOT EXISTS idx_ordenes_tipo ON sst.ordenes_servicio(tipo_orden_id);
+
+-- El borrador arrastra el tipo elegido en la vista previa de Importar, para que
+-- la OS nazca con él. Se guarda en columna y no en el JSON de la extracción: no
+-- lo dice el documento de la ARL, lo decide quien revisa.
+ALTER TABLE sst.borradores_extraccion ADD COLUMN IF NOT EXISTS tipo_orden_id UUID REFERENCES sst.tipos_orden(id);
+
+-- VER-04 · QUÉ soportes se devolvieron para corregir, no solo que "hubo rechazo".
+--
+-- El rechazo era total: la orden volvía entera y el profesional podía subirlo
+-- todo otra vez, incluido lo que ya estaba bien. Guardando las categorías
+-- devueltas, el portal abre solo esas casillas y deja las demás bloqueadas, y
+-- el correo puede decir exactamente qué documento repetir.
+--
+-- Es una lista de PENDIENTES, no un histórico: se vacía en cuanto el
+-- profesional sube lo que le devolvieron o el administrador acepta los
+-- soportes. El histórico de rechazos vive en historial_estados_orden.
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS soportes_rechazados     TEXT[];
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS soportes_rechazo_motivo TEXT;
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS soportes_rechazados_en  TIMESTAMPTZ;
 
 -- ⭐ EST-03 · Historial de estados (auditoría + event source) ------------------
 CREATE TABLE IF NOT EXISTS sst.historial_estados_orden (
@@ -448,6 +560,21 @@ CREATE TABLE IF NOT EXISTS sst.archivos_soporte (
 );
 CREATE INDEX IF NOT EXISTS idx_archivos_soporte_orden ON sst.archivos_soporte(orden_id);
 
+-- SUP · Categoría y nombre interno del soporte (ago-2026).
+--
+-- `nombre_original` es lo que traía el archivo del móvil del profesional
+-- ('IMG_20260815_142233.jpg'), y con eso el administrador no sabía qué estaba
+-- abriendo. Ahora la casilla del portal en la que se subió queda registrada
+-- (`categoria`) y el sistema le pone un nombre propio (`nombre_archivo`:
+-- 'acta.pdf', 'evidencias.jpg'). El original se conserva para poder decirle al
+-- profesional cuál de los suyos hay que repetir.
+--
+-- `tamano_original_bytes` guarda cuánto pesaba antes de comprimir: sin ese dato
+-- no hay forma de saber si la compresión está sirviendo en producción.
+ALTER TABLE sst.archivos_soporte ADD COLUMN IF NOT EXISTS categoria             TEXT;
+ALTER TABLE sst.archivos_soporte ADD COLUMN IF NOT EXISTS nombre_archivo        TEXT;
+ALTER TABLE sst.archivos_soporte ADD COLUMN IF NOT EXISTS tamano_original_bytes BIGINT;
+
 -- M11 · Notificaciones ---------------------------------------------------------
 CREATE TABLE IF NOT EXISTS sst.notificaciones (
   id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -460,6 +587,29 @@ CREATE TABLE IF NOT EXISTS sst.notificaciones (
   creado_en  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_notificaciones_usuario ON sst.notificaciones(usuario_id, leido_en);
+
+-- NOT-04 · Papelera de la campanita.
+--
+-- Antes solo se podía marcar leída, así que la bandeja crecía sin fin y los
+-- avisos ya resueltos seguían estorbando. Se borra en blando y no de verdad:
+-- una notificación es el rastro de un hecho de negocio (una asignación, un
+-- rechazo), y ese rastro no se tira por limpiar la vista — de ahí que la
+-- pestaña "Eliminadas" pueda devolverla.
+ALTER TABLE sst.notificaciones ADD COLUMN IF NOT EXISTS eliminado_en TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS idx_notificaciones_bandeja
+  ON sst.notificaciones(usuario_id, eliminado_en, creado_en DESC);
+
+-- ENC-05 · Los avisos de encuesta anteriores al cambio no traían el profesional,
+-- y sin él la campanita no sabía a qué ficha llevar: se quedaban abriendo la
+-- orden, que es justo lo que se quería dejar de hacer. Se rellena desde la OS.
+UPDATE sst.notificaciones n
+   SET datos = COALESCE(n.datos, '{}'::jsonb)
+               || jsonb_build_object('profesional_id', o.profesional_asignado_id)
+  FROM sst.ordenes_servicio o
+ WHERE n.tipo = 'ENCUESTA_RESPONDIDA'
+   AND o.id::text = n.datos->>'orden_id'
+   AND o.profesional_asignado_id IS NOT NULL
+   AND NOT (n.datos ? 'profesional_id');
 
 -- Configuración global (clave-valor tipado) -----------------------------------
 CREATE TABLE IF NOT EXISTS sst.configuracion (
@@ -520,6 +670,36 @@ ALTER TABLE sst.respuestas_encuesta ADD COLUMN IF NOT EXISTS empresa_nombre  TEX
 -- congela el texto que se le mostró a ESTE cliente: si mañana cambia la
 -- redacción, las respuestas viejas siguen contando lo que realmente se preguntó.
 ALTER TABLE sst.respuestas_encuesta ADD COLUMN IF NOT EXISTS preguntas       JSONB;
+
+-- ENC-03 · La encuesta califica DOS cosas distintas, no una.
+--
+-- `satisfaccion` mide la actividad recibida y `recomendacion` a JD&D como
+-- empresa; faltaba la nota del PROFESIONAL que dictó la capacitación, que es
+-- justo la que permite hacerle seguimiento a cada asesor. Se guarda aparte para
+-- poder promediarla sola.
+--
+-- Las encuestas anteriores a esta columna quedan en NULL: no se rellenan con la
+-- satisfacción general, porque no es lo mismo. Donde hace falta una nota del
+-- profesional para promediar (la vista de desempeño) se usa el COALESCE, y ahí
+-- sí queda dicho que es una aproximación.
+ALTER TABLE sst.respuestas_encuesta ADD COLUMN IF NOT EXISTS calificacion_profesional SMALLINT;
+
+-- Los topes viven en la BD y no solo en el formulario: el comentario se pinta en
+-- la tabla de Informes y en el detalle del profesional, y un texto de 20.000
+-- caracteres pegado desde un correo rompe las dos vistas.
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_encuesta_calificacion_profesional') THEN
+    ALTER TABLE sst.respuestas_encuesta
+      ADD CONSTRAINT chk_encuesta_calificacion_profesional
+      CHECK (calificacion_profesional IS NULL OR calificacion_profesional BETWEEN 1 AND 5);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_encuesta_comentarios_largo') THEN
+    ALTER TABLE sst.respuestas_encuesta
+      ADD CONSTRAINT chk_encuesta_comentarios_largo
+      CHECK (comentarios IS NULL OR char_length(comentarios) <= 500);
+  END IF;
+END $$;
 
 -- ENC-06 · Una sola encuesta por OS (y un solo token): evita reenviar dos
 -- formularios distintos para la misma orden.
@@ -627,17 +807,22 @@ EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 -- EST-06: proteger el cierre de la OS (defensa en profundidad, además de la
 -- matriz de sst.cambiar_estado_orden).
 --
--- La ÚNICA salida admitida desde EJECUTADA es volver a PROGRAMADA, que es el
--- rechazo de soportes (VER-02). Se abrió esa rendija al eliminarse el estado
--- EN VERIFICACIÓN: subir los soportes deja la OS EJECUTADA, así que sin ella el
--- administrador no tendría forma de devolverle el trabajo al profesional.
--- Cualquier otro retroceso (a SIN PROGRAMAR, por ejemplo) sigue prohibido.
+-- Desde EJECUTADA solo caben dos salidas: FINALIZADA (el administrador aceptó
+-- los soportes) y PROGRAMADA (los rechazó y se los devuelve al profesional).
+-- Esa marcha atrás existe porque, al no haber estado intermedio, sin ella no
+-- habría forma de devolver el trabajo.
+--
+-- FINALIZADA no tiene salida: es el cierre del ciclo y de él cuelgan la encuesta
+-- al cliente y la cuenta de cobro del profesional. Reabrir una orden cerrada es
+-- una decisión de negocio, no un clic.
 CREATE OR REPLACE FUNCTION sst.fn_bloquear_regresion_ejecutada() RETURNS trigger AS $$
 BEGIN
+  IF OLD.estado = 'FINALIZADA' AND NEW.estado <> 'FINALIZADA' THEN
+    RAISE EXCEPTION 'Una OS FINALIZADA no vuelve atrás: es el cierre del ciclo.';
+  END IF;
   IF OLD.estado = 'EJECUTADA'
-     AND NEW.estado <> 'EJECUTADA'
-     AND NEW.estado <> 'PROGRAMADA' THEN
-    RAISE EXCEPTION 'Desde EJECUTADA solo se puede volver a PROGRAMADA (rechazo de soportes).';
+     AND NEW.estado NOT IN ('EJECUTADA', 'PROGRAMADA', 'FINALIZADA') THEN
+    RAISE EXCEPTION 'Desde EJECUTADA solo se puede FINALIZAR (aceptar soportes) o volver a PROGRAMADA (rechazarlos).';
   END IF;
   RETURN NEW;
 END; $$ LANGUAGE plpgsql;
@@ -672,8 +857,14 @@ BEGIN
 
   -- Matriz de transiciones válidas.
   --
-  -- El ciclo se redujo a TRES estados (ago-2026, a pedido del cliente):
-  --   SIN PROGRAMAR → PROGRAMADA → EJECUTADA
+  -- El ciclo son CUATRO estados (ago-2026, a pedido del cliente):
+  --   SIN PROGRAMAR → PROGRAMADA → EJECUTADA → FINALIZADA
+  --
+  -- EJECUTADA la pone el PROFESIONAL al subir los soportes; FINALIZADA la pone
+  -- el ADMINISTRADOR al aceptarlos. Antes no existía la segunda y la orden se
+  -- quedaba en EJECUTADA para siempre: no había manera de mirar la bandeja y
+  -- saber qué estaba revisado y qué no.
+  --
   -- Se eliminaron EN VERIFICACIÓN (subir soportes deja la OS EJECUTADA
   -- directamente) y CANCELADA (una orden anulada se DESHABILITA en la bandeja,
   -- que es soft-delete del borrador y no un estado de la OS). Los valores siguen
@@ -687,7 +878,7 @@ BEGIN
   v_permitido := CASE
     WHEN v_actual = 'SIN PROGRAMAR' AND p_estado_nuevo = 'PROGRAMADA'    THEN TRUE
     WHEN v_actual = 'PROGRAMADA'    AND p_estado_nuevo IN ('EJECUTADA','SIN PROGRAMAR') THEN TRUE
-    WHEN v_actual = 'EJECUTADA'     AND p_estado_nuevo = 'PROGRAMADA'    THEN TRUE
+    WHEN v_actual = 'EJECUTADA'     AND p_estado_nuevo IN ('FINALIZADA','PROGRAMADA') THEN TRUE
     ELSE FALSE
   END;
 
@@ -731,10 +922,16 @@ SELECT o.*,
        a.nombre         AS arl_nombre,
        a.formato_origen AS arl_formato,
        p.nombre         AS profesional_nombre,
-       p.correo         AS profesional_correo
+       p.correo         AS profesional_correo,
+       -- CFG-04 · El NOMBRE del tipo de orden viaja resuelto: la vista de
+       -- Órdenes lo enseña en cada fila y pedir el catálogo aparte para
+       -- traducir un id sería un viaje por pantalla.
+       tp.nombre        AS tipo_orden,
+       tp.valor_hora    AS tipo_orden_valor_hora
 FROM sst.ordenes_servicio o
 JOIN sst.arls a               ON a.id = o.arl_id
-LEFT JOIN sst.profesionales p ON p.id = o.profesional_asignado_id;
+LEFT JOIN sst.profesionales p ON p.id = o.profesional_asignado_id
+LEFT JOIN sst.tipos_orden tp  ON tp.id = o.tipo_orden_id;
 
 -- RPT-01 · KPIs globales del dashboard.
 -- DROP + CREATE (y no CREATE OR REPLACE): la vista ganó `ejecutadas_mes` en medio
@@ -746,11 +943,16 @@ SELECT
   count(*) FILTER (WHERE estado = 'SIN PROGRAMAR')           AS sin_programar,
   count(*) FILTER (WHERE estado = 'PROGRAMADA')              AS programadas,
   count(*) FILTER (WHERE estado = 'EN VERIFICACIÓN')         AS en_verificacion,
+  -- Un contador por estado, cada uno puro: la pantalla los pinta como tarjetas
+  -- separadas y sumarlos aquí las descuadraría. Donde hace falta "el trabajo
+  -- hecho" (el KPI de arriba del dashboard) se suman los dos, que es una
+  -- decisión de presentación.
   count(*) FILTER (WHERE estado = 'EJECUTADA')               AS ejecutadas,
+  count(*) FILTER (WHERE estado = 'FINALIZADA')              AS finalizadas,
   -- RPT-01 pide "ejecutadas EN EL MES": el acumulado histórico se conserva
   -- arriba porque lo usan los porcentajes por ARL y la cartera.
   count(*) FILTER (
-    WHERE estado = 'EJECUTADA'
+    WHERE estado IN ('EJECUTADA','FINALIZADA')
       AND date_trunc('month', COALESCE(fecha_ejecucion, actualizado_en)) = date_trunc('month', now())
   )                                                          AS ejecutadas_mes,
   count(*) FILTER (WHERE estado = 'CANCELADA')               AS canceladas,
@@ -764,7 +966,7 @@ FROM sst.ordenes_servicio;
 CREATE OR REPLACE VIEW sst.vw_ordenes_por_arl AS
 SELECT a.id AS arl_id, a.nombre AS arl_nombre,
        count(o.id) AS total,
-       count(o.id) FILTER (WHERE o.estado = 'EJECUTADA') AS ejecutadas
+       count(o.id) FILTER (WHERE o.estado IN ('EJECUTADA','FINALIZADA')) AS ejecutadas
 FROM sst.arls a
 LEFT JOIN sst.ordenes_servicio o ON o.arl_id = a.id
 GROUP BY a.id, a.nombre
@@ -775,7 +977,7 @@ ORDER BY a.nombre;
 --
 -- Los nombres salen del snapshot de la encuesta y solo caen al JOIN vivo cuando
 -- falta (encuestas creadas antes de que existiera el snapshot).
-DROP VIEW IF EXISTS sst.vw_encuestas;
+DROP VIEW IF EXISTS sst.vw_encuestas CASCADE;
 CREATE VIEW sst.vw_encuestas AS
 SELECT e.id,
        e.orden_id,
@@ -791,6 +993,12 @@ SELECT e.id,
        e.contacto_nombre,
        e.contacto_correo,
        e.satisfaccion,
+       e.calificacion_profesional,
+       -- Con qué nota entra esta encuesta al promedio del profesional. Las
+       -- anteriores a la pregunta nueva aportan su satisfacción general, que es
+       -- lo más cercano que hay: descartarlas dejaría a media plantilla sin
+       -- historial de un día para otro.
+       COALESCE(e.calificacion_profesional, e.satisfaccion) AS nota_profesional,
        e.recomendacion,
        e.comentarios,
        e.preguntas,
@@ -803,14 +1011,156 @@ JOIN sst.ordenes_servicio o     ON o.id = e.orden_id
 LEFT JOIN sst.arls a            ON a.id = COALESCE(e.arl_id, o.arl_id)
 LEFT JOIN sst.profesionales p   ON p.id = COALESCE(e.profesional_id, o.profesional_asignado_id);
 
--- PRE-01 · Horas ejecutadas por profesional y mes: la materia prima de la
--- pre-cuenta.
+-- CFG-01 / ENC-05 · Lo que se ve de un profesional en su listado: cuánto trabajo
+-- cerró y cómo lo califican.
 --
--- El mes de una OS es el de su `fecha_programada` (cuándo se ejecutó la
--- actividad), no el de su carga: una orden importada en junio y ejecutada en
--- julio se le paga al profesional en julio. Si no tiene fecha programada se cae
--- a `actualizado_en`, que en una OS EJECUTADA es su último cambio de estado.
-DROP VIEW IF EXISTS sst.vw_horas_ejecutadas;
+-- Las dos cifras van juntas porque una sin la otra engaña: un 5,0 de una sola
+-- encuesta no dice lo mismo que un 4,6 de cuarenta, y la encuesta es OPCIONAL —
+-- un asesor puede tener 100 órdenes ejecutadas y 10 respuestas. Por eso viaja
+-- también `encuestas_respondidas`, que es lo que le pone tamaño a la nota.
+DROP VIEW IF EXISTS sst.vw_profesionales_desempeno;
+CREATE VIEW sst.vw_profesionales_desempeno AS
+SELECT p.id AS profesional_id,
+       COALESCE(o.ordenes_ejecutadas, 0)   AS ordenes_ejecutadas,
+       COALESCE(e.encuestas_enviadas, 0)   AS encuestas_enviadas,
+       COALESCE(e.encuestas_respondidas, 0) AS encuestas_respondidas,
+       e.calificacion_promedio,
+       e.ultima_calificacion_en
+FROM sst.profesionales p
+LEFT JOIN LATERAL (
+  SELECT count(*)::int AS ordenes_ejecutadas
+    FROM sst.ordenes_servicio os
+   WHERE os.profesional_asignado_id = p.id AND os.estado IN ('EJECUTADA','FINALIZADA')
+) o ON true
+LEFT JOIN LATERAL (
+  SELECT count(*)::int                                    AS encuestas_enviadas,
+         count(*) FILTER (WHERE v.respondida)::int        AS encuestas_respondidas,
+         round(avg(v.nota_profesional) FILTER (WHERE v.respondida)::numeric, 2) AS calificacion_promedio,
+         max(v.respondido_en)                             AS ultima_calificacion_en
+    FROM sst.vw_encuestas v
+   WHERE v.profesional_id = p.id
+) e ON true;
+
+-- PRE-01 · Rellena `soportes_aceptados_en` en las órdenes que ya se habían
+-- revisado antes de que existiera la columna. La huella está en el historial,
+-- que es donde se dejaba constancia hasta ahora; sin este bloque esas órdenes
+-- desaparecerían de las cuentas de cobro al desplegar.
+DO $$
+BEGIN
+  UPDATE sst.ordenes_servicio o
+     SET soportes_aceptados_en = h.primera_aceptacion
+    FROM (
+      SELECT orden_id, min(cambiado_en) AS primera_aceptacion
+        FROM sst.historial_estados_orden
+       WHERE motivo = 'Soportes revisados y aceptados'
+       GROUP BY orden_id
+    ) h
+   WHERE h.orden_id = o.id
+     AND o.soportes_aceptados_en IS NULL;
+END $$;
+
+-- CFG-04 · Ninguna orden puede quedarse sin tipo.
+--
+-- El campo es obligatorio de aquí en adelante, pero las 38 que ya estaban
+-- cargadas no lo tenían. Se deduce del título de la actividad que trajo la ARL
+-- ("CAP SEGURIDAD VIAL" → Capacitación) y, cuando no dice nada —la mayoría, que
+-- llegó sin ese dato—, cae en Capacitación, que es lo que hace esta empresa casi
+-- siempre. Es una suposición y se puede corregir orden por orden desde Órdenes;
+-- lo que no se podía dejar es la mitad de la bandeja sin categoría, porque de
+-- ella cuelga el valor hora del profesional.
+DO $$
+DECLARE v_cap UUID; v_ase UUID; v_ins UUID; v_n INTEGER;
+BEGIN
+  SELECT id INTO v_cap FROM sst.tipos_orden WHERE lower(btrim(nombre)) = 'capacitación';
+  SELECT id INTO v_ase FROM sst.tipos_orden WHERE lower(btrim(nombre)) = 'asesoría';
+  SELECT id INTO v_ins FROM sst.tipos_orden WHERE lower(btrim(nombre)) = 'inspección';
+  IF v_cap IS NULL THEN RETURN; END IF;
+
+  UPDATE sst.ordenes_servicio
+     SET tipo_orden_id = CASE
+           WHEN tipo_actividad ILIKE '%asesor%' THEN COALESCE(v_ase, v_cap)
+           WHEN tipo_actividad ILIKE '%inspec%' THEN COALESCE(v_ins, v_cap)
+           ELSE v_cap
+         END
+   WHERE tipo_orden_id IS NULL;
+  GET DIAGNOSTICS v_n = ROW_COUNT;
+  IF v_n > 0 THEN
+    RAISE NOTICE 'CFG-04: % orden(es) sin tipo quedaron categorizadas.', v_n;
+  END IF;
+
+  -- Los borradores todavía sin validar arrancan con la misma suposición, para
+  -- que la vista previa llegue con el desplegable ya puesto.
+  UPDATE sst.borradores_extraccion
+     SET tipo_orden_id = CASE
+           WHEN metadatos_extraccion->'tipo_actividad'->>'value' ILIKE '%asesor%' THEN COALESCE(v_ase, v_cap)
+           WHEN metadatos_extraccion->'tipo_actividad'->>'value' ILIKE '%inspec%' THEN COALESCE(v_ins, v_cap)
+           ELSE v_cap
+         END
+   WHERE tipo_orden_id IS NULL AND estado <> 'VALIDADA';
+END $$;
+
+-- PRE-02 · Y las que ya tienen profesional se quedan con SU valor hora.
+--
+-- Se congela el que estaría vigente hoy, con el mismo orden de resolución que
+-- usa la asignación: tarifa del profesional para ese tipo → valor del tipo →
+-- valor base del profesional. Sin este bloque, las órdenes ya asignadas
+-- entrarían a la cuenta de cobro con valor cero.
+UPDATE sst.ordenes_servicio o
+   SET valor_hora_cobro = v.valor, valor_hora_origen = v.origen
+  FROM (
+    SELECT o2.id,
+           COALESCE(t.valor_hora, NULLIF(tp.valor_hora, 0), p.valor_hora, 0) AS valor,
+           CASE WHEN t.valor_hora IS NOT NULL          THEN 'tarifa'
+                WHEN COALESCE(tp.valor_hora, 0) > 0    THEN 'tipo'
+                ELSE 'profesional' END                 AS origen
+      FROM sst.ordenes_servicio o2
+      JOIN sst.profesionales p       ON p.id  = o2.profesional_asignado_id
+      LEFT JOIN sst.tipos_orden tp   ON tp.id = o2.tipo_orden_id
+      LEFT JOIN LATERAL (
+        SELECT ta.valor_hora
+          FROM sst.tarifas_actividad_profesional ta
+         WHERE ta.profesional_id = o2.profesional_asignado_id
+           AND tp.nombre IS NOT NULL
+           AND lower(ta.actividad) = lower(tp.nombre)
+         ORDER BY ta.vigente_desde DESC LIMIT 1
+      ) t ON true
+     WHERE o2.valor_hora_cobro IS NULL
+  ) v
+ WHERE v.id = o.id;
+
+-- EST-01 · Las órdenes cuyos soportes YA se habían aceptado nacen FINALIZADAS.
+--
+-- Se revisaron y se dieron por buenas cuando el estado final era EJECUTADA; sin
+-- este bloque se quedarían mezcladas con las que nadie ha mirado todavía, que es
+-- justo la distinción que el estado nuevo viene a hacer. El movimiento queda en
+-- el historial, como cualquier otro cambio de estado.
+DO $$
+DECLARE v_n INTEGER;
+BEGIN
+  WITH movidas AS (
+    UPDATE sst.ordenes_servicio
+       SET estado = 'FINALIZADA'
+     WHERE estado = 'EJECUTADA' AND soportes_aceptados_en IS NOT NULL
+    RETURNING id, soportes_aceptados_por, soportes_aceptados_en
+  )
+  INSERT INTO sst.historial_estados_orden (orden_id, estado_anterior, estado_nuevo, cambiado_por, motivo, cambiado_en)
+  SELECT id, 'EJECUTADA', 'FINALIZADA', soportes_aceptados_por,
+         'Soportes aceptados (migración al estado FINALIZADA)', soportes_aceptados_en
+    FROM movidas;
+  GET DIAGNOSTICS v_n = ROW_COUNT;
+  IF v_n > 0 THEN
+    RAISE NOTICE 'Migración de estados: % OS con soportes aceptados pasaron a FINALIZADA.', v_n;
+  END IF;
+END $$;
+
+-- PRE-01 · Horas ejecutadas por profesional y mes: la materia prima de la
+-- cuenta de cobro.
+--
+-- El mes de una OS es el de su EJECUCIÓN, no el de su carga ni el de la
+-- revisión: una orden importada en junio, ejecutada en julio y revisada en
+-- agosto se le paga al profesional en julio. Si no tiene fecha de ejecución se
+-- cae a la programada y, en último término, a `actualizado_en`.
+DROP VIEW IF EXISTS sst.vw_horas_ejecutadas CASCADE;
 CREATE VIEW sst.vw_horas_ejecutadas AS
 SELECT o.id                     AS orden_id,
        o.codigo                 AS orden_codigo,
@@ -821,12 +1171,36 @@ SELECT o.id                     AS orden_id,
        o.tipo_actividad,
        o.actividad_economica,
        COALESCE(o.horas_asignadas, 0) AS horas,
-       COALESCE(o.fecha_programada, o.actualizado_en)::date AS fecha_ejecucion,
-       to_char(COALESCE(o.fecha_programada, o.actualizado_en), 'YYYY-MM') AS periodo
+       -- PRE-02 · Lo que se le paga por esta orden, congelado al asignarla. La
+       -- cuenta de cobro lee esto y no el catálogo: cambiar el valor hora de un
+       -- tipo no puede reescribir lo ya trabajado.
+       o.tipo_orden_id,
+       tp.nombre           AS tipo_orden,
+       o.valor_hora_cobro,
+       o.valor_hora_origen,
+       o.valor_cobro_total,
+       COALESCE(o.fecha_ejecucion, o.fecha_programada, o.actualizado_en)::date AS fecha_ejecucion,
+       to_char(COALESCE(o.fecha_ejecucion, o.fecha_programada, o.actualizado_en), 'YYYY-MM') AS periodo,
+       o.soportes_aceptados_en
 FROM sst.ordenes_servicio o
 JOIN sst.arls a               ON a.id = o.arl_id
 LEFT JOIN sst.profesionales p ON p.id = o.profesional_asignado_id
-WHERE o.estado = 'EJECUTADA' AND o.profesional_asignado_id IS NOT NULL;
+LEFT JOIN sst.tipos_orden tp  ON tp.id = o.tipo_orden_id
+WHERE o.estado IN ('EJECUTADA','FINALIZADA') AND o.profesional_asignado_id IS NOT NULL;
+
+-- ⭐ PRE-01 · Lo que de verdad se le puede cobrar a JD&D por un profesional.
+--
+-- Es `vw_horas_ejecutadas` más UNA condición: los soportes tienen que estar
+-- aceptados. Que la OS esté EJECUTADA significa que el profesional subió los
+-- archivos; que se le pueda pagar significa que un administrador los revisó y
+-- los dio por buenos.
+--
+-- Va en una vista aparte y no como filtro de la anterior a propósito: los
+-- informes de horas (RPT-05) miden trabajo EJECUTADO, y colarles aquí la
+-- revisión les cambiaría la cifra sin que nadie lo pidiera.
+DROP VIEW IF EXISTS sst.vw_horas_por_cobrar;
+CREATE VIEW sst.vw_horas_por_cobrar AS
+SELECT * FROM sst.vw_horas_ejecutadas WHERE soportes_aceptados_en IS NOT NULL;
 
 -- RPT-03 · Órdenes vencidas: llevan demasiado tiempo sin ejecutarse.
 --
@@ -856,7 +1230,7 @@ SELECT o.id,
 FROM sst.ordenes_servicio o
 JOIN sst.arls a               ON a.id = o.arl_id
 LEFT JOIN sst.profesionales p ON p.id = o.profesional_asignado_id
-WHERE o.estado NOT IN ('EJECUTADA', 'CANCELADA');
+WHERE o.estado NOT IN ('EJECUTADA', 'FINALIZADA', 'CANCELADA');
 
 -- RPT-06 · Cartera: ejecutadas que siguen sin facturar o sin validar la ARL.
 DROP VIEW IF EXISTS sst.vw_cartera;
@@ -882,7 +1256,7 @@ SELECT o.id,
 FROM sst.ordenes_servicio o
 JOIN sst.arls a               ON a.id = o.arl_id
 LEFT JOIN sst.profesionales p ON p.id = o.profesional_asignado_id
-WHERE o.estado = 'EJECUTADA'
+WHERE o.estado IN ('EJECUTADA','FINALIZADA')
   AND (o.facturado_en IS NULL OR o.validado_arl_en IS NULL);
 
 -- PRE-08 · Pre-cuentas con los datos del profesional ya resueltos.

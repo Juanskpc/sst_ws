@@ -49,8 +49,12 @@ export function filaDato(etiqueta, valor) {
   </tr>`;
 }
 
-/** Bloque destacado con las franjas de la visita, una debajo de otra. */
-export function bloqueFranjas(titulo, lineas) {
+/**
+ * Bloque destacado con una lista de líneas, una debajo de otra: las franjas de
+ * una visita en el correo de asignación, las órdenes incluidas en el de la
+ * pre-cuenta. Se llamaba `bloqueFranjas` cuando solo existía el primer caso.
+ */
+export function bloqueLista(titulo, lineas) {
   if (!lineas?.length) return '';
   const items = lineas
     .map(
@@ -63,6 +67,25 @@ export function bloqueFranjas(titulo, lineas) {
     <tr><td style="padding:14px 16px">
       <p style="margin:0 0 6px;font:700 11px ${FUENTE};letter-spacing:.06em;text-transform:uppercase;color:${AZUL}">${esc(titulo)}</p>
       <table role="presentation" cellpadding="0" cellspacing="0" width="100%">${items}</table>
+    </td></tr>
+  </table>`;
+}
+
+/**
+ * Cifra destacada (el total de una pre-cuenta de cobro).
+ *
+ * Va en su propio bloque y no como una fila más de `tablaDatos` porque es el
+ * dato por el que se abre el correo: quien recibe su cuenta del mes mira primero
+ * cuánto se le va a pagar y solo después de dónde sale. La `nota` es el
+ * desglose corto que sostiene la cifra ("12 órdenes · 48 horas").
+ */
+export function bloqueTotal(etiqueta, valor, nota) {
+  if (!valor) return '';
+  return `<table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="margin:18px 0;border-collapse:collapse;background:#f8fafc;border:1px solid ${BORDE};border-left:3px solid ${AZUL_CLARO};border-radius:6px">
+    <tr><td style="padding:16px 18px">
+      <p style="margin:0 0 4px;font:700 11px ${FUENTE};letter-spacing:.06em;text-transform:uppercase;color:${AZUL}">${esc(etiqueta)}</p>
+      <p style="margin:0;font:700 26px ${FUENTE};color:${AZUL};line-height:1.2">${esc(valor)}</p>
+      ${nota ? `<p style="margin:5px 0 0;font:400 13px ${FUENTE};color:${SUAVE}">${esc(nota)}</p>` : ''}
     </td></tr>
   </table>`;
 }

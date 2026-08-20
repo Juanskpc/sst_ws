@@ -7,21 +7,80 @@ import { badRequest, notFound } from '../../utils/httpError.js';
 import { storage } from '../../services/storage.service.js';
 import { readSheetPreview } from '../../services/extraction.service.js';
 import { enqueueImport } from '../../queue/importQueue.js';
+import { detectarOrdenExistente, hashArchivo, identidadDeOrden } from '../../services/dedup.service.js';
 import { materializarOrden } from './drafts.routes.js';
 
 const router = Router();
 router.use(authRequired);
+
+/**
+ * IMP-09 · Traduce lo que devuelve el detector a lo que la vista necesita pintar.
+ * El identificador se calcula aquí y no en el cliente: es el mismo criterio con
+ * el que el pipeline decide qué es un duplicado.
+ */
+function avisoDeDuplicado({ archivo, deteccion }) {
+  return {
+    archivo,
+    via: deteccion.via,
+    ordenes: deteccion.ordenes.map((o) => ({
+      id: o.id,
+      identidad: identidadDeOrden(o),
+      codigo: o.codigo,
+      estado: o.estado,
+      empresa_nombre: o.empresa_nombre,
+      arl_nombre: o.arl_nombre,
+      profesional_nombre: o.profesional_nombre,
+      fecha_programada: o.fecha_programada,
+      deshabilitado: o.deshabilitado,
+    })),
+  };
+}
+
+/**
+ * IMP-09 · Comprobación PREVIA, sin IA: ¿este archivo trae una orden que ya
+ * está en el sistema?
+ *
+ * Se llama al elegir los archivos, antes de "Procesar con IA". Nada se guarda:
+ * ni lote, ni borrador, ni el archivo en disco — la respuesta es solo un
+ * dictamen. Existe porque la comprobación equivalente se hacía DESPUÉS de la
+ * extracción, y para entonces la petición de IA ya estaba gastada.
+ */
+router.post('/precheck', requireRole('admin'), uploadImport.single('file'), asyncHandler(async (req, res) => {
+  if (!req.file) throw badRequest('Adjunta un archivo en el campo "file"');
+  const { originalname, mimetype, buffer } = req.file;
+  const deteccion = await detectarOrdenExistente({ buffer, mime: mimetype, filename: originalname });
+  res.json({
+    data: {
+      existe: deteccion.existe,
+      ...avisoDeDuplicado({ archivo: originalname, deteccion }),
+    },
+  });
+}));
 
 // IMP-01/02 · Subir archivo (Excel SIPAB o PDF). Responde de inmediato (NFR<2s).
 router.post('/', requireRole('admin'), uploadImport.single('file'), asyncHandler(async (req, res) => {
   if (!req.file) throw badRequest('Adjunta un archivo en el campo "file"');
   const { originalname, mimetype, buffer } = req.file;
 
+  // IMP-09 · Última barrera antes de gastar la petición de IA. La vista ya hace
+  // esta comprobación al elegir el archivo, pero el gasto se decide aquí: un
+  // cliente que no la haya hecho —o una pestaña abierta desde antes— no puede
+  // colar un documento ya procesado.
+  const deteccion = await detectarOrdenExistente({ buffer, mime: mimetype, filename: originalname });
+  if (deteccion.existe) {
+    return res.status(409).json({
+      error: deteccion.ordenes.length === 1
+        ? `Esta orden ya está en el sistema como ${deteccion.ordenes[0].codigo} (${deteccion.ordenes[0].estado}).`
+        : `Las ${deteccion.ordenes.length} órdenes de este archivo ya están en el sistema.`,
+      duplicado: avisoDeDuplicado({ archivo: originalname, deteccion }),
+    });
+  }
+
   const fileKey = await storage.put('imports', originalname, buffer);
   const batch = await pool.query(
-    `INSERT INTO sst.lotes_importacion (subido_por, nombre_archivo, url_archivo, tipo_mime, estado)
-     VALUES ($1,$2,$3,$4,'PROCESANDO') RETURNING *`,
-    [req.user.sub, originalname, fileKey, mimetype]
+    `INSERT INTO sst.lotes_importacion (subido_por, nombre_archivo, url_archivo, tipo_mime, estado, hash_archivo)
+     VALUES ($1,$2,$3,$4,'PROCESANDO',$5) RETURNING *`,
+    [req.user.sub, originalname, fileKey, mimetype, hashArchivo(buffer)]
   );
   const batchId = batch.rows[0].id;
 
@@ -151,6 +210,23 @@ router.post('/:id/confirm', requireRole('admin'), asyncHandler(async (req, res) 
     const resto = sinVencimiento.rowCount > 3 ? ` y ${sinVencimiento.rowCount - 3} más` : '';
     throw badRequest(
       `${sinVencimiento.rowCount} orden(es) no tienen fecha de vencimiento: ${nombres}${resto}. Diligénciela antes de guardar.`
+    );
+  }
+
+  // CFG-04 · Y el tipo de orden, por lo mismo: es obligatorio y sin él la OS no
+  // sabría con qué valor hora se cobra.
+  const sinTipo = await pool.query(
+    `SELECT coalesce(metadatos_extraccion->'empresa_nombre'->>'value', 'Sin nombre') AS empresa
+       FROM sst.borradores_extraccion
+      WHERE lote_importacion_id=$1 AND estado='PENDIENTE_REVISION' AND tipo_orden_id IS NULL`,
+    [req.params.id]
+  );
+  if (sinTipo.rowCount) {
+    const nombres = sinTipo.rows.slice(0, 3).map((x) => x.empresa).join(', ');
+    const resto = sinTipo.rowCount > 3 ? ` y ${sinTipo.rowCount - 3} más` : '';
+    throw badRequest(
+      `${sinTipo.rowCount} orden(es) no tienen tipo de orden: ${nombres}${resto}. ` +
+      'Elíjalo antes de guardar: de él sale el valor hora con el que se cobra la visita.'
     );
   }
 

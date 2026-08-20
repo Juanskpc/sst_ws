@@ -92,10 +92,30 @@ async function seedSampleProfessionals(client) {
   console.log('  → profesionales de ejemplo asegurados');
 }
 
+/**
+ * EST-01 · Valores de enum que hay que añadir ANTES de `schema.sql`.
+ *
+ * Postgres no deja usar un valor de enum en la misma transacción en la que se
+ * agrega, y `schema.sql` va en una sola sentencia múltiple —es decir, una sola
+ * transacción— con vistas que ya nombran 'FINALIZADA'. Así que el ALTER se hace
+ * aparte y antes. En una base nueva no hace nada: el tipo todavía no existe y
+ * el CREATE TYPE de `schema.sql` ya trae el valor.
+ */
+async function asegurarEstados(client) {
+  const existe = await client.query(
+    `SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
+      WHERE n.nspname = 'sst' AND t.typname = 'estado_orden'`
+  );
+  if (!existe.rowCount) return;
+  await client.query(`ALTER TYPE sst.estado_orden ADD VALUE IF NOT EXISTS 'FINALIZADA' AFTER 'EJECUTADA'`);
+  console.log("  → estado 'FINALIZADA' asegurado en sst.estado_orden");
+}
+
 async function main() {
   console.log('== Migración JD&D IA-Core ==');
   const client = await pool.connect();
   try {
+    await asegurarEstados(client);
     await runSqlFile(client, 'schema.sql');
     await runSqlFile(client, 'seed.sql');
     await seedCuentas(client);
