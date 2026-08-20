@@ -130,23 +130,35 @@ async function porTextoDelDocumento(texto, client) {
   return r.rows;
 }
 
-/** Vía 3 · Excel SIPAB: se descarta solo si TODAS sus filas ya están cargadas. */
+/**
+ * Vía 3 · Excel SIPAB: se descarta solo si TODAS sus filas ya están cargadas.
+ *
+ * Las identidades del archivo se preguntan **en una sola consulta**. Se hacía
+ * fila por fila, y esto corre dos veces por archivo —al elegirlo (`/precheck`) y
+ * al subirlo—, así que un SIPAB de 99 filas costaba ~200 idas y vueltas a una
+ * base remota antes de que el usuario viera nada.
+ */
 async function porFilasDelExcel(buffer, client) {
   const filas = await parseExcelSipab(buffer);
   if (!filas.length) return { ordenes: [], todas: false, total: 0 };
 
-  const ordenes = [];
+  const crons = [];
+  const secs = [];
   for (const fila of filas) {
     const cron = fila.fields?.codigo_cronograma?.value || null;
     const sec = fila.fields?.secuencia?.value || null;
-    if (!cron || !sec) continue;
-    const r = await client.query(
-      `${SELECT_ORDEN} WHERE o.codigo_cronograma = $1 AND o.secuencia = $2 LIMIT 1`,
-      [cron, sec]
-    );
-    if (r.rows[0]) ordenes.push(r.rows[0]);
+    if (cron && sec) { crons.push(cron); secs.push(sec); }
   }
-  return { ordenes, todas: ordenes.length === filas.length, total: filas.length };
+  if (!crons.length) return { ordenes: [], todas: false, total: filas.length };
+
+  const r = await client.query(
+    `${SELECT_ORDEN}
+      WHERE (o.codigo_cronograma, o.secuencia)
+            IN (SELECT c, s FROM unnest($1::text[], $2::text[]) AS t(c, s))
+      ORDER BY o.fecha_carga`,
+    [crons, secs]
+  );
+  return { ordenes: r.rows, todas: r.rows.length === filas.length, total: filas.length };
 }
 
 let _extractor = null;

@@ -265,8 +265,8 @@ async function generarPdf(o) {
 
 /**
  * Encabezados EXACTOS del SIPAB real (`base_datos_bolivar.xlsx`). El orden y la
- * redacción importan: `HEADER_MAP` de `extraction.service.js` los reconoce por
- * texto, y una columna renombrada deja de mapearse al campo canónico.
+ * redacción importan: `SIPAB_HEADERS` de `extraction.service.js` los reconoce
+ * por nombre exacto, y una columna renombrada deja de mapearse al campo canónico.
  */
 const CABECERAS_SIPAB = [
   'Nit Empresa', 'Razon Social', 'Descripcion Estado Empresa', 'En Mora',
@@ -283,18 +283,36 @@ const CABECERAS_SIPAB = [
   'Observaciones', 'Num pol', 'Ubicacion Actividad',
 ];
 
+/**
+ * Filas del SIPAB de ejemplo, con la MISMA forma que el reporte real:
+ *  · `programa` es el código del plan (columna "Actividad Programa"), y el
+ *    título de la actividad va aparte, en la columna "Descripcion".
+ *  · la ciudad, la dirección, el teléfono y el contacto de la empresa NO tienen
+ *    columna propia: viajan dentro del bloque de "Ubicacion Actividad".
+ *  · el correo y el celular del responsable de SST solo aparecen —cuando
+ *    aparecen— escritos dentro de las observaciones.
+ * Una fila se mide en UNIDADES y no en horas, y las fechas alternan entre fecha
+ * de Excel y el texto `18/aug/2026`, porque el SIPAB real mezcla las dos cosas.
+ */
 const FILAS_SIPAB = [
-  ['901455780', 'TRANSPORTES ANDINA DEL SUR S A S', 'CAP TRABAJO SEGURO EN ALTURAS', 8,  '2026-08-18', 'PASTO',     'ANDRES FELIPE OSORIO'],
-  ['900874312', 'AGROINDUSTRIAS EL MIRADOR LTDA',   'CAP RIESGO QUIMICO',            4,  '2026-08-19', 'IPIALES',   'MARTHA LUCIA BURBANO'],
-  ['901662045', 'CONFECCIONES LA PRIMAVERA S A S',  'INSPECCION DE PUESTOS DE TRABAJO', 6, '2026-08-20', 'TUQUERRES', 'JAIRO ANTONIO CUARAN'],
-  ['890301774', 'LACTEOS SAN FERNANDO S A',         'CAP SEGURIDAD VIAL',           10, '2026-08-21', 'PASTO',     'FELIPE VARGAS TORRES'],
-  ['901208955', 'CONSTRUCTORA VALLE VERDE S A S',   'CAP MANEJO MANUAL DE CARGAS',  12, '2026-08-24', 'TUMACO',    'GLORIA ESPERANZA MINA'],
-  ['900556128', 'DISTRIBUIDORA NARIÑO EXPRESS LTDA','MEDICION DE ILUMINACION',       3, '2026-08-25', 'PASTO',     'CARLOS EDUARDO BENAVIDES'],
-  ['901733460', 'CLINICA SANTA ISABEL S A S',       'CAP RIESGO BIOLOGICO',         16, '2026-08-26', 'IPIALES',   'RUBEN DARIO CHAVES'],
-  ['900912337', 'METALMECANICA DEL PACIFICO S A S', 'CAP RIESGO MECANICO',           5, '2026-08-27', 'TUMACO',    'YENNY ALEXANDRA CAICEDO'],
-  ['901044219', 'PANIFICADORA EL TRIGAL LTDA',      'CAP HIGIENE POSTURAL',          4, '2026-08-28', 'PASTO',     'LINA MARCELA JOJOA'],
-  ['900733015', 'HOTELES DEL SUR S A S',            'CAP PREVENCION DE INCENDIOS',   6, '2026-08-31', 'IPIALES',   'EDWIN ALEXANDER RUANO'],
+  { nit: '901455780', razon: 'TRANSPORTES ANDINA DEL SUR S A S', programa: '508.05.01', actividad: 'PROGRAMA DE PREVENCION CONTRA CAIDAS', horas: 8,  fecha: '2026-08-18', ciudad: 'PASTO',     direccion: 'CR 21A 17 27',      telefono: '3105006718', contacto: 'JULLY VANESA GETIAL',   obs: 'CAPACITACION EN TRABAJO SEGURO EN ALTURAS / JULLY VANESA GETIAL (COORD. SST) 316 3348612 SST@ANDINADELSUR.COM.CO' },
+  { nit: '900874312', razon: 'AGROINDUSTRIAS EL MIRADOR LTDA',   programa: '508.09.04', actividad: 'PROGRAMA DE RIESGO QUIMICO',          horas: 4,  fecha: '2026-08-19', ciudad: 'IPIALES',   direccion: 'CL 16 # 22 68 CENTRO', telefono: '7258745',    contacto: 'MARTHA LUCIA BURBANO', obs: 'CAPACITACION EN MANEJO DE SUSTANCIAS QUIMICAS. CONTACTO: MARTHA BURBANO 320 6560433' },
+  { nit: '901662045', razon: 'CONFECCIONES LA PRIMAVERA S A S',  programa: '508.12.01', actividad: 'VIGILANCIA EPIDEMIOLOGICA DE ERGONOMIA', horas: 6, fecha: '2026-08-20', ciudad: 'TUQUERRES', direccion: 'AV LA PLAYA CL 5 6 15', telefono: '3174231638', contacto: 'JAIRO ANTONIO CUARAN', obs: 'INSPECCION DE PUESTOS DE TRABAJO. REQUIERE REGISTRO FOTOGRAFICO Y FORMATO DE ASISTENCIA' },
+  { nit: '890301774', razon: 'LACTEOS SAN FERNANDO S A',         programa: '412.04.26', actividad: 'PROGRAMA DE SEGURIDAD VIAL',          horas: 10, fecha: '2026-08-21', ciudad: 'PASTO',     direccion: 'CLL 18 # 18 60',       telefono: '3808955',    contacto: 'FELIPE VARGAS TORRES', obs: 'CAPACITACION EN SEGURIDAD VIAL PARA CONDUCTORES / FELIPE VARGAS 317 2186903; SST@LACTEOSSANFERNANDO.COM' },
+  { nit: '901208955', razon: 'CONSTRUCTORA VALLE VERDE S A S',   programa: '508.04.16', actividad: 'PROGRAMA DE ORDEN Y LIMPIEZA',        horas: 12, fecha: '2026-08-24', ciudad: 'TUMACO',    direccion: 'CR 40 A 17 A 35',      telefono: '3207889508', contacto: 'GLORIA ESPERANZA MINA', obs: 'CAPACITACION EN MANEJO MANUAL DE CARGAS. DEFINIR HORA CON LA EMPRESA' },
+  { nit: '900556128', razon: 'DISTRIBUIDORA NARIÑO EXPRESS LTDA',programa: '508.27.02', actividad: 'HABITOS SALUDABLES CONSERVACION AUDITIVA', horas: 3, fecha: '2026-08-25', ciudad: 'PASTO',   direccion: 'AV 5N 23AN 35',        telefono: '3366700',    contacto: 'CARLOS BENAVIDES',     obs: 'MEDICION DE ILUMINACION EN BODEGA. CONTACTO: CARLOS BENAVIDES 310 2492927' },
+  { nit: '901733460', razon: 'CLINICA SANTA ISABEL S A S',       programa: '508.11.15', actividad: 'PRIMEROS AUXILIOS',                   horas: 16, fecha: '2026-08-26', ciudad: 'IPIALES',   direccion: 'CL 19 # 31 C 19',      telefono: '3158754736', contacto: 'RUBEN DARIO CHAVES',   obs: 'CAPACITACION EN RIESGO BIOLOGICO / RUBEN CHAVES (COORD. TALENTO HUMANO) SST@SANTAISABEL.COM.CO 315 8754736' },
+  { nit: '900912337', razon: 'METALMECANICA DEL PACIFICO S A S', programa: '414.01.03', actividad: 'INVESTIGACION DE ACCIDENTE GRAVE',    horas: 1,  fecha: '2026-08-27', ciudad: 'TUMACO',    direccion: 'VEREDA EL ALISO BODEGA 3', telefono: '3366700', contacto: 'YENNY A. CAICEDO',     obs: 'INVESTIGACION DE SINIESTRO GRAVE OCURRIDO EL 12-AUG-26', unidad: 'UNIDADES' },
+  { nit: '901044219', razon: 'PANIFICADORA EL TRIGAL LTDA',      programa: '508.12.01', actividad: 'PROGRAMA DE HIGIENE POSTURAL',        horas: 4,  fecha: '2026-08-28', ciudad: 'PASTO',     direccion: 'CR 21A 17 27',         telefono: '3105006718', contacto: 'LINA MARCELA JOJOA',   obs: 'ASESORIA EN PAUSAS ACTIVAS Y HIGIENE POSTURAL' },
+  { nit: '900733015', razon: 'HOTELES DEL SUR S A S',            programa: '508.11.05', actividad: 'DIVULGACION PLAN EMERGENCIAS',        horas: 6,  fecha: '2026-08-31', ciudad: 'IPIALES',   direccion: 'CL 16 # 22 68 CENTRO', telefono: '7258745',    contacto: 'EDWIN ALEXANDER RUANO', obs: 'CAPACITACION EN PREVENCION DE INCENDIOS. ACOMPAÑAMIENTO EN SIMULACRO' },
 ];
+
+/** Los meses del SIPAB van abreviados en inglés: `2026-08-18` → `18/aug/2026`. */
+const MES_SIPAB = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+function fechaTextoSipab(iso) {
+  const [a, m, d] = iso.split('-');
+  return `${d}/${MES_SIPAB[Number(m) - 1]}/${a}`;
+}
 
 /**
  * @param {boolean} conVencimiento  Añade la columna "Fecha Vencimiento".
@@ -311,35 +329,39 @@ async function generarExcel(conVencimiento) {
   ws.addRow(cabeceras);
   ws.getRow(1).font = { bold: true };
 
-  FILAS_SIPAB.forEach(([nit, razon, actividad, horas, fecha, ciudad, profesional], i) => {
+  FILAS_SIPAB.forEach((o, i) => {
+    const { nit, razon, programa, actividad, horas, fecha, ciudad, direccion, telefono, contacto, obs } = o;
     const fila = new Array(cabeceras.length).fill('');
     fila[0] = nit;
     fila[1] = razon;
-    fila[2] = 'Activa';
+    fila[2] = 'Activa';                            // estado de la EMPRESA, no de la actividad
     fila[3] = 'NO';
     fila[4] = String(1370500 + i);                 // Numero Cronograma  → codigo_cronograma
     fila[5] = String(10 + i);                      // Actividad Cronograma → secuencia
-    fila[6] = actividad;                           // Actividad Programa → actividad_economica
-    fila[7] = 'Programada';
-    fila[8] = 'HORAS';
+    fila[6] = programa;                            // Actividad Programa → actividad_economica
+    fila[7] = actividad;                           // Descripcion → tipo_actividad
+    fila[8] = o.unidad ?? 'HORAS';
     fila[9] = horas;                               // Act Programadas → horas_asignadas
     fila[10] = 0;
     fila[11] = 0;
     fila[12] = 0;
     fila[13] = 0;
-    fila[15] = 'ASESORIA';
+    fila[15] = i % 3 === 0 ? 'T' : 'C';
     fila[16] = 15 + i;
-    fila[17] = fecha;                              // Fecha Programada → fecha_orden
+    // La MITAD como fecha de Excel y la otra mitad como el texto `18/aug/2026`:
+    // el SIPAB real mezcla los dos formatos en la misma columna.
+    fila[17] = i % 2 === 0 ? new Date(`${fecha}T00:00:00Z`) : fechaTextoSipab(fecha);
     fila[20] = '08:00';
-    fila[22] = 'EMPRESA';
+    fila[22] = 'INDIVIDUAL';
     fila[30] = '901203812';
-    fila[31] = PROVEEDOR.nombre;
-    fila[33] = profesional;                        // Nombre Profesional → contacto_sst_nombre
+    fila[31] = PROVEEDOR.nombre;                   // el proveedor es JD&D, no la empresa
     fila[35] = 'CLAUDIA RESTREPO';
     fila[37] = 'JORGE ENRIQUE MORA';
-    fila[38] = `Actividad de ejemplo generada para pruebas · ${ciudad}`;
-    fila[39] = `POL-${20260 + i}`;
-    fila[40] = ciudad;                             // Ubicacion Actividad → ciudad_ejecucion
+    fila[38] = `${obs} (ACTIVIDAD CARGADA EN PROCESO DE LOTE)`;  // Observaciones → descripcion
+    fila[39] = `Nro. ${20260000000 + i}`;
+    // Ubicacion Actividad: un solo texto del que salen ciudad, dirección y
+    // contacto de la empresa.
+    fila[40] = `Departamento: NARINO - Ciudad: ${ciudad} - Dirección: ${direccion} - Teléfono: ${telefono} - Contacto: ${contacto}`;
     if (conVencimiento) {
       const d = new Date(`${fecha}T12:00:00`);
       d.setDate(d.getDate() + 60);
