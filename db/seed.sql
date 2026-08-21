@@ -54,12 +54,12 @@ INSERT INTO sst.permisos_rol (rol, vista, permitido) VALUES
   ('admin',       'informes',       TRUE),
   ('admin',       'profesionales',  TRUE),
   ('admin',       'configuracion',  TRUE),
-  ('profesional', 'dashboard',      TRUE),
-  ('profesional', 'importar',       FALSE),
-  ('profesional', 'ordenes',        FALSE),
-  ('profesional', 'informes',       TRUE),
-  ('profesional', 'profesionales',  FALSE),
-  ('profesional', 'configuracion',  TRUE),
+  ('administrativo', 'dashboard',      TRUE),
+  ('administrativo', 'importar',       FALSE),
+  ('administrativo', 'ordenes',        FALSE),
+  ('administrativo', 'informes',       TRUE),
+  ('administrativo', 'profesionales',  FALSE),
+  ('administrativo', 'configuracion',  TRUE),
   ('contador',    'dashboard',      TRUE),
   ('contador',    'importar',       FALSE),
   ('contador',    'ordenes',        FALSE),
@@ -78,14 +78,14 @@ INSERT INTO sst.permisos_rol (rol, vista, permitido) VALUES
   ('admin',       'precuentas',     TRUE),
   ('contador',    'precuentas',     TRUE),
   ('auditor',     'precuentas',     TRUE),
-  ('profesional', 'precuentas',     FALSE),
+  ('administrativo', 'precuentas',     FALSE),
   -- CFG-02 · Empresas clientes: maestro comercial. Lo mantiene el admin; el
-  -- contador y el auditor lo consultan (aparece en cartera y pre-cuentas). El
+  -- contador y el auditor lo consultan (aparece en las cuentas de cobro). El
   -- profesional no lo necesita.
   ('admin',       'empresas',       TRUE),
   ('contador',    'empresas',       TRUE),
   ('auditor',     'empresas',       TRUE),
-  ('profesional', 'empresas',       FALSE)
+  ('administrativo', 'empresas',       FALSE)
 ON CONFLICT (rol, vista) DO NOTHING;
 
 -- Plantillas de formatos precargadas (M4 / FOR) --------------------------------

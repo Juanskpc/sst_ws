@@ -115,7 +115,10 @@ export async function generatePrecuentaPdf(precuenta) {
   const meses = ['enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio',
     'julio', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre'];
   const [anio, mes] = String(precuenta.periodo || '').split('-').map(Number);
-  const periodoLargo = `${meses[(mes || 1) - 1]} de ${anio}`;
+  // De la segunda cuenta del mes en adelante se dice en el propio documento:
+  // el profesional recibe dos PDF del mismo mes y sin esto parecerían el mismo.
+  const complemento = Number(precuenta.numero) > 1 ? ' · complementaria' : '';
+  const periodoLargo = `${meses[(mes || 1) - 1]} de ${anio}${complemento}`;
 
   // Columnas del detalle: x de inicio y ancho útil para recortar el texto.
   const COLS = [

@@ -3,6 +3,9 @@ import { pool } from '../../config/db.js';
 import { asyncHandler } from '../../utils/asyncHandler.js';
 import { badRequest, conflict, notFound } from '../../utils/httpError.js';
 import { authRequired, requireRole } from '../../middleware/auth.js';
+import {
+  validarNombre, validarCorreo, validarTelefono, validarTextoOpcional, validarValorHora,
+} from '../../utils/personas.js';
 
 const router = Router();
 router.use(authRequired);
@@ -153,15 +156,23 @@ router.get('/:id', asyncHandler(async (req, res) => {
 
 // CFG-01 · Crear (admin)
 router.post('/', requireRole('admin'), asyncHandler(async (req, res) => {
-  const { nombre, telefono, especialidad, valor_hora = 0, estado = 'Activo' } = req.body || {};
-  const correo = req.body?.correo || req.body?.email;
-  if (!nombre || !correo) throw badRequest('nombre y correo son obligatorios');
+  const { estado = 'Activo' } = req.body || {};
   if (!['Activo', 'Inactivo'].includes(estado)) throw badRequest('estado inválido');
+
+  // CFG-01 · Mismo validador que las cuentas de usuario: nombre solo con letras
+  // y en mayúsculas, correo con formato, teléfono solo dígitos. Antes se podía
+  // guardar una ficha con nombre de una letra y un correo sin arroba.
+  const nombre = validarNombre(req.body?.nombre);
+  const correo = validarCorreo(req.body?.correo || req.body?.email);
+  const telefono = validarTelefono(req.body?.telefono);
+  const especialidad = validarTextoOpcional(req.body?.especialidad, 'La especialidad');
+  const valorHora = validarValorHora(req.body?.valor_hora);
+
   await assertContactoDisponible({ correo, telefono });
   const r = await pool.query(
     `INSERT INTO sst.profesionales (nombre, correo, telefono, especialidad, valor_hora, estado)
      VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
-    [nombre, correo, telefono, especialidad, valor_hora, estado]
+    [nombre, correo, telefono, especialidad, valorHora, estado]
   );
   await enlazarCuenta(r.rows[0].id, r.rows[0].correo);
   res.status(201).json({ data: r.rows[0] });
@@ -169,8 +180,20 @@ router.post('/', requireRole('admin'), asyncHandler(async (req, res) => {
 
 // CFG-01 · Editar (admin)
 router.put('/:id', requireRole('admin'), asyncHandler(async (req, res) => {
-  const { nombre, telefono, especialidad, valor_hora, estado } = req.body || {};
-  const correo = req.body?.correo ?? req.body?.email ?? null;
+  const { estado } = req.body || {};
+  if (estado !== undefined && !['Activo', 'Inactivo'].includes(estado)) {
+    throw badRequest('estado inválido');
+  }
+  // PUT parcial: solo se valida lo que venga (el COALESCE de abajo conserva el
+  // resto), así que un campo ausente no puede fallar por "obligatorio".
+  const nombre = req.body?.nombre === undefined ? null : validarNombre(req.body.nombre);
+  const correoBruto = req.body?.correo ?? req.body?.email;
+  const correo = correoBruto === undefined || correoBruto === null ? null : validarCorreo(correoBruto);
+  const telefono = req.body?.telefono === undefined ? null : validarTelefono(req.body.telefono);
+  const especialidad = req.body?.especialidad === undefined
+    ? null
+    : validarTextoOpcional(req.body.especialidad, 'La especialidad');
+  const valorHora = req.body?.valor_hora === undefined ? null : validarValorHora(req.body.valor_hora);
   // Misma regla que en el alta: si no se valida aquí, la restricción se saltaría
   // creando el profesional con otro correo y editándolo después.
   await assertContactoDisponible({ correo, telefono, excluirId: req.params.id });
@@ -183,7 +206,7 @@ router.put('/:id', requireRole('admin'), asyncHandler(async (req, res) => {
        valor_hora = COALESCE($6, valor_hora),
        estado = COALESCE($7, estado)
      WHERE id=$1 RETURNING *`,
-    [req.params.id, nombre, correo, telefono, especialidad, valor_hora, estado]
+    [req.params.id, nombre, correo, telefono, especialidad, valorHora, estado]
   );
   if (!r.rows[0]) throw notFound('Profesional no encontrado');
   // Si cambió el correo, el enlace anterior puede haber dejado de ser cierto:

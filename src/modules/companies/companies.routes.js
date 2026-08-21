@@ -12,7 +12,7 @@ router.use(authRequired);
  * CFG-02 · Maestro de empresas clientes.
  *
  * La lectura queda abierta a cualquier sesión autenticada (contador y auditor la
- * necesitan para leer cartera y pre-cuentas); la escritura es del administrador.
+ * necesitan para leer las cuentas de cobro); la escritura es del administrador.
  */
 
 /** Campos editables desde el formulario, en el orden en que van al UPDATE. */

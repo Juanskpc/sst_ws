@@ -3,6 +3,9 @@ import { pool } from '../../config/db.js';
 import { asyncHandler } from '../../utils/asyncHandler.js';
 import { hashPassword, verifyPassword, signToken } from '../../utils/security.js';
 import { badRequest, unauthorized, notFound, forbidden, conflict } from '../../utils/httpError.js';
+import {
+  validarNombre, validarCorreo, validarTelefono, validarTextoOpcional, validarDocumento,
+} from '../../utils/personas.js';
 import { authRequired, requireMaestro } from '../../middleware/auth.js';
 import { createRateLimiter } from '../../utils/rateLimit.js';
 import { env } from '../../config/env.js';
@@ -13,10 +16,24 @@ import {
 
 const router = Router();
 
+/**
+ * AUTH-04 · Roles del sistema.
+ *
+ * 'administrativo' se llamaba 'profesional' y se renombró (19-ago-2026) porque
+ * se confundía con los PROFESIONALES que hacen las visitas, que no tienen
+ * cuenta: son fichas de `sst.profesionales` y trabajan por enlaces públicos.
+ */
+const ROLES_VALIDOS = ['admin', 'administrativo', 'contador', 'auditor'];
+
 const usuarioPublico = (u) => ({
   id: u.id, documento_identidad: u.documento_identidad, nombre: u.nombre, correo: u.correo,
   rol: u.rol, telefono: u.telefono, especialidad: u.especialidad, activo: u.activo,
   es_maestro: u.es_maestro === true,
+  // ASG-08 · Ficha de profesional de campo enlazada, si la hay. Es lo que decide
+  // si el panel de inicio muestra una agenda propia: la tiene quien SALE a las
+  // visitas, no un rol concreto. Sin esto, el panel se bifurcaba por rol y una
+  // cuenta administrativa veía "no tiene ficha enlazada" sin necesitar ninguna.
+  profesional_id: u.profesional_id ?? null,
 });
 
 /**
@@ -41,7 +58,10 @@ router.post('/login', asyncHandler(async (req, res) => {
   const documento = req.body?.documento || req.body?.documento_identidad;
   if (!documento || !password) throw badRequest('documento y password son obligatorios');
   const r = await pool.query(
-    `SELECT * FROM sst.usuarios WHERE documento_identidad = $1`,
+    // La ficha de profesional enlazada viaja desde el login: el panel de inicio
+    // decide con ella si enseña una agenda propia.
+    `SELECT u.*, (SELECT p.id FROM sst.profesionales p WHERE p.usuario_id = u.id LIMIT 1) AS profesional_id
+       FROM sst.usuarios u WHERE u.documento_identidad = $1`,
     [String(documento).trim()]
   );
   const usuario = r.rows[0];
@@ -77,9 +97,39 @@ router.post('/login', asyncHandler(async (req, res) => {
 
 // AUTH-05 · Perfil del usuario autenticado (+ permisos vigentes de su rol)
 router.get('/me', authRequired, asyncHandler(async (req, res) => {
-  const r = await pool.query(`SELECT * FROM sst.usuarios WHERE id=$1`, [req.user.sub]);
+  const r = await pool.query(
+    `SELECT u.*, (SELECT p.id FROM sst.profesionales p WHERE p.usuario_id = u.id LIMIT 1) AS profesional_id
+       FROM sst.usuarios u WHERE u.id=$1`,
+    [req.user.sub]
+  );
   if (!r.rows[0]) throw notFound('Usuario no encontrado');
   res.json({ usuario: usuarioPublico(r.rows[0]), permisos: await permisosDeSesion(r.rows[0]) });
+}));
+
+/**
+ * AUTH-05 · El usuario corrige SUS datos.
+ *
+ * Solo nombre, teléfono y especialidad: el correo identifica la cuenta —y el
+ * documento es con lo que se inicia sesión—, así que cambiarlos es cosa del
+ * Administrador Maestro. El rol, por lo mismo: nadie se asciende solo.
+ *
+ * Existía el formulario en Configuración pero no el endpoint: el botón
+ * "Guardar cambios" no llamaba a nada y los cambios se perdían al recargar.
+ */
+router.put('/me', authRequired, asyncHandler(async (req, res) => {
+  const nombre = validarNombre(req.body?.nombre);
+  const telefono = validarTelefono(req.body?.telefono);
+  const especialidad = validarTextoOpcional(req.body?.especialidad, 'La especialidad');
+
+  const r = await pool.query(
+    `UPDATE sst.usuarios
+        SET nombre=$2, telefono=$3, especialidad=$4, actualizado_en=now()
+      WHERE id=$1
+      RETURNING *, (SELECT p.id FROM sst.profesionales p WHERE p.usuario_id = sst.usuarios.id LIMIT 1) AS profesional_id`,
+    [req.user.sub, nombre, telefono, especialidad]
+  );
+  if (!r.rows[0]) throw notFound('Usuario no encontrado');
+  res.json({ message: 'Perfil actualizado.', usuario: usuarioPublico(r.rows[0]) });
 }));
 
 // AUTH-03 · Solicitud de recuperación de contraseña por correo.
@@ -141,20 +191,20 @@ router.post('/reset-password', asyncHandler(async (req, res) => {
 
 // AUTH-04 · Alta de usuarios — roles diferenciados
 router.post('/usuarios', authRequired, requireMaestro, asyncHandler(async (req, res) => {
-  const { nombre, rol = 'profesional', telefono, especialidad } = req.body || {};
-  const correo = req.body?.correo || req.body?.email;
-  const documento = req.body?.documento || req.body?.documento_identidad;
-  if (!nombre || !correo || !documento) {
-    throw badRequest('nombre, documento y correo son obligatorios');
-  }
-  if (!['admin', 'profesional', 'contador', 'auditor'].includes(rol)) throw badRequest('Rol inválido');
+  const { rol = 'administrativo' } = req.body || {};
+  if (!ROLES_VALIDOS.includes(rol)) throw badRequest('Rol inválido');
+
+  // M1 · Los datos de la persona pasan por el mismo validador que las fichas de
+  // profesional: nombre solo con letras y en mayúsculas, correo con formato,
+  // teléfono solo dígitos. Antes entraba cualquier cosa.
+  const nombre = validarNombre(req.body?.nombre);
+  const correo = validarCorreo(req.body?.correo || req.body?.email);
+  const telefono = validarTelefono(req.body?.telefono);
+  const especialidad = validarTextoOpcional(req.body?.especialidad, 'La especialidad');
   // Contraseña inicial = la propia cédula (documento). El usuario deberá cambiarla
   // en su primer ingreso: el login detecta que password === documento y lo avisa.
-  const documentoTrim = String(documento).trim();
+  const documentoTrim = validarDocumento(req.body?.documento || req.body?.documento_identidad);
   const documentoClave = claveDocumento(documentoTrim);
-  // Sin esto, un documento de solo espacios o signos ("   ", "--") normalizaría a
-  // cadena vacía y coincidiría con cualquier usuario sin documento registrado.
-  if (!documentoClave) throw badRequest('El documento de identidad debe contener números o letras');
   // El UNIQUE de la columna ya impide el duplicado exacto; esto además atrapa el
   // mismo documento escrito con puntos o espacios ("1.020.304.050") y devuelve a
   // quién pertenece, que es lo que el Maestro necesita saber para resolverlo.
@@ -170,7 +220,7 @@ router.post('/usuarios', authRequired, requireMaestro, asyncHandler(async (req, 
   const r = await pool.query(
     `INSERT INTO sst.usuarios (nombre, correo, documento_identidad, contrasena_hash, rol, telefono, especialidad)
      VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-    [nombre, correo.toLowerCase(), documentoTrim, await hashPassword(documentoTrim), rol, telefono, especialidad]
+    [nombre, correo, documentoTrim, await hashPassword(documentoTrim), rol, telefono, especialidad]
   );
   const creado = r.rows[0];
   await auditar({
@@ -195,9 +245,17 @@ router.put('/usuarios/:id', authRequired, requireMaestro, asyncHandler(async (re
   if (actual.es_maestro && actual.id !== req.user.sub) {
     throw forbidden('La cuenta del Administrador Maestro solo puede editarla el propio maestro');
   }
-  const { nombre, telefono, especialidad, rol } = req.body || {};
-  const correo = req.body?.correo || req.body?.email;
-  if (rol && !['admin', 'profesional', 'contador', 'auditor'].includes(rol)) throw badRequest('Rol inválido');
+  const { rol } = req.body || {};
+  if (rol && !ROLES_VALIDOS.includes(rol)) throw badRequest('Rol inválido');
+  // Solo se valida lo que venga: es un PUT parcial (COALESCE abajo), así que un
+  // campo ausente conserva su valor y no debe fallar por "obligatorio".
+  const nombre = req.body?.nombre === undefined ? null : validarNombre(req.body.nombre);
+  const correoBruto = req.body?.correo ?? req.body?.email;
+  const correo = correoBruto === undefined ? null : validarCorreo(correoBruto);
+  const telefono = req.body?.telefono === undefined ? null : validarTelefono(req.body.telefono);
+  const especialidad = req.body?.especialidad === undefined
+    ? null
+    : validarTextoOpcional(req.body.especialidad, 'La especialidad');
   if (actual.es_maestro && rol && rol !== 'admin') throw badRequest('El Administrador Maestro debe conservar rol admin');
   const r = await pool.query(
     `UPDATE sst.usuarios
@@ -208,7 +266,7 @@ router.put('/usuarios/:id', authRequired, requireMaestro, asyncHandler(async (re
             rol = COALESCE($6, rol),
             actualizado_en = now()
       WHERE id = $1 RETURNING *`,
-    [actual.id, nombre, correo?.toLowerCase(), telefono, especialidad, rol]
+    [actual.id, nombre, correo, telefono, especialidad, rol]
   );
   await auditar({
     usuarioId: req.user.sub, correo: req.user.correo, evento: EVENTOS.USUARIO_ACTUALIZADO, exito: true, req,

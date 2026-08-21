@@ -5,8 +5,8 @@ import { authRequired, requireRole } from '../../middleware/auth.js';
 import { badRequest } from '../../utils/httpError.js';
 import { generatePrecuentaPdf } from '../../services/pdf.service.js';
 import {
-  ESTADOS_PRECUENTA, aniosConTrabajo, enviarPrecuenta, generarPrecuentas, obtenerPrecuenta,
-  resumenPorMes, urlPrecuenta,
+  ESTADOS_PRECUENTA, aniosConTrabajo, avisarCorteDeCobro, enviarPrecuenta, generarPrecuentas,
+  obtenerPrecuenta, resumenPorMes, urlPrecuenta,
 } from './billing.service.js';
 
 const router = Router();
@@ -51,6 +51,10 @@ router.get('/', asyncHandler(async (req, res) => {
  */
 router.get('/resumen', asyncHandler(async (req, res) => {
   const anio = filtro(req.query.anio) ?? String(new Date().getFullYear());
+  // CFG-05 · Lo más parecido a un cron que hay aquí: al abrir la vista se
+  // comprueba si el mes anterior quedó sin cobrar pasado el día de corte y, si
+  // es así, se deja el aviso en la campanita. Es idempotente por periodo.
+  avisarCorteDeCobro().catch(() => {});
   res.json({ data: await resumenPorMes({ anio }) });
 }));
 

@@ -162,6 +162,9 @@ router.post('/support/:token/files', uploadSupports, asyncHandler(async (req, re
         'algo, el equipo administrativo se lo devolverá y este enlace volverá a abrirse.',
       );
     }
+    // Con un rechazo pendiente solo se aceptan las casillas devueltas: lo demás
+    // ya lo dio por bueno el administrador, y volver a recibirlo sería pedirle
+    // que revise otra vez lo que aprobó.
     if (hayRechazo) {
       const fuera = subidas.filter((c) => !rechazados.includes(c));
       if (fuera.length) {
@@ -170,17 +173,24 @@ router.post('/support/:token/files', uploadSupports, asyncHandler(async (req, re
           `${listaEtiquetas(fuera)} ya fue aceptado y no se puede reemplazar.`,
         );
       }
-      // Y va COMPLETA. Aceptar la corrección a medias dejaba la orden en tierra
-      // de nadie: ni cerrada ni devuelta, con el administrador esperando un
-      // documento que nadie le recuerda al profesional que falta. Lo devuelto se
-      // envía junto, en un solo viaje.
-      const faltan = rechazados.filter((c) => !subidas.includes(c));
-      if (faltan.length) {
-        throw badRequest(
-          `Falta adjuntar: ${listaEtiquetas(faltan)}. Los documentos devueltos se envían ` +
-          `todos juntos: adjunte los ${rechazados.length} y vuelva a enviar.`,
-        );
-      }
+    }
+
+    // Y el envío va COMPLETO, tanto en la entrega inicial como en la corrección.
+    //
+    // Aceptar uno de los tres documentos dejaba la orden en tierra de nadie: el
+    // administrador la ve EJECUTADA, la abre para revisar y se encuentra con que
+    // faltan dos, sin nadie a quien reclamárselos porque el enlace ya se cerró.
+    // Se entrega todo de una vez o no se entrega.
+    const requeridas = hayRechazo ? rechazados : CATEGORIAS_SOPORTE.map((c) => c.clave);
+    const faltan = requeridas.filter((c) => !subidas.includes(c));
+    if (faltan.length) {
+      throw badRequest(
+        hayRechazo
+          ? `Falta adjuntar: ${listaEtiquetas(faltan)}. Los documentos devueltos se envían ` +
+            `todos juntos: adjunte los ${requeridas.length} y vuelva a enviar.`
+          : `Falta adjuntar: ${listaEtiquetas(faltan)}. Los ${requeridas.length} documentos de la ` +
+            'visita se envían juntos, en un solo envío.',
+      );
     }
 
     // El anterior se va en cuanto llega el nuevo, SIEMPRE: cada casilla guarda

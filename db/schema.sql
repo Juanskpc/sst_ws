@@ -19,8 +19,24 @@ SET search_path TO sst, public;
 -- TIPOS ENUMERADOS
 -- -----------------------------------------------------------------------------
 DO $$ BEGIN
-  CREATE TYPE sst.rol_usuario AS ENUM ('admin', 'profesional', 'contador', 'auditor');
+  CREATE TYPE sst.rol_usuario AS ENUM ('admin', 'administrativo', 'contador', 'auditor');
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+-- AUTH-04 · 'profesional' pasó a llamarse 'administrativo' (19-ago-2026).
+--
+-- Se confundía con los PROFESIONALES que hacen las visitas, que no tienen
+-- cuenta: son fichas de `sst.profesionales` y trabajan por enlaces públicos.
+-- Este rol es personal interno de JD&D cuyo acceso lo define la matriz de
+-- permisos, nada más. Se renombra el valor del enum en vez de crear otro: así
+-- las cuentas y las filas de `permisos_rol` que ya existían siguen valiendo.
+DO $$ BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid
+     WHERE t.typname = 'rol_usuario' AND e.enumlabel = 'profesional'
+  ) THEN
+    ALTER TYPE sst.rol_usuario RENAME VALUE 'profesional' TO 'administrativo';
+  END IF;
+END $$;
 
 DO $$ BEGIN
   CREATE TYPE sst.estado_profesional AS ENUM ('Activo', 'Inactivo');
@@ -80,7 +96,7 @@ CREATE TABLE IF NOT EXISTS sst.usuarios (
   nombre                   TEXT NOT NULL,
   correo                   TEXT NOT NULL UNIQUE,
   contrasena_hash          TEXT NOT NULL,
-  rol                      sst.rol_usuario NOT NULL DEFAULT 'profesional',
+  rol                      sst.rol_usuario NOT NULL DEFAULT 'administrativo',
   telefono                 TEXT,
   especialidad             TEXT,
   activo                   BOOLEAN NOT NULL DEFAULT TRUE,
@@ -144,6 +160,9 @@ CREATE TABLE IF NOT EXISTS sst.eventos_autenticacion (
 );
 CREATE INDEX IF NOT EXISTS idx_eventos_aut_usuario ON sst.eventos_autenticacion(usuario_id);
 CREATE INDEX IF NOT EXISTS idx_eventos_aut_evento  ON sst.eventos_autenticacion(evento, creado_en);
+
+-- El DEFAULT de la columna no lo cambia el CREATE TABLE en una BD que ya existe.
+ALTER TABLE sst.usuarios ALTER COLUMN rol SET DEFAULT 'administrativo';
 
 -- Roles y permisos · matriz de acceso por vista (rol × vista → permitido) ------
 -- Vistas = ítems del sidebar: dashboard | importar | ordenes | informes |
@@ -510,7 +529,7 @@ CREATE INDEX IF NOT EXISTS idx_ocupaciones_fecha ON sst.ocupaciones_profesional(
 --
 -- `ordenes_servicio.fecha_programada` solo sabe de UN instante, y una visita
 -- real se parte: mañana y tarde, o varios días. Esa columna se conserva (la usan
--- los reportes, la cartera, el periodo de la pre-cuenta y el orden del listado)
+-- los reportes, el periodo de la cuenta de cobro y el orden del listado)
 -- y queda igual al INICIO de la primera franja; el detalle vive aquí.
 -- Una OS sin franjas es una OS a la antigua: se lee su fecha_programada y ya.
 CREATE TABLE IF NOT EXISTS sst.franjas_visita (
@@ -619,15 +638,20 @@ CREATE TABLE IF NOT EXISTS sst.configuracion (
   actualizado_en TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- RPT-06 · Cartera. Que una OS ejecutada esté facturada, o validada por la ARL,
--- es información EXTERNA: no se deduce de ningún estado del sistema, así que se
--- marca explícitamente. Nulo = pendiente, que es justo lo que lista el reporte.
-ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS facturado_en      TIMESTAMPTZ;
-ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS validado_arl_en   TIMESTAMPTZ;
-ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS cartera_marcada_por UUID REFERENCES sst.usuarios(id) ON DELETE SET NULL;
-
-CREATE INDEX IF NOT EXISTS idx_ordenes_cartera
-  ON sst.ordenes_servicio(estado, facturado_en, validado_arl_en);
+-- RPT-06 · Cartera: RETIRADA (19-ago-2026, a pedido del cliente).
+--
+-- Era la pestaña que marcaba a mano si una OS ejecutada estaba facturada y
+-- validada por la ARL. Se elimina entera —pestaña, endpoints, vista y las tres
+-- columnas—; ninguna llegó a tener datos. Las bajadas se dejan escritas para que
+-- `npm run migrate` limpie también las bases que ya existían.
+DROP VIEW IF EXISTS sst.vw_cartera;
+-- `vw_ordenes_expandidas` es `SELECT o.*`, así que también depende de estas
+-- columnas. Se suelta aquí y se vuelve a crear más abajo, ya sin ellas.
+DROP VIEW IF EXISTS sst.vw_ordenes_expandidas CASCADE;
+DROP INDEX IF EXISTS sst.idx_ordenes_cartera;
+ALTER TABLE sst.ordenes_servicio DROP COLUMN IF EXISTS facturado_en;
+ALTER TABLE sst.ordenes_servicio DROP COLUMN IF EXISTS validado_arl_en;
+ALTER TABLE sst.ordenes_servicio DROP COLUMN IF EXISTS cartera_marcada_por;
 
 -- ASG-05 · Revisión de la invitación de calendario de la visita.
 -- El .ics que se adjunta al correo de asignación lleva un UID fijo por orden,
@@ -753,8 +777,17 @@ ALTER TABLE sst.precuentas ADD COLUMN IF NOT EXISTS actualizado_en TIMESTAMPTZ N
 
 -- Una sola pre-cuenta por profesional y periodo: regenerar actualiza la que ya
 -- existe en lugar de duplicar el cobro del mes.
-CREATE UNIQUE INDEX IF NOT EXISTS uq_precuenta_prof_periodo
+-- PRE-01 · Puede haber MÁS DE UNA cuenta por profesional y mes.
+--
+-- Antes había un índice único (profesional_id, periodo) y con él una orden
+-- finalizada tarde no tenía dónde ir: la cuenta del mes ya estaba cerrada y no
+-- se podía emitir otra. Es el mismo caso de una factura: la aceptada no se
+-- toca, se emite una complementaria. El índice se elimina y la vista numera las
+-- cuentas del mes para poder decirlo en pantalla.
+DROP INDEX IF EXISTS sst.uq_precuenta_prof_periodo;
+CREATE INDEX IF NOT EXISTS idx_precuenta_prof_periodo
   ON sst.precuentas(profesional_id, periodo);
+
 CREATE INDEX IF NOT EXISTS idx_precuentas_periodo ON sst.precuentas(periodo);
 
 -- PRE-03 · Datos de la OS congelados en el ítem: el documento que el
@@ -950,7 +983,7 @@ SELECT
   count(*) FILTER (WHERE estado = 'EJECUTADA')               AS ejecutadas,
   count(*) FILTER (WHERE estado = 'FINALIZADA')              AS finalizadas,
   -- RPT-01 pide "ejecutadas EN EL MES": el acumulado histórico se conserva
-  -- arriba porque lo usan los porcentajes por ARL y la cartera.
+  -- arriba porque lo usan los porcentajes por ARL.
   count(*) FILTER (
     WHERE estado IN ('EJECUTADA','FINALIZADA')
       AND date_trunc('month', COALESCE(fecha_ejecucion, actualizado_en)) = date_trunc('month', now())
@@ -1188,19 +1221,26 @@ LEFT JOIN sst.profesionales p ON p.id = o.profesional_asignado_id
 LEFT JOIN sst.tipos_orden tp  ON tp.id = o.tipo_orden_id
 WHERE o.estado IN ('EJECUTADA','FINALIZADA') AND o.profesional_asignado_id IS NOT NULL;
 
--- ⭐ PRE-01 · Lo que de verdad se le puede cobrar a JD&D por un profesional.
+-- ⭐ PRE-01 · Lo que de verdad está PENDIENTE de cobrar por un profesional.
 --
--- Es `vw_horas_ejecutadas` más UNA condición: los soportes tienen que estar
--- aceptados. Que la OS esté EJECUTADA significa que el profesional subió los
--- archivos; que se le pueda pagar significa que un administrador los revisó y
--- los dio por buenos.
+-- Es `vw_horas_ejecutadas` más DOS condiciones:
 --
--- Va en una vista aparte y no como filtro de la anterior a propósito: los
--- informes de horas (RPT-05) miden trabajo EJECUTADO, y colarles aquí la
--- revisión les cambiaría la cifra sin que nadie lo pidiera.
+--  1. los soportes tienen que estar aceptados. Que la OS esté EJECUTADA
+--     significa que el profesional subió los archivos; que se le pueda pagar
+--     significa que un administrador los revisó y los dio por buenos;
+--  2. la orden no puede estar ya dentro de una cuenta de cobro. Sin esto, una
+--     orden facturada seguía apareciendo como pendiente para siempre, y —peor—
+--     el trabajo que se finalizaba DESPUÉS de cerrar la cuenta del mes quedaba
+--     absorbido por la fila de esa cuenta y no se veía en ninguna parte.
+--
+-- Va en una vista aparte y no como filtro de `vw_horas_ejecutadas` a propósito:
+-- los informes de horas (RPT-05) miden trabajo EJECUTADO, y colarles aquí la
+-- facturación les cambiaría la cifra sin que nadie lo pidiera.
 DROP VIEW IF EXISTS sst.vw_horas_por_cobrar;
 CREATE VIEW sst.vw_horas_por_cobrar AS
-SELECT * FROM sst.vw_horas_ejecutadas WHERE soportes_aceptados_en IS NOT NULL;
+SELECT h.* FROM sst.vw_horas_ejecutadas h
+ WHERE h.soportes_aceptados_en IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sst.precuenta_items i WHERE i.orden_id = h.orden_id);
 
 -- RPT-03 · Órdenes vencidas: llevan demasiado tiempo sin ejecutarse.
 --
@@ -1232,39 +1272,16 @@ JOIN sst.arls a               ON a.id = o.arl_id
 LEFT JOIN sst.profesionales p ON p.id = o.profesional_asignado_id
 WHERE o.estado NOT IN ('EJECUTADA', 'FINALIZADA', 'CANCELADA');
 
--- RPT-06 · Cartera: ejecutadas que siguen sin facturar o sin validar la ARL.
-DROP VIEW IF EXISTS sst.vw_cartera;
-CREATE VIEW sst.vw_cartera AS
-SELECT o.id,
-       o.codigo,
-       o.empresa_nombre,
-       o.nit_nic,
-       o.arl_id,
-       a.nombre AS arl_nombre,
-       o.profesional_asignado_id AS profesional_id,
-       p.nombre AS profesional_nombre,
-       o.horas_asignadas,
-       o.valor_total,
-       COALESCE(o.fecha_programada, o.actualizado_en)::date AS fecha_ejecucion,
-       (CURRENT_DATE - COALESCE(o.fecha_programada, o.actualizado_en)::date)::int AS dias_desde_ejecucion,
-       o.facturado_en,
-       o.validado_arl_en,
-       -- Etiqueta única para agrupar y para pintar la fila.
-       CASE WHEN o.facturado_en IS NULL AND o.validado_arl_en IS NULL THEN 'sin_facturar_ni_validar'
-            WHEN o.facturado_en IS NULL                               THEN 'sin_facturar'
-            ELSE 'sin_validar_arl' END AS pendiente
-FROM sst.ordenes_servicio o
-JOIN sst.arls a               ON a.id = o.arl_id
-LEFT JOIN sst.profesionales p ON p.id = o.profesional_asignado_id
-WHERE o.estado IN ('EJECUTADA','FINALIZADA')
-  AND (o.facturado_en IS NULL OR o.validado_arl_en IS NULL);
-
 -- PRE-08 · Pre-cuentas con los datos del profesional ya resueltos.
 DROP VIEW IF EXISTS sst.vw_precuentas;
 CREATE VIEW sst.vw_precuentas AS
 SELECT pc.*,
        p.nombre  AS profesional_nombre,
        p.correo  AS profesional_correo,
+       -- Cuál es dentro de su mes: la 2 en adelante son complementarias
+       -- (trabajo que se finalizó después de cerrar la primera).
+       row_number() OVER (PARTITION BY pc.profesional_id, pc.periodo ORDER BY pc.creado_en)::int AS numero,
+       count(*)    OVER (PARTITION BY pc.profesional_id, pc.periodo)::int                        AS del_mes,
        (SELECT count(*)::int FROM sst.precuenta_items i WHERE i.precuenta_id = pc.id) AS total_ordenes
 FROM sst.precuentas pc
 JOIN sst.profesionales p ON p.id = pc.profesional_id;

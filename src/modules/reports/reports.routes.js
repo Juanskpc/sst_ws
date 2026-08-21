@@ -6,6 +6,7 @@ import { authRequired } from '../../middleware/auth.js';
 import { badRequest, notFound } from '../../utils/httpError.js';
 import { getOrderExpanded } from '../orders/orders.service.js';
 import { executiveSummary, interpretSearch } from '../../services/gemini.service.js';
+import { avisarCorteDeCobro } from '../billing/billing.service.js';
 
 const router = Router();
 router.use(authRequired);
@@ -30,6 +31,10 @@ function aCelda(v) {
 
 // RPT-01/02 · KPIs del dashboard + distribución por ARL.
 router.get('/dashboard', asyncHandler(async (_req, res) => {
+  // CFG-05 · Sin tareas programadas, el aviso del día de corte se materializa
+  // al abrir una pantalla. Esta la abre todo el mundo al entrar, así que es
+  // donde antes se enteran de que el mes anterior quedó sin cobrar.
+  avisarCorteDeCobro().catch(() => {});
   const [kpis, byArl, monthly] = await Promise.all([
     pool.query(`SELECT * FROM sst.vw_kpis_dashboard`),
     pool.query(`SELECT * FROM sst.vw_ordenes_por_arl`),
@@ -159,30 +164,6 @@ router.get('/horas', asyncHandler(async (req, res) => {
       por_mes: porMes.rows,
     },
   });
-}));
-
-/** RPT-06 · Cartera: ejecutadas sin facturar y/o sin validación de la ARL. */
-router.get('/cartera', asyncHandler(async (req, res) => {
-  const clauses = [];
-  const params = [];
-  if (req.query.arl_id) { params.push(req.query.arl_id); clauses.push(`arl_id = $${params.length}`); }
-  if (req.query.pendiente) { params.push(req.query.pendiente); clauses.push(`pendiente = $${params.length}`); }
-  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
-
-  const [filas, resumen, porArl] = await Promise.all([
-    pool.query(`SELECT * FROM sst.vw_cartera ${where} ORDER BY dias_desde_ejecucion DESC LIMIT 1000`, params),
-    pool.query(
-      `SELECT count(*)::int AS total,
-              count(*) FILTER (WHERE facturado_en IS NULL)::int    AS sin_facturar,
-              count(*) FILTER (WHERE validado_arl_en IS NULL)::int AS sin_validar,
-              coalesce(sum(valor_total), 0)::numeric               AS monto,
-              coalesce(max(dias_desde_ejecucion), 0)::int          AS max_dias
-         FROM sst.vw_cartera ${where}`, params),
-    pool.query(
-      `SELECT arl_nombre, count(*)::int AS total, coalesce(sum(valor_total),0)::numeric AS monto
-         FROM sst.vw_cartera ${where} GROUP BY 1 ORDER BY total DESC`, params),
-  ]);
-  res.json({ data: { resumen: resumen.rows[0], por_arl: porArl.rows, ordenes: filas.rows } });
 }));
 
 /**

@@ -457,7 +457,7 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
 
   // ASG-02 · La visita puede venir partida en franjas (mañana y tarde, o varios
   // días). `fecha_programada` sigue siendo el INICIO de la primera: de ella
-  // cuelgan el periodo de la pre-cuenta, la cartera, los reportes y el orden de
+  // cuelgan el periodo de la cuenta de cobro, los reportes y el orden de
   // los listados, así que se deriva aquí en vez de confiar en el cliente.
   const franjas = normalizarFranjas(req.body?.franjas);
   const fechaProgramada = franjas.length
@@ -785,32 +785,6 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
       franjas: result.franjas,
     },
   });
-}));
-
-/**
- * RPT-06 · Marca (o desmarca) la facturación y la validación de la ARL.
- *
- * Es un dato que entra de afuera —lo confirma quien factura o quien habla con
- * la ARL—, así que se registra a mano. Ambos campos son opcionales: se actualiza
- * solo el que venga en el cuerpo, para poder marcar uno sin pisar el otro.
- */
-router.patch('/:id/cartera', requireRole('admin', 'contador'), asyncHandler(async (req, res) => {
-  const { facturado, validado_arl: validadoArl } = req.body || {};
-  if (facturado === undefined && validadoArl === undefined) {
-    throw badRequest('Indique "facturado" y/o "validado_arl" (true o false)');
-  }
-  const sets = ['cartera_marcada_por = $2'];
-  const params = [req.params.id, req.user.sub];
-  if (facturado !== undefined) sets.push(`facturado_en = ${facturado ? 'now()' : 'NULL'}`);
-  if (validadoArl !== undefined) sets.push(`validado_arl_en = ${validadoArl ? 'now()' : 'NULL'}`);
-
-  const r = await pool.query(
-    `UPDATE sst.ordenes_servicio SET ${sets.join(', ')} WHERE id=$1
-     RETURNING id, codigo, facturado_en, validado_arl_en`,
-    params
-  );
-  if (!r.rows[0]) throw badRequest('OS no encontrada');
-  res.json({ data: r.rows[0] });
 }));
 
 // M4 · (Re)generar formatos manualmente

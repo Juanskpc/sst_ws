@@ -107,8 +107,10 @@ export async function resumenPorMes({ anio, client = pool }) {
   const cuentas = await client.query(
     `SELECT * FROM sst.vw_precuentas WHERE periodo LIKE $1`, [`${y}-%`]
   );
-  const porClave = new Map(cuentas.rows.map((c) => [`${c.periodo}|${c.profesional_id}`, c]));
 
+  // Trabajo PENDIENTE agrupado por profesional y mes. La vista ya excluye lo
+  // que está dentro de una cuenta, así que aquí solo queda lo que nadie ha
+  // cobrado todavía.
   const grupos = new Map();
   for (const o of trabajo.rows) {
     const clave = `${o.periodo}|${o.profesional_id}`;
@@ -142,25 +144,120 @@ export async function resumenPorMes({ anio, client = pool }) {
     if (!(valorHora > 0)) g.ordenes_sin_tarifa += 1;
   }
 
-  const filas = [...grupos.values()].map((g) => {
-    const cuenta = porClave.get(`${g.periodo}|${g.profesional_id}`);
-    return {
+  // Las CUENTAS ya creadas y el trabajo PENDIENTE son filas distintas, aunque
+  // caigan en el mismo profesional y mes.
+  //
+  // Antes se fundían en una sola: si existía cuenta, mandaban sus cifras
+  // congeladas y el trabajo finalizado después quedaba tapado — una cuenta
+  // aceptada en agosto escondía las siete órdenes que se cerraron esa misma
+  // semana. Separadas, la cuenta se lee como lo que es (un acuerdo cerrado) y lo
+  // nuevo se ve como lo que es (dinero por cobrar), y se le puede emitir una
+  // cuenta complementaria.
+  const filas = [
+    ...cuentas.rows.map((c) => ({
+      periodo: c.periodo,
+      profesional_id: c.profesional_id,
+      profesional_nombre: c.profesional_nombre,
+      total_horas: Number(c.total_horas),
+      total_monto: Number(c.total_monto),
+      total_ordenes: c.total_ordenes,
+      ordenes_sin_tarifa: 0,
+      precuenta_id: c.id,
+      estado: c.estado,
+      enviado_en: c.enviado_en ?? null,
+      respondido_en: c.respondido_en ?? null,
+      observaciones: c.observaciones ?? null,
+      // Cuál es dentro de su mes: de la 2 en adelante son complementarias.
+      numero: c.numero,
+      del_mes: c.del_mes,
+    })),
+    ...[...grupos.values()].map((g) => ({
       ...g,
-      // Con cuenta ya creada mandan sus cifras: son las que se le enviaron.
-      total_horas: cuenta ? Number(cuenta.total_horas) : g.total_horas,
-      total_monto: cuenta ? Number(cuenta.total_monto) : g.total_monto,
-      total_ordenes: cuenta ? cuenta.total_ordenes : g.total_ordenes,
-      precuenta_id: cuenta?.id ?? null,
-      estado: cuenta?.estado ?? null,
-      enviado_en: cuenta?.enviado_en ?? null,
-      respondido_en: cuenta?.respondido_en ?? null,
-      observaciones: cuenta?.observaciones ?? null,
-    };
-  });
+      precuenta_id: null,
+      estado: null,
+      enviado_en: null,
+      respondido_en: null,
+      observaciones: null,
+      numero: null,
+      // Si ya hay cuentas de ese mes, esto es un complemento por generar.
+      del_mes: cuentas.rows.filter(
+        (c) => c.periodo === g.periodo && c.profesional_id === g.profesional_id,
+      ).length,
+    })),
+  ];
 
   filas.sort((a, b) =>
-    b.periodo.localeCompare(a.periodo) || a.profesional_nombre.localeCompare(b.profesional_nombre));
+    b.periodo.localeCompare(a.periodo)
+    || a.profesional_nombre.localeCompare(b.profesional_nombre)
+    // Dentro del mismo profesional y mes: primero lo que falta por cobrar.
+    || (a.precuenta_id === null ? -1 : 1));
   return filas;
+}
+
+/**
+ * CFG-05 · Aviso del día de corte.
+ *
+ * El día de corte es una fecha del mes —del 1 al 28— y no dispara nada por su
+ * cuenta: el despliegue no tiene tareas programadas. Lo que hace es esto:
+ * pasado ese día, si el MES ANTERIOR todavía tiene trabajo sin cobrar, se le
+ * avisa por la campanita a quien puede resolverlo (administradores y
+ * contadores). Nada más — no genera cuentas ni manda correos.
+ *
+ * Se comprueba al abrir Cuentas de cobro y al entrar al panel de inicio, que es
+ * lo más parecido a un cron que hay aquí. El aviso se crea UNA vez por periodo y
+ * usuario: la condición se cumple todos los días hasta que alguien cobre, y sin
+ * la deduplicación la campanita se llenaría del mismo aviso.
+ *
+ * Nunca lanza: es un efecto secundario de abrir una pantalla, no la operación
+ * que el usuario pidió.
+ */
+export async function avisarCorteDeCobro(client = pool) {
+  try {
+    const cfg = await client.query(
+      `SELECT valor FROM sst.configuracion WHERE clave='precuenta_dia_corte'`
+    );
+    const dia = Number(cfg.rows[0]?.valor) || 5;
+    const hoy = new Date();
+    if (hoy.getDate() < dia) return { avisado: false, motivo: 'Todavía no llega el día de corte.' };
+
+    // El mes anterior al de hoy, en formato AAAA-MM.
+    const anterior = new Date(hoy.getFullYear(), hoy.getMonth() - 1, 1);
+    const periodo = `${anterior.getFullYear()}-${String(anterior.getMonth() + 1).padStart(2, '0')}`;
+
+    const pendiente = await client.query(
+      `SELECT count(*)::int AS ordenes,
+              count(DISTINCT profesional_id)::int AS profesionales,
+              coalesce(sum(round(horas * coalesce(valor_hora_cobro, 0))), 0)::bigint AS monto
+         FROM sst.vw_horas_por_cobrar WHERE periodo = $1`,
+      [periodo]
+    );
+    const p = pendiente.rows[0];
+    if (!p || p.ordenes === 0) return { avisado: false, motivo: `${periodo} no tiene trabajo sin cobrar.` };
+
+    const r = await client.query(
+      `INSERT INTO sst.notificaciones (usuario_id, tipo, titulo, mensaje, datos)
+       SELECT u.id, 'CORTE_COBRO',
+              'Cuentas de cobro pendientes',
+              $2, jsonb_build_object('periodo', $1::text)
+         FROM sst.usuarios u
+        WHERE u.activo AND u.rol IN ('admin','contador')
+          AND NOT EXISTS (
+            SELECT 1 FROM sst.notificaciones n
+             WHERE n.usuario_id = u.id AND n.tipo = 'CORTE_COBRO'
+               AND n.datos->>'periodo' = $1::text
+          )
+       RETURNING id`,
+      [
+        periodo,
+        `${periodoLargo(periodo)}: quedan ${p.ordenes} orden(es) de ${p.profesionales} ` +
+        `profesional(es) sin cuenta de cobro, por ${enPesos(p.monto)}.`,
+      ]
+    );
+    return { avisado: r.rowCount > 0, periodo, avisos: r.rowCount, pendiente: p };
+  } catch (e) {
+    console.error('[corte] no se pudo generar el aviso:', e?.message);
+    return { avisado: false, motivo: e?.message };
+  }
 }
 
 /** Años en los que hay trabajo por cobrar, para el selector de la vista. */
@@ -174,12 +271,17 @@ export async function aniosConTrabajo(client = pool) {
 }
 
 /**
- * PRE-01 · Genera (o recalcula) las pre-cuentas de un periodo.
+ * PRE-01 · Genera (o recalcula) las cuentas de cobro de un periodo.
  *
- * Idempotente: una pre-cuenta por profesional y periodo. Volver a generar
- * recalcula las que siguen abiertas —útil si se cerró una OS tarde o se corrigió
- * una tarifa— pero NO toca las que el profesional ya aceptó o rechazó: esas son
- * un acuerdo cerrado y se informan como omitidas.
+ * Solo entra el trabajo que **todavía no está en ninguna cuenta**: la vista
+ * `vw_horas_por_cobrar` ya excluye lo facturado.
+ *
+ * Si la cuenta del mes sigue ABIERTA (generada o enviada), se recalcula sobre
+ * ella —útil si se cerró una OS tarde o se corrigió una tarifa—. Si ya está
+ * cerrada (aceptada o rechazada), NO se toca: es un acuerdo cerrado y lo nuevo
+ * se emite como cuenta **complementaria** del mismo mes, igual que una factura
+ * complementaria. Antes esto era imposible —había un índice único por
+ * profesional y periodo— y el trabajo finalizado tarde se quedaba sin cobrar.
  *
  * `profesionalId` opcional restringe la generación a uno solo.
  */
@@ -193,13 +295,27 @@ export async function generarPrecuentas({ periodo, profesionalId = null, userId 
     filtroProf = ` AND h.profesional_id = $${params.length}`;
   }
 
-  // Las OS del mes con los soportes ya aceptados, con lo necesario para
-  // valorarlas. `profesional_nombre` ya viene en la vista.
+  // Las OS del mes con los soportes aceptados y todavía sin cobrar… más las que
+  // ya están dentro de una cuenta ABIERTA de este mismo periodo: recalcular una
+  // cuenta abierta tiene que volver a incluir lo que ya contenía, o la dejaría
+  // vacía. Lo que está en una cuenta CERRADA no vuelve a entrar nunca.
+  params.push(periodo);
+  const iPeriodo = params.length;
   const trabajo = await pool.query(
     `SELECT h.*, p.valor_hora AS valor_hora_base
-       FROM sst.vw_horas_por_cobrar h
+       FROM sst.vw_horas_ejecutadas h
        JOIN sst.profesionales p ON p.id = h.profesional_id
-      WHERE h.fecha_ejecucion BETWEEN $1::date AND $2::date${filtroProf}
+      WHERE h.soportes_aceptados_en IS NOT NULL
+        AND h.fecha_ejecucion BETWEEN $1::date AND $2::date${filtroProf}
+        AND NOT EXISTS (
+          SELECT 1
+            FROM sst.precuenta_items i
+            JOIN sst.precuentas pc ON pc.id = i.precuenta_id
+           WHERE i.orden_id = h.orden_id
+             AND NOT (pc.periodo = $${iPeriodo}
+                      AND pc.profesional_id = h.profesional_id
+                      AND pc.estado NOT IN ('aceptada','rechazada'))
+        )
       ORDER BY h.profesional_id, h.fecha_ejecucion`,
     params
   );
@@ -217,20 +333,13 @@ export async function generarPrecuentas({ periodo, profesionalId = null, userId 
 
   for (const [profId, ordenes] of porProfesional) {
     const existente = (await pool.query(
-      `SELECT id, estado FROM sst.precuentas WHERE profesional_id=$1 AND periodo=$2`,
+      // La ABIERTA, si la hay: es la única que se puede recalcular. Las cerradas
+      // se quedan como están y lo nuevo irá a una cuenta complementaria.
+      `SELECT id, estado FROM sst.precuentas
+        WHERE profesional_id=$1 AND periodo=$2 AND estado NOT IN ('aceptada','rechazada')
+        ORDER BY creado_en DESC LIMIT 1`,
       [profId, periodo]
     )).rows[0];
-
-    if (existente && CERRADAS.includes(existente.estado)) {
-      omitidas.push({
-        precuenta_id: existente.id,
-        profesional_id: profId,
-        profesional_nombre: ordenes[0].profesional_nombre,
-        estado: existente.estado,
-        motivo: `Ya fue ${existente.estado} por el profesional`,
-      });
-      continue;
-    }
 
     // Valora cada orden ANTES de abrir la transacción (son consultas de lectura).
     const items = [];
@@ -285,15 +394,22 @@ export async function generarPrecuentas({ periodo, profesionalId = null, userId 
     }
 
     const precuenta = await withTransaction(async (client) => {
-      const pc = (await client.query(
-        `INSERT INTO sst.precuentas (profesional_id, periodo, total_horas, total_monto, estado, token, generado_por)
-         VALUES ($1,$2,$3,$4,'generada',$5,$6)
-         ON CONFLICT (profesional_id, periodo) DO UPDATE
-           SET total_horas=EXCLUDED.total_horas, total_monto=EXCLUDED.total_monto,
-               estado='generada', generado_por=EXCLUDED.generado_por, actualizado_en=now()
-         RETURNING *`,
-        [profId, periodo, totalHoras, totalMonto, randomToken(24), userId]
-      )).rows[0];
+      // Sobre la abierta se recalcula; si no hay, nace una nueva (que puede ser
+      // la segunda del mes: la complementaria).
+      const pc = existente
+        ? (await client.query(
+            `UPDATE sst.precuentas
+                SET total_horas=$2, total_monto=$3, estado='generada',
+                    generado_por=$4, actualizado_en=now()
+              WHERE id=$1 RETURNING *`,
+            [existente.id, totalHoras, totalMonto, userId]
+          )).rows[0]
+        : (await client.query(
+            `INSERT INTO sst.precuentas
+               (profesional_id, periodo, total_horas, total_monto, estado, token, generado_por)
+             VALUES ($1,$2,$3,$4,'generada',$5,$6) RETURNING *`,
+            [profId, periodo, totalHoras, totalMonto, randomToken(24), userId]
+          )).rows[0];
 
       // Los ítems se reemplazan completos: recalcular es rehacer el detalle.
       await client.query(`DELETE FROM sst.precuenta_items WHERE precuenta_id=$1`, [pc.id]);
@@ -411,7 +527,7 @@ export async function enviarPrecuenta(id) {
 
     await sendEmail({
       to: pc.profesional_correo,
-      subject: `Cuenta de cobro · ${mes} — JD&D Consultores`,
+      subject: `Cuenta de cobro · ${mes}${pc.numero > 1 ? ' (complementaria)' : ''} — JD&D Consultores`,
       // La versión en texto se conserva íntegra: es lo que ve quien lee en texto
       // plano y lo que queda en el log del driver 'console'.
       text:

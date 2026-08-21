@@ -5,7 +5,7 @@ import { authRequired, requireMaestro } from '../../middleware/auth.js';
 import { badRequest } from '../../utils/httpError.js';
 import { VISTAS_SISTEMA } from '../auth/auth.service.js';
 
-const ROLES = ['admin', 'profesional', 'contador', 'auditor'];
+const ROLES = ['admin', 'administrativo', 'contador', 'auditor'];
 
 const router = Router();
 // La matriz de accesos es competencia exclusiva del Administrador Maestro: un
