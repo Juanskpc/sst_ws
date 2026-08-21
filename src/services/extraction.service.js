@@ -215,14 +215,42 @@ function textoDeCelda(cell) {
   return String(raw).trim();
 }
 
-/** "Hora Programada" llega como fecha de Excel (1899-12-30T08:00Z) → "08:00". */
+/**
+ * Excel no tiene un tipo "hora": guarda las horas sueltas como una fecha en su
+ * día cero, el 30-dic-1899, con el formato `h:mm`. Por eso "Hora Programada" y
+ * "Hora Ejecutada" llegan aquí como `1899-12-30T08:00Z` en vez de como 08:00.
+ */
+const DIA_CERO_EXCEL = '1899-12-30';
+
+/** ¿La celda es una hora del día y no una fecha? */
+function esHoraSuelta(valor, numFmt) {
+  if (!(valor instanceof Date)) return false;
+  if (valor.toISOString().slice(0, 10) === DIA_CERO_EXCEL) return true;
+  // Red de seguridad para hojas guardadas con el sistema de fechas de 1904: se
+  // mira el formato, que en una hora lleva horas y no lleva día ni año.
+  const fmt = String(numFmt ?? '');
+  return /h/i.test(fmt) && !/[yd]/i.test(fmt);
+}
+
+/** `1899-12-30T08:00Z` → "08:00". */
+function horaTexto(valor) {
+  const hh = String(valor.getUTCHours()).padStart(2, '0');
+  const mm = String(valor.getUTCMinutes()).padStart(2, '0');
+  return `${hh}:${mm}`;
+}
+
+/**
+ * "Hora Programada" → "08:00". Es la hora a la que empieza la visita, NO su
+ * duración: las horas de la orden salen de "Act Programadas" y solo cuando la
+ * unidad de medida son HORAS.
+ */
 function horaDeCelda(row, col) {
   if (!col) return null;
-  const raw = row.getCell(col).value;
-  if (raw instanceof Date) {
-    const hh = String(raw.getUTCHours()).padStart(2, '0');
-    const mm = String(raw.getUTCMinutes()).padStart(2, '0');
-    return hh === '00' && mm === '00' ? null : `${hh}:${mm}`;
+  const cell = row.getCell(col);
+  const raw = cell.value;
+  if (esHoraSuelta(raw, cell.numFmt)) {
+    const hora = horaTexto(raw);
+    return hora === '00:00' ? null : hora;   // 00:00 = casilla sin diligenciar
   }
   const s = String(raw ?? '').trim();
   return /^\d{1,2}:\d{2}/.test(s) ? s : null;
@@ -319,11 +347,16 @@ export async function parseExcelSipab(buffer) {
 
     // 5) "Act Programadas" son horas solo si la unidad de medida son HORAS. En
     //    UNIDADES (una investigación de accidente, por ejemplo) el número es una
-    //    cantidad de actividades, así que se marca para revisión en vez de darlo
-    //    por bueno como si fueran horas.
+    //    cantidad de actividades: un "1" que NO significa una hora. El SIPAB
+    //    tampoco las trae en otra columna —"Hora Programada" es la hora de
+    //    inicio de la visita (08:00), no una duración—, así que el campo se deja
+    //    VACÍO para que lo diligencie quien revisa. Dejarlo con el número de
+    //    actividades marcado en amarillo hacía que una orden de una investigación
+    //    de accidente entrara a Órdenes como si fuera de una sola hora.
     const unidad = celda(row, auxMap.unidad_medida);
     if (fields.horas_asignadas.value && unidad && !/hora/i.test(unidad)) {
-      fields.horas_asignadas.confidence = 60;
+      fields.horas_asignadas.value = '';
+      fields.horas_asignadas.confidence = 0;
     }
 
     // Fila válida solo si trae al menos cronograma o secuencia.
@@ -375,6 +408,14 @@ export async function readSheetPreview(buffer, { maxRows = 300, maxCols = 40 } =
       // Incluye el texto `01/aug/2026` con el que el SIPAB escribe la mayoría de
       // sus fechas; si no lo fuera, `.text` resuelve fórmulas y texto enriquecido.
       const texto = String(cell.text ?? '').trim();
+      // Las columnas de HORA se pintan como hora y no como fecha: Excel las
+      // guarda en su día cero, así que "Hora Programada 08:00" aparecía en el
+      // modal de revisión como `1899-12-30` —una fecha imposible al lado del
+      // campo de horas, que es justo lo que había que comparar—.
+      if (esHoraSuelta(cell.value, cell.numFmt)) {
+        celdas.push(horaTexto(cell.value));
+        continue;
+      }
       celdas.push(
         cell.value instanceof Date
           ? cell.value.toISOString().slice(0, 10)

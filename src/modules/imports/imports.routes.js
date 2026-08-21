@@ -266,7 +266,7 @@ router.post('/:id/confirm', requireRole('admin'), asyncHandler(async (req, res) 
       const orden = await withTransaction((client) => materializarOrden(id, req.user.sub, client));
       creadas.push(orden.codigo);
     } catch (e) {
-      fallidas.push(e?.message || 'No se pudo crear la OS');
+      fallidas.push(motivoLegible(e));
     }
   }
 
@@ -280,6 +280,26 @@ router.post('/:id/confirm', requireRole('admin'), asyncHandler(async (req, res) 
     data: { confirmadas: creadas.length, codigos: creadas, fallidas },
   });
 }));
+
+/**
+ * Por qué no entró UNA orden del lote, en cristiano.
+ *
+ * Este bucle se traga los errores para que una orden mala no tumbe a las demás,
+ * y con eso se salta el manejador de errores de Express: lo que se listaba en
+ * pantalla era el mensaje crudo del driver de Postgres —"duplicate key value
+ * violates unique constraint \"ordenes_servicio_codigo_key\""—, que no le dice
+ * nada a quien está importando y le hace buscar la causa donde no está (el NIT
+ * repetido de la empresa, por ejemplo). El error completo sigue yendo al log,
+ * que es donde sirve.
+ */
+function motivoLegible(e) {
+  // Los errores de dominio (HttpError) ya están escritos para quien los lee.
+  if (e?.statusCode) return e.message;
+  console.error('[confirmar lote]', e?.code ?? '', e?.constraint ?? '', e?.detail ?? e?.message);
+  if (e?.code === '23505') return 'La orden ya estaba registrada en el sistema.';
+  if (e?.code === '23502') return 'A la orden le falta un dato obligatorio.';
+  return 'No se pudo crear la OS. Vuelva a intentarlo; si sigue igual, revise los datos de la orden.';
+}
 
 // Descartar el lote completo sin enviarlo a Órdenes (los borradores quedan
 // DESCARTADA; el archivo original se conserva para auditoría).

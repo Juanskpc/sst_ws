@@ -196,6 +196,47 @@ router.put('/:id', requireRole('admin'), asyncHandler(async (req, res) => {
 }));
 
 /**
+ * Clave del cerrojo con el que se reparte el código legible de la OS. Es un
+ * número arbitrario: lo único que importa es que nadie más use el mismo par
+ * (clave, año) en `pg_advisory_xact_lock`.
+ */
+const CERROJO_CODIGO_OS = 8471;
+
+/**
+ * Siguiente código legible OS-YYYY-NNNN.
+ *
+ * Se calculaba con `count(*) + 1` y sin cerrojo, y eso fallaba de dos maneras,
+ * las dos con el mismo síntoma: *duplicate key value violates unique constraint
+ * "ordenes_servicio_codigo_key"*, media tanda guardada y la otra media no.
+ *
+ *  1. **Dos confirmaciones a la vez.** La vista de Importar manda una petición
+ *     por ARCHIVO, así que una tanda de dos archivos confirma en paralelo: las
+ *     dos transacciones contaban lo mismo —ninguna ve las filas sin confirmar de
+ *     la otra—, sacaban el mismo número y la segunda moría contra el índice
+ *     único. Nada que ver con el NIT ni con la empresa: dos órdenes de la misma
+ *     empresa siempre se han podido guardar.
+ *  2. **Contar no es numerar.** `count(*)` da el número de filas, no el último
+ *     número usado: basta con que se borre una orden —o con que convivan las
+ *     sembradas de demostración (OS-2026-1001…)— para que el conteo apunte a un
+ *     código que ya existe, y entonces el choque es permanente.
+ *
+ * Ahora el reparto va bajo un cerrojo por año (se libera solo al terminar la
+ * transacción) y se parte del MÁXIMO ya usado, nunca del conteo: los códigos no
+ * se repiten ni se reutilizan aunque se borre una orden.
+ */
+async function siguienteCodigoOS(client) {
+  const year = new Date().getFullYear();
+  await client.query(`SELECT pg_advisory_xact_lock($1, $2)`, [CERROJO_CODIGO_OS, year]);
+  const r = await client.query(
+    `SELECT COALESCE(MAX(split_part(codigo, '-', 3)::int), 0) AS n
+       FROM sst.ordenes_servicio
+      WHERE codigo ~ ('^OS-' || $1 || '-[0-9]+$')`,
+    [String(year)]
+  );
+  return `OS-${year}-${String(r.rows[0].n + 1).padStart(4, '0')}`;
+}
+
+/**
  * M3 · Materializa la OS a partir de un borrador: la crea con estado
  * SIN PROGRAMAR (IMP-07) y escribe la primera entrada de auditoría.
  *
@@ -248,12 +289,7 @@ export async function materializarOrden(draftId, userId, client) {
     if (dup.rows[0]) throw conflict('OS duplicada por (ARL + cronograma + secuencia)');
   }
 
-  // Código legible OS-YYYY-NNNN.
-  const year = new Date().getFullYear();
-  const cnt = await client.query(
-    `SELECT count(*)::int AS c FROM sst.ordenes_servicio WHERE codigo LIKE $1`, [`OS-${year}-%`]
-  );
-  const codigo = `OS-${year}-${String(cnt.rows[0].c + 1).padStart(4, '0')}`;
+  const codigo = await siguienteCodigoOS(client);
 
   // CFG-02 · La OS queda enlazada al maestro de empresas, creando la ficha si
   // la empresa es nueva. Los textos (nit_nic / empresa_nombre) se conservan

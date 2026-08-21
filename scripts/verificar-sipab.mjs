@@ -52,7 +52,17 @@ check('numero_orden vacío (identidad excluyente por ARL)',
   cuenta((r) => r.fields.numero_orden.value) === 0);
 check('NIT y razón social en todas',
   cuenta((r) => r.fields.nit_nic.value && r.fields.empresa_nombre.value) === records.length);
-check('horas en todas', cuenta((r) => parseNumeroCO(r.fields.horas_asignadas.value) > 0) === records.length);
+// Las horas solo se dan por buenas cuando el SIPAB mide la actividad en HORAS.
+// Lo que viene en UNIDADES es una cantidad de actividades, no una duración, y
+// debe llegar VACÍO para que lo diligencie quien revisa (ver extraction.service).
+// Las dos comprobaciones se saltan las hojas que no declaran unidad de medida
+// (una exportación propia, por ejemplo): sin esa columna no hay nada que decidir.
+const conUnidad = records.filter((r) => r.sipab?.unidad_medida);
+const enHoras = (r) => /hora/i.test(r.sipab?.unidad_medida ?? '');
+check('horas en todas las órdenes medidas en HORAS',
+  conUnidad.filter(enHoras).every((r) => parseNumeroCO(r.fields.horas_asignadas.value) > 0));
+check('las órdenes que NO se miden en horas llegan sin horas (las pone quien revisa)',
+  conUnidad.filter((r) => !enHoras(r)).every((r) => !r.fields.horas_asignadas.value));
 
 const sinFecha = cuenta((r) => !parseFechaCO(r.fields.fecha_orden.value));
 check('fecha_orden parseable a ISO en todas', sinFecha === 0, `${sinFecha} sin fecha`);
@@ -79,8 +89,14 @@ const correosMalos = records.filter((r) => r.fields.contacto_sst_correo.value)
   .filter((r) => !/^[^@\s]+@[^@\s]+\.[a-z]{2,}$/i.test(r.fields.contacto_sst_correo.value));
 check('los correos rescatados son direcciones válidas', correosMalos.length === 0);
 
-const horasFlag = cuenta((r) => r.fields.horas_asignadas.confidence < 70);
-console.log(`INFO  órdenes cuya cantidad NO está en horas (marcadas): ${horasFlag}/${records.length}`);
+const horasFlag = conUnidad.filter((r) => !enHoras(r)).length;
+console.log(`INFO  órdenes cuya cantidad NO está en horas (van sin horas, a diligenciar): ${horasFlag}/${records.length}`);
+
+// "Hora Programada" es la hora de INICIO de la visita, no una duración. Excel la
+// guarda en su día cero, así que un 1899-12-30 aquí sería el fallo de formato.
+const horasRaras = records.filter((r) => r.sipab?.hora_programada)
+  .filter((r) => !/^\d{2}:\d{2}$/.test(r.sipab.hora_programada));
+check('la hora programada se lee como hora (HH:mm), no como fecha', horasRaras.length === 0);
 
 const venc = cuenta((r) => r.fields.fecha_vencimiento.value);
 console.log(`INFO  con fecha de vencimiento: ${venc}/${records.length}`);
