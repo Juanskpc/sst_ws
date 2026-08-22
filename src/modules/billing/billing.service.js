@@ -278,15 +278,42 @@ export async function aniosConTrabajo(client = pool) {
  *
  * Si la cuenta del mes sigue ABIERTA (generada o enviada), se recalcula sobre
  * ella —útil si se cerró una OS tarde o se corrigió una tarifa—. Si ya está
- * cerrada (aceptada o rechazada), NO se toca: es un acuerdo cerrado y lo nuevo
- * se emite como cuenta **complementaria** del mismo mes, igual que una factura
- * complementaria. Antes esto era imposible —había un índice único por
- * profesional y periodo— y el trabajo finalizado tarde se quedaba sin cobrar.
+ * ACEPTADA no se toca nunca: es un acuerdo cerrado, y lo nuevo se emite como
+ * cuenta **complementaria** del mismo mes, igual que una factura complementaria.
+ * Antes esto era imposible —había un índice único por profesional y periodo— y
+ * el trabajo finalizado tarde se quedaba sin cobrar.
+ *
+ * PRE-07 · `precuentaId` REHACE una cuenta RECHAZADA. Un rechazo no es un
+ * acuerdo: es un documento devuelto para corregir. Antes las órdenes de una
+ * cuenta rechazada quedaban atrapadas en ella —no entraban en ninguna
+ * generación nueva—, así que pulsar "Generar" sobre esa fila no encontraba
+ * trabajo y no hacía nada. Con la cuenta señalada, sus órdenes vuelven a entrar,
+ * se revalorizan con las tarifas de hoy y la cuenta vuelve a quedar 'generada',
+ * lista para reenviarse al profesional.
  *
  * `profesionalId` opcional restringe la generación a uno solo.
  */
-export async function generarPrecuentas({ periodo, profesionalId = null, userId = null }) {
+export async function generarPrecuentas({ periodo, profesionalId = null, precuentaId = null, userId = null }) {
   const { inicio, fin } = rangoPeriodo(periodo);
+
+  // La cuenta que se está rehaciendo, si se pidió una. Tiene que ser de este
+  // mismo profesional y periodo (si no, se estaría reescribiendo la cuenta de
+  // otro) y no puede estar aceptada.
+  let rehacer = null;
+  if (precuentaId) {
+    rehacer = (await pool.query(
+      `SELECT id, estado, profesional_id, periodo FROM sst.precuentas WHERE id=$1`,
+      [precuentaId]
+    )).rows[0];
+    if (!rehacer) throw badRequest('La cuenta de cobro que se quiere rehacer no existe.');
+    if (rehacer.estado === 'aceptada') {
+      throw badRequest('La cuenta ya fue aceptada por el profesional; no se puede rehacer.');
+    }
+    if (rehacer.periodo !== periodo || (profesionalId && rehacer.profesional_id !== profesionalId)) {
+      throw badRequest('La cuenta de cobro no corresponde a ese profesional y mes.');
+    }
+    profesionalId = rehacer.profesional_id;
+  }
 
   const params = [inicio, fin];
   let filtroProf = '';
@@ -296,11 +323,14 @@ export async function generarPrecuentas({ periodo, profesionalId = null, userId 
   }
 
   // Las OS del mes con los soportes aceptados y todavía sin cobrar… más las que
-  // ya están dentro de una cuenta ABIERTA de este mismo periodo: recalcular una
+  // ya están dentro de una cuenta ABIERTA de este mismo periodo (recalcular una
   // cuenta abierta tiene que volver a incluir lo que ya contenía, o la dejaría
-  // vacía. Lo que está en una cuenta CERRADA no vuelve a entrar nunca.
+  // vacía) y las de la cuenta rechazada que se esté rehaciendo. Lo que está en
+  // una cuenta ACEPTADA no vuelve a entrar nunca.
   params.push(periodo);
   const iPeriodo = params.length;
+  params.push(rehacer?.id ?? null);
+  const iRehacer = params.length;
   const trabajo = await pool.query(
     `SELECT h.*, p.valor_hora AS valor_hora_base
        FROM sst.vw_horas_ejecutadas h
@@ -312,6 +342,7 @@ export async function generarPrecuentas({ periodo, profesionalId = null, userId 
             FROM sst.precuenta_items i
             JOIN sst.precuentas pc ON pc.id = i.precuenta_id
            WHERE i.orden_id = h.orden_id
+             AND pc.id IS DISTINCT FROM $${iRehacer}::uuid
              AND NOT (pc.periodo = $${iPeriodo}
                       AND pc.profesional_id = h.profesional_id
                       AND pc.estado NOT IN ('aceptada','rechazada'))
@@ -332,14 +363,17 @@ export async function generarPrecuentas({ periodo, profesionalId = null, userId 
   const omitidas = [];
 
   for (const [profId, ordenes] of porProfesional) {
-    const existente = (await pool.query(
-      // La ABIERTA, si la hay: es la única que se puede recalcular. Las cerradas
-      // se quedan como están y lo nuevo irá a una cuenta complementaria.
-      `SELECT id, estado FROM sst.precuentas
-        WHERE profesional_id=$1 AND periodo=$2 AND estado NOT IN ('aceptada','rechazada')
-        ORDER BY creado_en DESC LIMIT 1`,
-      [profId, periodo]
-    )).rows[0];
+    const existente = rehacer && rehacer.profesional_id === profId
+      ? { id: rehacer.id, estado: rehacer.estado }
+      : (await pool.query(
+          // La ABIERTA, si la hay: es la única que se recalcula sola. La aceptada
+          // se queda como está y lo nuevo irá a una cuenta complementaria; la
+          // rechazada solo se rehace si se pidió por `precuentaId`.
+          `SELECT id, estado FROM sst.precuentas
+            WHERE profesional_id=$1 AND periodo=$2 AND estado NOT IN ('aceptada','rechazada')
+            ORDER BY creado_en DESC LIMIT 1`,
+          [profId, periodo]
+        )).rows[0];
 
     // Valora cada orden ANTES de abrir la transacción (son consultas de lectura).
     const items = [];
@@ -400,7 +434,14 @@ export async function generarPrecuentas({ periodo, profesionalId = null, userId 
         ? (await client.query(
             `UPDATE sst.precuentas
                 SET total_horas=$2, total_monto=$3, estado='generada',
-                    generado_por=$4, actualizado_en=now()
+                    generado_por=$4, actualizado_en=now(),
+                    -- Rehacer un rechazo deja una cuenta NUEVA sobre el mismo
+                    -- registro: las marcas de envío y respuesta son de la
+                    -- versión que el profesional devolvió y ya no describen
+                    -- esta. Las observaciones sí se conservan: son el motivo
+                    -- que hay que haber corregido.
+                    enviado_en    = CASE WHEN estado = 'rechazada' THEN NULL ELSE enviado_en END,
+                    respondido_en = CASE WHEN estado = 'rechazada' THEN NULL ELSE respondido_en END
               WHERE id=$1 RETURNING *`,
             [existente.id, totalHoras, totalMonto, userId]
           )).rows[0]

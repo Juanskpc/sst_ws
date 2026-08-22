@@ -107,29 +107,45 @@ router.get('/me', authRequired, asyncHandler(async (req, res) => {
 }));
 
 /**
- * AUTH-05 · El usuario corrige SUS datos.
+ * AUTH-05 · El usuario corrige SUS datos: nombre, correo, teléfono y especialidad.
  *
- * Solo nombre, teléfono y especialidad: el correo identifica la cuenta —y el
- * documento es con lo que se inicia sesión—, así que cambiarlos es cosa del
- * Administrador Maestro. El rol, por lo mismo: nadie se asciende solo.
+ * El documento NO se toca aquí —es con lo que se inicia sesión— ni el rol:
+ * nadie se asciende solo. El correo sí, porque es el dato que más cambia en la
+ * práctica y obligar a pedírselo al Administrador Maestro dejaba al propio
+ * maestro sin forma de corregir el suyo. Es opcional en el cuerpo: si no llega,
+ * la cuenta conserva el que tiene.
  *
- * Existía el formulario en Configuración pero no el endpoint: el botón
- * "Guardar cambios" no llamaba a nada y los cambios se perdían al recargar.
+ * Al final se reemite el token. Sus claims `correo` y `nombre` no son
+ * decorativos: de ahí salen el remitente y la copia de los correos de asignación
+ * (M11). Sin reemitirlo, cambiar el correo mandaría las notificaciones a la
+ * dirección vieja hasta que el token caducara.
  */
 router.put('/me', authRequired, asyncHandler(async (req, res) => {
   const nombre = validarNombre(req.body?.nombre);
   const telefono = validarTelefono(req.body?.telefono);
   const especialidad = validarTextoOpcional(req.body?.especialidad, 'La especialidad');
+  const correo = req.body?.correo === undefined ? null : validarCorreo(req.body.correo);
 
-  const r = await pool.query(
-    `UPDATE sst.usuarios
-        SET nombre=$2, telefono=$3, especialidad=$4, actualizado_en=now()
-      WHERE id=$1
-      RETURNING *, (SELECT p.id FROM sst.profesionales p WHERE p.usuario_id = sst.usuarios.id LIMIT 1) AS profesional_id`,
-    [req.user.sub, nombre, telefono, especialidad]
-  );
+  let r;
+  try {
+    r = await pool.query(
+      `UPDATE sst.usuarios
+          SET nombre=$2, telefono=$3, especialidad=$4, correo=COALESCE($5, correo),
+              actualizado_en=now()
+        WHERE id=$1
+        RETURNING *, (SELECT p.id FROM sst.profesionales p WHERE p.usuario_id = sst.usuarios.id LIMIT 1) AS profesional_id`,
+      [req.user.sub, nombre, telefono, especialidad, correo]
+    );
+  } catch (e) {
+    if (e.code === '23505') throw conflict(`El correo ${correo} ya pertenece a otra cuenta.`);
+    throw e;
+  }
   if (!r.rows[0]) throw notFound('Usuario no encontrado');
-  res.json({ message: 'Perfil actualizado.', usuario: usuarioPublico(r.rows[0]) });
+  res.json({
+    message: 'Perfil actualizado.',
+    usuario: usuarioPublico(r.rows[0]),
+    token: signToken(r.rows[0]),
+  });
 }));
 
 // AUTH-03 · Solicitud de recuperación de contraseña por correo.

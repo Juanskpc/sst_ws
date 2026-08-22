@@ -103,10 +103,18 @@ router.get('/:id/pdf', asyncHandler(async (req, res) => {
  *
  * Se dispara a mano (no hay cron en el despliegue actual) y es idempotente, así
  * que repetirla el mismo mes recalcula en vez de duplicar.
+ *
+ * PRE-07 · Con `precuenta_id` se REHACE esa cuenta rechazada: sus órdenes
+ * vuelven a valorarse y queda otra vez lista para enviar.
  */
 router.post('/generate', requireRole('admin'), asyncHandler(async (req, res) => {
-  const { periodo, profesional_id: profesionalId } = req.body || {};
-  const r = await generarPrecuentas({ periodo, profesionalId: profesionalId || null, userId: req.user.sub });
+  const { periodo, profesional_id: profesionalId, precuenta_id: precuentaId } = req.body || {};
+  const r = await generarPrecuentas({
+    periodo,
+    profesionalId: profesionalId || null,
+    precuentaId: precuentaId || null,
+    userId: req.user.sub,
+  });
   res.status(201).json({
     // Las omitidas importan tanto como las generadas: son las que el usuario
     // esperaba ver y no aparecieron, casi siempre por falta de tarifa.
@@ -129,13 +137,25 @@ router.post('/:id/send', requireRole('admin'), asyncHandler(async (req, res) => 
 }));
 
 /**
- * Corrección manual del estado (admin). Existe para PRE-07: tras un rechazo,
- * alguien revisa y decide; y para reabrir una pre-cuenta enviada por error.
+ * Reapertura manual del estado (admin): devuelve una cuenta a 'generada' o
+ * 'enviada' cuando se envió por error.
+ *
+ * PRE-06/07 · **Aceptada y rechazada las pone el profesional, nadie más.** Son
+ * su respuesta al documento, y un administrador marcándolas por él convertía la
+ * aceptación —que es lo que autoriza el pago— en un trámite interno. El atajo
+ * existía en la vista para "resolver" un rechazo y se retiró; aquí se cierra la
+ * puerta también en el servidor, que es donde tiene que estar la regla.
  */
 router.patch('/:id/estado', requireRole('admin'), asyncHandler(async (req, res) => {
   const { estado, observaciones } = req.body || {};
   if (!ESTADOS_PRECUENTA.includes(estado)) {
     throw badRequest(`Estado inválido. Use uno de: ${ESTADOS_PRECUENTA.join(', ')}`);
+  }
+  if (estado === 'aceptada' || estado === 'rechazada') {
+    throw badRequest(
+      'Aceptar o rechazar la cuenta de cobro solo lo hace el profesional desde su enlace. ' +
+      'Para corregir una cuenta rechazada, vuelva a generarla y envíesela.'
+    );
   }
   const r = await pool.query(
     `UPDATE sst.precuentas SET estado=$2, observaciones=COALESCE($3, observaciones), actualizado_en=now()

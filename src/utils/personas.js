@@ -20,8 +20,18 @@
  */
 import { badRequest } from './httpError.js';
 
-/** Letras (con tildes y Ñ), espacios y los signos que aparecen en un nombre. */
-const SOLO_LETRAS = /^[A-ZÁÉÍÓÚÜÑ][A-ZÁÉÍÓÚÜÑ\s'’.-]*$/;
+/**
+ * Letras (con tildes y Ñ), espacios y los signos que aparecen de verdad en los
+ * nombres de este sistema.
+ *
+ * El '&' y los paréntesis están porque las cuentas del cliente los usan:
+ * "Administrador Maestro JD&D", "Marcela Rueda (Asistente)". Sin ellos el
+ * propio perfil del maestro era imposible de guardar —el aviso salía sobre el
+ * nombre aunque se estuviera editando el teléfono— y el filtro de tecleo
+ * borraba el '&' según se escribía, así que tampoco había forma de corregirlo.
+ * Los dígitos siguen fuera: una persona no se llama con números.
+ */
+const SOLO_LETRAS = /^[A-ZÁÉÍÓÚÜÑ][A-ZÁÉÍÓÚÜÑ\s'’.\-&()]*$/;
 const CORREO = /^[^\s@]+@[^\s@]+\.[a-zA-Z]{2,}$/;
 
 /** Espacios colapsados, sin bordes y en mayúsculas. */
@@ -42,7 +52,7 @@ export function validarNombre(v, campo = 'El nombre') {
   if (nombre.length < 3) throw badRequest(`${campo} debe tener al menos 3 caracteres.`);
   if (nombre.length > 120) throw badRequest(`${campo} no puede pasar de 120 caracteres.`);
   if (!SOLO_LETRAS.test(nombre)) {
-    throw badRequest(`${campo} solo admite letras y espacios (sin números ni símbolos).`);
+    throw badRequest(`${campo} solo admite letras, espacios y los signos ' . - & ( ) — sin números.`);
   }
   return nombre;
 }
