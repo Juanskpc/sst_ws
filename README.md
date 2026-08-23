@@ -8,6 +8,15 @@ Backend Node.js (Express 5 + PostgreSQL/Neon) para la plataforma de gestión de
 > verdad para los dos proyectos. Léelo antes de empezar: trae el estado por
 > módulo, las trampas conocidas y la lista de pendientes priorizada.
 
+> 🚩 **"Continúa con el trabajo pendiente que nos pidió el cliente"** = la tanda
+> del **22-ago-2026**. Empieza por **`jdd_consultores_app/docs/plan-peticiones-22-ago-2026.md`**,
+> sección **§0 "Dónde retomar"**. Van construidas las fases 1, 2 y 3 (los
+> enumerados del AT-031 de Bolívar, la matriz de formatos y soportes por ARL, y
+> los viáticos); lo siguiente es la fase 4.
+>
+> ⚠️ Ese trabajo está en la rama **`tanda-22-ago-formatos-y-viaticos`**, que
+> existe con el mismo nombre en los dos repos. En `master` no está.
+
 > ⚠️ **"Fase 1" y la "Regla de Oro" ya no existen** (la demo se aprobó el
 > 27-jul-2026). Están construidos **los 12 módulos** del FRS, encuestas,
 > pre-cuentas y reportes incluidos; del FRS solo queda fuera ASG-06 (WhatsApp),
