@@ -13,7 +13,7 @@ import {
 import { notify } from '../../services/notification.service.js';
 import { comprimirSoporte } from '../../services/compress.service.js';
 import {
-  CATEGORIAS_SOPORTE, etiquetaCategoria, listaEtiquetas, normalizarCategoria,
+  casillasDeOrden, etiquetaCategoria, listaEtiquetas, normalizarCategoria,
   nombreCanonico, nombreOriginalLegible,
 } from '../../services/soportes.service.js';
 
@@ -44,9 +44,6 @@ async function resolveToken(token, client = pool) {
   return row;
 }
 
-/** Las casillas del portal, en orden, tal como se le presentan al profesional. */
-const CASILLAS = CATEGORIAS_SOPORTE.map((c) => ({ clave: c.clave, etiqueta: c.etiqueta }));
-
 // M6 · Resumen de la OS para el portal público (SIN login).
 //
 // SUP-07 / VER-04 · Viaja también lo que YA subió y, si hubo rechazo, qué
@@ -72,7 +69,11 @@ router.get('/support/:token', asyncHandler(async (req, res) => {
       horas_asignadas: row.horas_asignadas,
       fecha_programada: row.fecha_programada,
       estado: row.estado,
-      casillas: CASILLAS,
+      // SUP · Las casillas de ESTA orden, no las tres de siempre: dependen de la
+      // ARL y del tipo de actividad, y quedaron congeladas al asignarla. Una
+      // asesoría de Bolívar no pide registro fotográfico; una asistencia
+      // técnica pide informe.
+      casillas: casillasDeOrden(row.soportes_requeridos),
       // Qué se puede subir hoy: todo, o solo lo devuelto si hay un rechazo
       // pendiente. La regla la fija el servidor, no la pantalla.
       soportes_rechazados: rechazados,
@@ -138,6 +139,10 @@ router.post('/support/:token/files', uploadSupports, asyncHandler(async (req, re
     const rechazados = (row.soportes_rechazados || []).map((c) => normalizarCategoria(c));
     const hayRechazo = rechazados.length > 0;
     const subidas = [...new Set(entrantes.map((e) => e.categoria))];
+    // Lo que se le pidió a ESTA orden. Es lo que decide tanto qué falta como qué
+    // sobra: mandar un informe en una capacitación que no lo lleva no es un
+    // extra inofensivo, es un documento que nadie va a revisar.
+    const deLaOrden = casillasDeOrden(row.soportes_requeridos).map((c) => c.clave);
 
     // SUP-05 · El enlace solo admite carga en DOS momentos: la entrega inicial y
     // la corrección de lo que se devolvió. Entre medias está en revisión y se
@@ -173,6 +178,17 @@ router.post('/support/:token/files', uploadSupports, asyncHandler(async (req, re
           `${listaEtiquetas(fuera)} ya fue aceptado y no se puede reemplazar.`,
         );
       }
+    } else {
+      // Y en la entrega inicial, solo las casillas que esta orden pide. El
+      // formulario ya no las enseña, pero el campo viaja en un multipart y el
+      // servidor no puede fiarse de que el navegador mandara lo que se pintó.
+      const sobran = subidas.filter((c) => c !== 'otros' && !deLaOrden.includes(c));
+      if (sobran.length) {
+        throw badRequest(
+          `Esta visita no pide ${listaEtiquetas(sobran)}. Los documentos de esta orden son: ` +
+          `${listaEtiquetas(deLaOrden)}.`,
+        );
+      }
     }
 
     // Y el envío va COMPLETO, tanto en la entrega inicial como en la corrección.
@@ -181,7 +197,7 @@ router.post('/support/:token/files', uploadSupports, asyncHandler(async (req, re
     // administrador la ve EJECUTADA, la abre para revisar y se encuentra con que
     // faltan dos, sin nadie a quien reclamárselos porque el enlace ya se cerró.
     // Se entrega todo de una vez o no se entrega.
-    const requeridas = hayRechazo ? rechazados : CATEGORIAS_SOPORTE.map((c) => c.clave);
+    const requeridas = hayRechazo ? rechazados : deLaOrden;
     const faltan = requeridas.filter((c) => !subidas.includes(c));
     if (faltan.length) {
       throw badRequest(
@@ -379,6 +395,9 @@ router.get('/precuenta/:token', asyncHandler(async (req, res) => {
       profesional_nombre: pc.profesional_nombre,
       total_horas: pc.total_horas,
       total_monto: pc.total_monto,
+      // Con viáticos, el total ya no es horas × tarifa. El profesional está a
+      // punto de ACEPTAR esta cifra, así que tiene que poder cuadrarla.
+      total_viaticos: pc.total_viaticos,
       total_ordenes: pc.total_ordenes,
       estado: pc.estado,
       observaciones: pc.observaciones,
@@ -390,6 +409,7 @@ router.get('/precuenta/:token', asyncHandler(async (req, res) => {
         actividad: i.actividad,
         fecha_ejecucion: i.fecha_ejecucion,
         horas: i.horas,
+        viaticos: i.viaticos,
         valor_hora: i.valor_hora_snapshot,
         monto: i.monto,
       })),

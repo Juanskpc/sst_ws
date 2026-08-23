@@ -37,6 +37,25 @@ export const CANONICAL_FIELDS = [
   'descripcion',
 ];
 
+/**
+ * Campos que VIVEN en el borrador junto a los canónicos pero que NO se le piden
+ * al modelo (ago-2026).
+ *
+ * `tipo_servicio_arl` lo trae el Excel SIPAB en su propia columna, de forma
+ * determinista: pedírselo además a la IA sería pagar tokens por adivinar un dato
+ * que ya está leído, con el riesgo de que se lo invente en los PDF de AXA y
+ * Colmena, donde esa letra ni existe. `modalidad_ejecucion` no está en ningún
+ * documento: la escribe quien revisa la orden.
+ *
+ * Se quedan fuera de `CANONICAL_FIELDS` —y por tanto del esquema de salida y de
+ * la confianza general— pero dentro de `CAMPOS_BORRADOR`, que es lo que la vista
+ * previa deja corregir y lo que se materializa en la OS.
+ */
+export const CAMPOS_REVISION = ['tipo_servicio_arl', 'modalidad_ejecucion', 'viaticos_valor'];
+
+/** Todo lo que el borrador guarda y el modal de revisión puede corregir. */
+export const CAMPOS_BORRADOR = [...CANONICAL_FIELDS, ...CAMPOS_REVISION];
+
 // responseSchema para salida estructurada (subconjunto OpenAPI Schema).
 const fieldSchema = {
   type: 'object',

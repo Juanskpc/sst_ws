@@ -4,11 +4,14 @@ import { asyncHandler } from '../../utils/asyncHandler.js';
 import { authRequired, requireRole } from '../../middleware/auth.js';
 import { badRequest, notFound, conflict } from '../../utils/httpError.js';
 import { computeOverallConfidence } from '../../services/extraction.service.js';
-import { CANONICAL_FIELDS } from '../../services/gemini.service.js';
+import { CAMPOS_BORRADOR } from '../../services/gemini.service.js';
 import { resolverEmpresaId } from '../companies/companies.service.js';
 // Los mismos parsers los usa la edición de una OS ya materializada
 // (`PUT /orders/:id`): viven en utils para que no puedan divergir.
 import { parseNumeroCO, parseFechaCO } from '../../utils/parseo.js';
+import {
+  esBolivar, normalizarModalidadEjecucion, normalizarTipoActividadBolivar,
+} from '../../utils/bolivar.js';
 
 const router = Router();
 router.use(authRequired);
@@ -171,7 +174,7 @@ router.put('/:id', requireRole('admin'), asyncHandler(async (req, res) => {
   }
 
   const merged = { ...cur.rows[0].metadatos_extraccion };
-  for (const f of fields ? CANONICAL_FIELDS : []) {
+  for (const f of fields ? CAMPOS_BORRADOR : []) {
     if (fields[f]) {
       merged[f] = {
         value: fields[f].value ?? merged[f]?.value ?? '',
@@ -269,6 +272,29 @@ export async function materializarOrden(draftId, userId, client) {
   const cron = val('codigo_cronograma');
   const sec = val('secuencia');
 
+  // FOR · Los dos enumerados del AT-031 de Bolívar. La letra la trae el SIPAB;
+  // la modalidad la escribe quien revisa y es OBLIGATORIA en esa ARL, porque de
+  // ella depende qué formatos se adjuntan: el comunicado de la ARL admite el
+  // AT-031 en presencial y en virtual, pero el AT-028 solo en presencial.
+  // Descubrirlo al asignar —cuando el correo ya va camino del profesional— es
+  // demasiado tarde, así que se exige aquí, igual que el tipo de orden.
+  // Viáticos: el valor es un campo del formulario (corregible a mano) y el
+  // desglose viaja como contexto del SIPAB. Se guardan los dos: sin el desglose
+  // la cifra no se puede justificar ante la ARL ni explicar cuando alguien la
+  // discuta.
+  const viaticos = parseNumeroCO(val('viaticos_valor'));
+  const detalleViaticos = m.sipab?.viaticos?.detalle ?? null;
+
+  const tipoServicioArl = normalizarTipoActividadBolivar(val('tipo_servicio_arl'));
+  const modalidadEjecucion = normalizarModalidadEjecucion(val('modalidad_ejecucion'));
+  const arl = await client.query(`SELECT nombre FROM sst.arls WHERE id=$1`, [draft.arl_id]);
+  if (esBolivar(arl.rows[0]?.nombre) && !modalidadEjecucion) {
+    throw badRequest(
+      'Falta indicar si la actividad es presencial o virtual. Elíjalo en la vista previa: ' +
+      'de ello depende qué formatos de Bolívar se le envían al profesional.',
+    );
+  }
+
   // Identidad por ARL: Bolívar usa cronograma+secuencia; AXA/Colmena, numero_orden.
   if (!numeroOrden && !(cron && sec)) {
     throw badRequest('La OS necesita numero_orden, o bien codigo_cronograma + secuencia');
@@ -312,18 +338,22 @@ export async function materializarOrden(draftId, userId, client) {
     `INSERT INTO sst.ordenes_servicio (
        codigo, arl_id, numero_orden, codigo_cronograma, secuencia, nro_afiliacion,
        nit_nic, empresa_nombre, empresa_id, actividad_economica, tipo_actividad, tipo_orden_id, modalidad,
+       tipo_servicio_arl, modalidad_ejecucion, viaticos_valor, viaticos_detalle,
        horas_asignadas, valor_unitario, valor_total,
        fecha_orden, fecha_vencimiento, ciudad_ejecucion, direccion, descripcion,
        contacto_empresa_nombre, contacto_empresa_cargo, contacto_empresa_telefono,
        contacto_sst_nombre, contacto_sst_telefono, contacto_sst_correo,
        lote_importacion_id, url_archivo_original, metadatos_extraccion, estado)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,
-             $20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,'SIN PROGRAMAR')
+             $20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,'SIN PROGRAMAR')
      RETURNING *`,
     [
       codigo, draft.arl_id, numeroOrden, cron, sec, val('nro_afiliacion'),
       val('nit_nic'), val('empresa_nombre'), empresaId, val('actividad_economica'),
       val('tipo_actividad'), draft.tipo_orden_id, val('modalidad'),
+      tipoServicioArl, modalidadEjecucion,
+      viaticos && viaticos > 0 ? viaticos : null,
+      detalleViaticos ? JSON.stringify(detalleViaticos) : null,
       parseNumeroCO(val('horas_asignadas')), parseNumeroCO(val('valor_unitario')),
       parseNumeroCO(val('valor_total')),
       parseFechaCO(val('fecha_orden')), parseFechaCO(val('fecha_vencimiento')),

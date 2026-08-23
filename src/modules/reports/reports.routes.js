@@ -133,13 +133,18 @@ router.get('/horas', asyncHandler(async (req, res) => {
   const rango = [desde, hasta];
   const [porProfesional, porArl, porMes, totales] = await Promise.all([
     pool.query(
+      // Los viáticos van en su propia columna, no sumados a nada: son un
+      // reembolso de gasto y mezclarlos con las horas o con los honorarios haría
+      // ilegible el informe de trabajo ejecutado.
       `SELECT profesional_id, profesional_nombre,
-              count(*)::int AS ordenes, sum(horas)::numeric AS horas
+              count(*)::int AS ordenes, sum(horas)::numeric AS horas,
+              coalesce(sum(viaticos_valor), 0)::numeric AS viaticos
          FROM sst.vw_horas_ejecutadas
         WHERE fecha_ejecucion BETWEEN $1::date AND $2::date
         GROUP BY 1,2 ORDER BY horas DESC`, rango),
     pool.query(
-      `SELECT arl_nombre, count(*)::int AS ordenes, sum(horas)::numeric AS horas
+      `SELECT arl_nombre, count(*)::int AS ordenes, sum(horas)::numeric AS horas,
+              coalesce(sum(viaticos_valor), 0)::numeric AS viaticos
          FROM sst.vw_horas_ejecutadas
         WHERE fecha_ejecucion BETWEEN $1::date AND $2::date
         GROUP BY 1 ORDER BY horas DESC`, rango),
@@ -150,6 +155,7 @@ router.get('/horas', asyncHandler(async (req, res) => {
         GROUP BY 1 ORDER BY 1`, rango),
     pool.query(
       `SELECT count(*)::int AS ordenes, coalesce(sum(horas),0)::numeric AS horas,
+              coalesce(sum(viaticos_valor),0)::numeric AS viaticos,
               count(DISTINCT profesional_id)::int AS profesionales
          FROM sst.vw_horas_ejecutadas
         WHERE fecha_ejecucion BETWEEN $1::date AND $2::date`, rango),

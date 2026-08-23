@@ -460,6 +460,80 @@ ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS soportes_rechazados   
 ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS soportes_rechazo_motivo TEXT;
 ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS soportes_rechazados_en  TIMESTAMPTZ;
 
+-- ⭐ FOR · Los dos enumerados que Bolívar exige en el formato AT-031 (ago-2026).
+--
+-- `tipo_servicio_arl` es la LETRA del tipo de actividad (A Asesoría, T
+-- Asistencia Técnica, C Capacitación, E Servicio Especializado, M Material,
+-- O Otros). La trae el propio SIPAB en su columna "Tipo Servicio" y hasta ahora
+-- se descartaba: se guardaba como contexto en metadatos_extraccion y no la leía
+-- nadie, así que la casilla del formato salía sin marcar y había que marcarla a
+-- bolígrafo sobre el impreso.
+--
+-- `modalidad_ejecucion` NO está en ningún documento: la decide quien revisa la
+-- orden, y es obligatoria en Bolívar. No es un adorno del formato — el
+-- comunicado SNPARL-40035219-2025 de la ARL dice que el AT-031 vale para
+-- actividades presenciales o virtuales pero que **el AT-028 es únicamente para
+-- presenciales**, así que de este campo depende qué formatos se adjuntan.
+--
+-- OJO: no se reutiliza la columna `modalidad`, que ya existe. Esa es texto libre
+-- extraído de los PDF de AXA y Colmena; mezclar ahí un enumerado de dos valores
+-- dejaría el histórico sin poder interpretarse.
+-- En el BORRADOR no llevan columna: viven dentro de `metadatos_extraccion`,
+-- como cualquier otro campo del modal de revisión (`CAMPOS_BORRADOR`). Es lo
+-- mismo que hace la fecha de vencimiento, que tampoco viene en el documento y
+-- se escribe a mano en la vista previa. `tipo_orden_id` sí es columna porque no
+-- es un campo del formulario de extracción, sino un id del catálogo CFG-04.
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS tipo_servicio_arl   CHAR(1);
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS modalidad_ejecucion TEXT;
+
+-- Los CHECK van por separado y con guarda: `ADD CONSTRAINT` no admite
+-- IF NOT EXISTS, y sin esto el segundo `npm run migrate` fallaría.
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_ordenes_tipo_servicio_arl') THEN
+    ALTER TABLE sst.ordenes_servicio ADD CONSTRAINT chk_ordenes_tipo_servicio_arl
+      CHECK (tipo_servicio_arl IS NULL OR tipo_servicio_arl IN ('A','T','C','E','M','O'));
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_ordenes_modalidad_ejecucion') THEN
+    ALTER TABLE sst.ordenes_servicio ADD CONSTRAINT chk_ordenes_modalidad_ejecucion
+      CHECK (modalidad_ejecucion IS NULL OR modalidad_ejecucion IN ('PRESENCIAL','VIRTUAL'));
+  END IF;
+END $$;
+
+-- ⭐ SUP · QUÉ soportes tiene que entregar ESTA orden (ago-2026).
+--
+-- El portal pedía siempre las mismas tres casillas (acta, asistencia,
+-- evidencias) a todas las órdenes. No es lo que exigen las ARL: una asesoría de
+-- Bolívar no lleva registro fotográfico y una asistencia técnica sí lleva
+-- informe de gestión. La lista sale de la misma regla que decide los formatos
+-- (`services/entrega-arl.service.js`).
+--
+-- Se CONGELA al asignar, en vez de recalcularse cada vez que alguien abre el
+-- portal: el profesional ya tiene el enlace en su correo, y cambiar una regla
+-- mañana no puede alterar lo que se le pidió ayer. NULL = orden anterior al
+-- cambio; el portal le sigue pidiendo las tres de siempre.
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS soportes_requeridos TEXT[];
+
+-- ⭐ Viáticos de la orden (ago-2026, a pedido del cliente).
+--
+-- Algunas órdenes se ejecutan fuera de la ciudad y llevan un valor aparte de las
+-- horas. Es OPCIONAL: NULL = la orden no lleva viáticos, que es el caso normal.
+--
+-- En Bolívar no hay que teclearlo: el propio SIPAB trae `Autoriza Viaticos` y
+-- las columnas de valor, que hasta ahora se descartaban. En AXA y Colmena se
+-- escribe a mano.
+--
+-- ⚠️ NO entra en `valor_cobro_total`, que es una columna GENERADA
+-- (horas × valor_hora_cobro) y es lo que hace trazable la tarifa. Los viáticos
+-- son un REEMBOLSO, no honorarios: van en su propia columna y se suman al final.
+-- Mezclarlos dejaría un "valor hora" implícito que no es el que se pactó.
+--
+-- `viaticos_detalle` guarda el desglose tal como venía (transporte, alojamiento,
+-- alimentación…). Es lo que permite justificar la cifra ante la ARL y ver de
+-- dónde salió cuando alguien la discuta.
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS viaticos_valor       NUMERIC(14,2);
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS viaticos_detalle     JSONB;
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS viaticos_observacion TEXT;
+
 -- ⭐ EST-03 · Historial de estados (auditoría + event source) ------------------
 CREATE TABLE IF NOT EXISTS sst.historial_estados_orden (
   id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -798,6 +872,19 @@ ALTER TABLE sst.precuenta_items ADD COLUMN IF NOT EXISTS empresa_nombre  TEXT;
 ALTER TABLE sst.precuenta_items ADD COLUMN IF NOT EXISTS arl_nombre      TEXT;
 ALTER TABLE sst.precuenta_items ADD COLUMN IF NOT EXISTS actividad       TEXT;
 ALTER TABLE sst.precuenta_items ADD COLUMN IF NOT EXISTS fecha_ejecucion DATE;
+
+-- ⭐ Viáticos en la cuenta de cobro (ago-2026).
+--
+-- Van como línea APARTE de los honorarios, no sumados dentro de `monto`: el
+-- profesional tiene que poder ver qué es pago por su trabajo y qué es reembolso
+-- de un gasto, y la contadora los trata distinto. `monto` sigue siendo
+-- horas × valor hora, exactamente como antes.
+--
+-- `precuentas.total_monto` SÍ los incluye: es lo que se le paga en total, que es
+-- lo que el documento anuncia y lo que el profesional acepta. Las cuentas
+-- anteriores quedan con 0 y su total no cambia.
+ALTER TABLE sst.precuenta_items ADD COLUMN IF NOT EXISTS viaticos       NUMERIC(14,2) NOT NULL DEFAULT 0;
+ALTER TABLE sst.precuentas      ADD COLUMN IF NOT EXISTS total_viaticos NUMERIC(14,2) NOT NULL DEFAULT 0;
 -- De dónde salió el valor hora aplicado: 'tarifa' (PRE-02) o 'profesional'
 -- (valor_hora base). Se muestra en pantalla para que una cifra rara se pueda
 -- explicar sin abrir la base de datos.
@@ -1212,6 +1299,9 @@ SELECT o.id                     AS orden_id,
        o.valor_hora_cobro,
        o.valor_hora_origen,
        o.valor_cobro_total,
+       -- Los viáticos viajan con las horas: la cuenta de cobro los cobra en la
+       -- misma fila, como una línea aparte del mismo trabajo.
+       o.viaticos_valor,
        COALESCE(o.fecha_ejecucion, o.fecha_programada, o.actualizado_en)::date AS fecha_ejecucion,
        to_char(COALESCE(o.fecha_ejecucion, o.fecha_programada, o.actualizado_en), 'YYYY-MM') AS periodo,
        o.soportes_aceptados_en

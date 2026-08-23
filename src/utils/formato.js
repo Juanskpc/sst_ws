@@ -53,6 +53,18 @@ function partesCO(valor) {
  * Formato de 12 horas con AM/PM en mayúsculas, que es como lo lee el
  * profesional en campo.
  */
+/**
+ * Pesos colombianos, sin decimales: `$ 21.020`.
+ *
+ * Vive aquí y no en el módulo de facturación porque lo usan también el correo de
+ * asignación (los viáticos de la orden) y los formatos: una cifra de dinero se
+ * escribe igual en todo el producto o el profesional cree que son dos cosas
+ * distintas.
+ */
+export const enPesosCO = (v) =>
+  new Intl.NumberFormat('es-CO', { style: 'currency', currency: 'COP', maximumFractionDigits: 0 })
+    .format(Number(v) || 0);
+
 export function horaAmPm(hhmm) {
   // Se exige el formato completo: `Number('')` es 0, así que sin esta guarda un
   // valor vacío se imprimiría como una medianoche perfectamente creíble.

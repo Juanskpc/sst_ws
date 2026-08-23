@@ -8,7 +8,7 @@ import {
   correoHtml, parrafo, tablaDatos, filaDato, bloqueTotal, bloqueLista, bloqueAviso,
   boton, enlaceCrudo,
 } from '../../services/email-layout.service.js';
-import { fechaDiaCO, horasConUnidad } from '../../utils/formato.js';
+import { enPesosCO, fechaDiaCO, horasConUnidad } from '../../utils/formato.js';
 
 /** Estados de una pre-cuenta. Desde aceptada/rechazada no se regenera sola. */
 export const ESTADOS_PRECUENTA = ['generada', 'enviada', 'aceptada', 'rechazada'];
@@ -27,10 +27,14 @@ export function rangoPeriodo(periodo) {
 
 export const urlPrecuenta = (token) => `${env.publicAppUrl}/precuenta?token=${token}`;
 
-/** Formato de pesos colombianos para correo y PDF. */
-export const enPesos = (v) =>
-  new Intl.NumberFormat('es-CO', { style: 'currency', currency: 'COP', maximumFractionDigits: 0 })
-    .format(Number(v) || 0);
+/**
+ * Formato de pesos colombianos para correo y PDF.
+ *
+ * La implementación vive en `utils/formato.js` desde ago-2026 —la usa también el
+ * correo de asignación para los viáticos—; aquí se re-exporta porque media
+ * docena de módulos ya la importan por este nombre.
+ */
+export const enPesos = enPesosCO;
 
 /**
  * PRE-02 · Valor hora con el que se cobra una orden.
@@ -121,6 +125,9 @@ export async function resumenPorMes({ anio, client = pool }) {
         profesional_nombre: o.profesional_nombre,
         total_horas: 0,
         total_monto: 0,
+        // Cuánto de ese total son viáticos: quien mira la pantalla tiene que
+        // poder distinguir honorarios de reembolsos antes de generar la cuenta.
+        total_viaticos: 0,
         total_ordenes: 0,
         // Cuántas de sus órdenes quedarían valoradas en cero: es lo que impide
         // generar la cuenta, y hay que poder señalarlo antes de intentarlo.
@@ -138,8 +145,10 @@ export async function resumenPorMes({ anio, client = pool }) {
       valorHoraBase: o.valor_hora_base,
     }, client);
     const horas = Number(o.horas) || 0;
+    const viaticos = Math.round(Number(o.viaticos_valor) || 0);
     g.total_horas += horas;
-    g.total_monto += Math.round(horas * valorHora);
+    g.total_monto += Math.round(horas * valorHora) + viaticos;
+    g.total_viaticos += viaticos;
     g.total_ordenes += 1;
     if (!(valorHora > 0)) g.ordenes_sin_tarifa += 1;
   }
@@ -160,6 +169,7 @@ export async function resumenPorMes({ anio, client = pool }) {
       profesional_nombre: c.profesional_nombre,
       total_horas: Number(c.total_horas),
       total_monto: Number(c.total_monto),
+      total_viaticos: Number(c.total_viaticos ?? 0),
       total_ordenes: c.total_ordenes,
       ordenes_sin_tarifa: 0,
       precuenta_id: c.id,
@@ -378,7 +388,11 @@ export async function generarPrecuentas({ periodo, profesionalId = null, precuen
     // Valora cada orden ANTES de abrir la transacción (son consultas de lectura).
     const items = [];
     let totalHoras = 0;
-    let totalMonto = 0;
+    // Honorarios y viáticos se llevan por separado hasta el final: el documento
+    // tiene que poder decir qué es pago por el trabajo y qué es reembolso de un
+    // gasto, y la contadora los trata distinto.
+    let totalHonorarios = 0;
+    let totalViaticos = 0;
     for (const o of ordenes) {
       const { valorHora, origen } = await resolverValorHora({
         profesionalId: profId,
@@ -391,9 +405,12 @@ export async function generarPrecuentas({ periodo, profesionalId = null, precuen
       });
       const horas = Number(o.horas) || 0;
       const monto = Math.round(horas * valorHora);
+      const viaticos = Math.round(Number(o.viaticos_valor) || 0);
       totalHoras += horas;
-      totalMonto += monto;
+      totalHonorarios += monto;
+      totalViaticos += viaticos;
       items.push({
+        viaticos,
         orden_id: o.orden_id,
         orden_codigo: o.orden_codigo,
         empresa_nombre: o.empresa_nombre,
@@ -412,8 +429,15 @@ export async function generarPrecuentas({ periodo, profesionalId = null, precuen
     // `valor_hora` y sin tarifa por actividad—, y hasta ahora se generaba igual:
     // se le mandaba al profesional un documento pidiéndole que aceptara cobrar
     // $0. Se omite y se dice qué hay que arreglar.
+    // El total que se le paga: honorarios + reembolsos.
+    const totalMonto = totalHonorarios + totalViaticos;
+
     const sinTarifa = items.filter((it) => !(Number(it.valor_hora_snapshot) > 0)).length;
-    if (totalMonto <= 0) {
+    // La guarda mira los HONORARIOS, no el total: lo que protege es que no se
+    // emita una cuenta por un trabajo valorado en cero (ficha sin tarifa). Una
+    // cuenta que solo reembolsara viáticos también estaría mal por el mismo
+    // motivo — el trabajo sigue sin valorarse—, así que se omite igual.
+    if (totalHonorarios <= 0) {
       omitidas.push({
         precuenta_id: existente?.id ?? null,
         profesional_id: profId,
@@ -422,7 +446,10 @@ export async function generarPrecuentas({ periodo, profesionalId = null, precuen
         motivo: sinTarifa
           ? `${sinTarifa} de sus ${items.length} orden(es) no tienen valor hora. ` +
             `Defina la tarifa del profesional (o la de la actividad) antes de generar.`
-          : 'El total quedaría en $0; revise las horas y la tarifa antes de generar.',
+          : 'Los honorarios quedarían en $0; revise las horas y la tarifa antes de generar.'
+            + (totalViaticos > 0
+              ? ` (Hay ${enPesos(totalViaticos)} en viáticos que tampoco se emiten sin honorarios.)`
+              : ''),
       });
       continue;
     }
@@ -433,7 +460,7 @@ export async function generarPrecuentas({ periodo, profesionalId = null, precuen
       const pc = existente
         ? (await client.query(
             `UPDATE sst.precuentas
-                SET total_horas=$2, total_monto=$3, estado='generada',
+                SET total_horas=$2, total_monto=$3, total_viaticos=$5, estado='generada',
                     generado_por=$4, actualizado_en=now(),
                     -- Rehacer un rechazo deja una cuenta NUEVA sobre el mismo
                     -- registro: las marcas de envío y respuesta son de la
@@ -443,13 +470,13 @@ export async function generarPrecuentas({ periodo, profesionalId = null, precuen
                     enviado_en    = CASE WHEN estado = 'rechazada' THEN NULL ELSE enviado_en END,
                     respondido_en = CASE WHEN estado = 'rechazada' THEN NULL ELSE respondido_en END
               WHERE id=$1 RETURNING *`,
-            [existente.id, totalHoras, totalMonto, userId]
+            [existente.id, totalHoras, totalMonto, userId, totalViaticos]
           )).rows[0]
         : (await client.query(
             `INSERT INTO sst.precuentas
-               (profesional_id, periodo, total_horas, total_monto, estado, token, generado_por)
-             VALUES ($1,$2,$3,$4,'generada',$5,$6) RETURNING *`,
-            [profId, periodo, totalHoras, totalMonto, randomToken(24), userId]
+               (profesional_id, periodo, total_horas, total_monto, total_viaticos, estado, token, generado_por)
+             VALUES ($1,$2,$3,$4,$5,'generada',$6,$7) RETURNING *`,
+            [profId, periodo, totalHoras, totalMonto, totalViaticos, randomToken(24), userId]
           )).rows[0];
 
       // Los ítems se reemplazan completos: recalcular es rehacer el detalle.
@@ -458,10 +485,10 @@ export async function generarPrecuentas({ periodo, profesionalId = null, precuen
         await client.query(
           `INSERT INTO sst.precuenta_items
              (precuenta_id, orden_id, orden_codigo, empresa_nombre, arl_nombre, actividad,
-              fecha_ejecucion, horas, valor_hora_snapshot, monto, origen_tarifa)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+              fecha_ejecucion, horas, valor_hora_snapshot, monto, viaticos, origen_tarifa)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
           [pc.id, it.orden_id, it.orden_codigo, it.empresa_nombre, it.arl_nombre, it.actividad,
-           it.fecha_ejecucion, it.horas, it.valor_hora_snapshot, it.monto, it.origen_tarifa]
+           it.fecha_ejecucion, it.horas, it.valor_hora_snapshot, it.monto, it.viaticos, it.origen_tarifa]
         );
       }
       return pc;
@@ -521,6 +548,9 @@ function lineasOrdenes(items = []) {
     diaEjecucion(it.fecha_ejecucion),
     horasConUnidad(it.horas),
     enPesos(it.monto),
+    // El viático se nombra en su orden, no solo en el total: es lo que permite
+    // reclamar si falta uno.
+    Number(it.viaticos) > 0 ? `+ ${enPesos(it.viaticos)} de viáticos` : null,
   ].filter(Boolean).join(' · '));
   const resto = items.length - lineas.length;
   if (resto > 0) lineas.push(`y ${resto} orden(es) más, en el PDF adjunto`);
@@ -599,6 +629,15 @@ export async function enviarPrecuenta(id) {
             filaDato('Periodo', mes),
             filaDato('Órdenes ejecutadas', pc.total_ordenes),
             filaDato('Total de horas', horasConUnidad(pc.total_horas)),
+            // Con viáticos, el total deja de ser "horas × tarifa" y hay que
+            // decir de qué se compone o la cifra no cuadra con las cuentas del
+            // profesional. Sin ellos, estas dos filas no aparecen.
+            ...(Number(pc.total_viaticos) > 0
+              ? [
+                  filaDato('Honorarios', enPesos(Number(pc.total_monto) - Number(pc.total_viaticos))),
+                  filaDato('Viáticos (reembolso)', enPesos(pc.total_viaticos)),
+                ]
+              : []),
           ]),
           bloqueLista('Órdenes incluidas', ordenes),
           parrafo('Acéptela o recházela desde aquí (no necesita iniciar sesión):'),

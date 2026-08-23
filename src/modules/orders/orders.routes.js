@@ -13,12 +13,16 @@ import { construirInvitaciones, adjuntosInvitacion } from '../../services/calend
 import {
   correoHtml, parrafo, tablaDatos, filaDato, bloqueLista, bloqueAviso, boton, enlaceCrudo,
 } from '../../services/email-layout.service.js';
-import { fechaDiaCO, fechaHoraCO, horaAmPm, horasTexto } from '../../utils/formato.js';
+import { enPesosCO, fechaDiaCO, fechaHoraCO, horaAmPm, horasTexto } from '../../utils/formato.js';
 import { parseNumeroCO, parseFechaCO } from '../../utils/parseo.js';
 import { resolverEmpresaId } from '../companies/companies.service.js';
 import {
-  CATEGORIAS_SOPORTE, esCategoriaValida, listaEtiquetas, normalizarCategoria,
+  casillasDeOrden, esCategoriaValida, etiquetaCategoria, listaEtiquetas, normalizarCategoria,
 } from '../../services/soportes.service.js';
+import {
+  normalizarModalidadEjecucion, normalizarTipoActividadBolivar,
+} from '../../utils/bolivar.js';
+import { avisoDeEntrega, entregaDeLaOrden } from '../../services/entrega-arl.service.js';
 
 const router = Router();
 router.use(authRequired);
@@ -349,6 +353,19 @@ const CAMPOS_EDITABLES = {
   // guarda tal cual (el conversor de String lo dejaría igual, pero nombrarlo
   // aparte deja claro que no es texto libre).
   tipo_orden_id: (v) => (String(v ?? '').trim() || null),
+  // FOR · Los dos enumerados del AT-031 de Bolívar. Se normalizan aquí y no en
+  // la vista: el CHECK de la columna rechazaría una letra inventada con un error
+  // del driver, y lo que hay que hacer con una es ignorarla, no reventar la
+  // corrección entera de la orden.
+  tipo_servicio_arl: normalizarTipoActividadBolivar,
+  modalidad_ejecucion: normalizarModalidadEjecucion,
+  // Viáticos. El valor es opcional: vaciarlo deja la orden SIN viáticos (NULL),
+  // que es distinto de llevarlos en cero.
+  viaticos_valor: (v) => {
+    const n = parseNumeroCO(v);
+    return n && n > 0 ? n : null;
+  },
+  viaticos_observacion: String,
 };
 
 /** Texto del formulario → lo que va a la columna ('' se guarda como NULL). */
@@ -580,6 +597,20 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
     // `documentos_generados` como si fuera bueno.
     const docs = completa ? await generateOrderDocuments(req.params.id, client) : [];
 
+    // SUP · Qué soportes tendrá que devolver, CONGELADO aquí.
+    //
+    // Sale de la misma regla que acaba de decidir los formatos, y se guarda en
+    // vez de recalcularse cada vez que el profesional abre el portal: el enlace
+    // ya va camino de su correo con una lista concreta de documentos, y cambiar
+    // una regla la semana que viene no puede alterar lo que se le pidió hoy.
+    const entrega = entregaDeLaOrden(await getOrderExpanded(req.params.id, client));
+    if (completa) {
+      await client.query(
+        `UPDATE sst.ordenes_servicio SET soportes_requeridos = $2 WHERE id = $1`,
+        [req.params.id, entrega.soportes],
+      );
+    }
+
     // Enlace público de soportes (M6). Al reprogramar se conserva el enlace
     // vigente: emitir uno nuevo invalidaría el que ya se le envió al profesional.
     const vigente = await client.query(
@@ -597,7 +628,7 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
 
     const orden = await getOrderExpanded(req.params.id, client);
     return {
-      orden, profesional: prof.rows[0], docs, token, esReprogramacion, completa,
+      orden, profesional: prof.rows[0], docs, token, esReprogramacion, completa, entrega,
       secuenciaCalendario: guardada.rows[0].secuencia_calendario,
       franjas: await franjasDeOrden(req.params.id, client),
       franjasPrevias,
@@ -658,6 +689,14 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
   const lugar = [o.direccion, o.ciudad_ejecucion].filter(Boolean).join(', ');
   const contacto = [o.contacto_sst_nombre, o.contacto_sst_telefono].filter(Boolean).join(' · ');
   const sinFormatos = !result.docs.length;
+  // SUP · Qué tiene que devolver, dicho en el mismo correo que le manda a la
+  // visita. Antes el correo hablaba de "los soportes firmados" en abstracto y la
+  // lista solo aparecía al abrir el portal, ya de vuelta de la empresa.
+  const queDevolver = listaEtiquetas(result.entrega.soportes);
+  // Los viáticos se dicen ANTES de la visita: el profesional decide cómo viaja
+  // con ese dato, y descubrirlos al recibir la cuenta de cobro llega tarde.
+  const viaticos = Number(o.viaticos_valor) || 0;
+  const viaticosTexto = viaticos > 0 ? enPesosCO(viaticos) : null;
 
   let correoEnviado = true;
   let correoError = null;
@@ -716,6 +755,7 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
             filaDato('ARL', o.arl_nombre),
             filaDato('Empresa', o.empresa_nombre),
             filaDato('Horas', horasTexto(o.horas_asignadas)),
+            filaDato('Viáticos aprobados', viaticosTexto),
             filaDato('Lugar', lugar),
             filaDato('Contacto SST', contacto),
           ]),
@@ -735,6 +775,18 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
                 `los datos de esta orden. Solo tienes que imprimirlos y completar en la sesión ` +
                 `lo que falta: asistentes, temas desarrollados, observaciones y firmas.`,
               ),
+          // La regla de la ARL, cuando hay algo que explicar: por qué esta
+          // capacitación virtual no lleva AT-028, o que hay que redactar un
+          // informe. Va como aviso destacado, no como un párrafo más.
+          result.entrega.nota ? bloqueAviso(result.entrega.nota) : '',
+          // Lo que tendrá que devolver, ANTES de ir a la visita: descubrir en el
+          // portal que hacía falta una firma más obliga a volver a la empresa.
+          result.entrega.soportes.length
+            ? bloqueLista(
+                'Al terminar tendrás que subir',
+                result.entrega.soportes.map((c) => etiquetaCategoria(c)),
+              )
+            : '',
           parrafo('Cuando termines la visita, sube los soportes firmados desde aquí (no necesitas iniciar sesión):'),
           boton('Subir soportes firmados', supportUrl),
           enlaceCrudo(supportUrl),
@@ -767,6 +819,10 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
   }
 
   const accion = result.esReprogramacion ? 'reprogramada' : 'asignada';
+  // FOR · Cuando la matriz tuvo que decidir con un dato que falta (sin tipo de
+  // actividad, sin la letra del AT-031, sin horas) se dice AQUÍ, que es el único
+  // momento en que alguien puede corregirlo antes de que el profesional ejecute.
+  const avisoEntrega = avisoDeEntrega(result.orden, result.entrega);
   res.json({
     message: correoEnviado
       ? `OS ${accion}, formatos generados y correo enviado.`
@@ -774,6 +830,14 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
     completa: true,
     correo_enviado: correoEnviado,
     correo_error: correoError,
+    // Qué se envió y qué se le pedirá de vuelta, para poder enseñarlo sin
+    // volver a pedir la orden.
+    entrega: {
+      tipo_actividad: result.entrega.tipo,
+      formatos: result.docs.map((d) => d.tipo),
+      soportes: result.entrega.soportes,
+      aviso: avisoEntrega,
+    },
     // CFG-03 · Cuántos formatos salieron adjuntos. En cero el correo llegó sin
     // documentos porque la ARL no tiene plantillas activas, y eso hay que
     // decírselo a quien asigna: es un vacío de configuración, no del envío.
@@ -809,11 +873,21 @@ router.get('/:id/supports', asyncHandler(async (req, res) => {
     `SELECT * FROM sst.archivos_soporte WHERE orden_id=$1
       ORDER BY CASE categoria
                  WHEN 'acta' THEN 1 WHEN 'asistencia' THEN 2 WHEN 'evidencias' THEN 3
+                 WHEN 'informe' THEN 4
                  ELSE 9 END,
                subido_en`,
     [req.params.id]
   );
-  res.json({ data: r.rows });
+  // SUP · Las casillas que se le pidieron a ESTA orden viajan con los archivos.
+  //
+  // Quien revisa las necesita para dos cosas: saber que falta algo que no está
+  // (una casilla vacía es un motivo de rechazo tan válido como un acta sin
+  // firmar) y no poder devolver un documento que nunca se pidió. Van aquí y no
+  // en una petición aparte porque se usan en la misma pantalla y a la vez.
+  const req_ = await pool.query(
+    `SELECT soportes_requeridos FROM sst.ordenes_servicio WHERE id=$1`, [req.params.id]
+  );
+  res.json({ data: r.rows, casillas: casillasDeOrden(req_.rows[0]?.soportes_requeridos) });
 }));
 
 /**
@@ -902,6 +976,14 @@ router.post('/:id/reject', requireRole('admin'), asyncHandler(async (req, res) =
   // vez documentos que ya había dado por buenos. Si no llega ninguna categoría
   // (cliente antiguo), se devuelven las que hoy tienen archivo — el
   // comportamiento de siempre.
+  // Las casillas de ESTA orden: devolver una que nunca se le pidió dejaría el
+  // portal esperando un documento que el profesional no tiene por qué entregar,
+  // y la orden atascada en PROGRAMADA para siempre.
+  const suyas = casillasDeOrden(
+    (await pool.query(`SELECT soportes_requeridos FROM sst.ordenes_servicio WHERE id=$1`, [req.params.id]))
+      .rows[0]?.soportes_requeridos,
+  ).map((c) => c.clave);
+
   const pedidas = Array.isArray(req.body?.categorias) ? req.body.categorias : null;
   let categorias;
   if (pedidas) {
@@ -911,12 +993,19 @@ router.post('/:id/reject', requireRole('admin'), asyncHandler(async (req, res) =
     if (!categorias.length) {
       throw badRequest('Marque al menos un documento para devolver al profesional.');
     }
+    const ajenas = categorias.filter((c) => !suyas.includes(c));
+    if (ajenas.length) {
+      throw badRequest(
+        `A esta orden no se le pidió ${listaEtiquetas(ajenas)}, así que no se puede devolver. ` +
+        `Sus documentos son: ${listaEtiquetas(suyas)}.`,
+      );
+    }
   } else {
     const conArchivo = (await pool.query(
       `SELECT DISTINCT COALESCE(categoria,'otros') AS categoria
          FROM sst.archivos_soporte WHERE orden_id=$1`, [req.params.id]
     )).rows.map((r) => normalizarCategoria(r.categoria));
-    categorias = conArchivo.length ? conArchivo : CATEGORIAS_SOPORTE.map((c) => c.clave);
+    categorias = conArchivo.length ? conArchivo : suyas;
   }
   const listaDocs = listaEtiquetas(categorias);
 

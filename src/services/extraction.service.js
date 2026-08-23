@@ -1,6 +1,7 @@
 import ExcelJS from 'exceljs';
-import { CANONICAL_FIELDS, classifyPdfArl } from './gemini.service.js';
+import { CAMPOS_BORRADOR, CANONICAL_FIELDS, classifyPdfArl } from './gemini.service.js';
 import { extractPdfWithOpenAI } from './openai-extraction.bridge.js';
+import { normalizarTipoActividadBolivar } from '../utils/bolivar.js';
 
 /**
  * Confianza general de la OS (0-100): promedio de la confianza de los campos que
@@ -50,7 +51,11 @@ const SIPAB_HEADERS = {
   'act reprogramadas': null,
   'aplazadas': null,
   'autor fact': null,
-  'tipo servicio': '@tipo_servicio',
+  // La LETRA del tipo de actividad del AT-031 (A/T/C/E/M/O). Estuvo mapeada a
+  // `@tipo_servicio` —contexto que no leía nadie— mientras la casilla del
+  // formato se marcaba a bolígrafo. Se sigue guardando también como contexto,
+  // en crudo, para poder ver qué decía la celda si la letra no se reconoce.
+  'tipo servicio': 'tipo_servicio_arl',
   'nro trabajadores programados': '@nro_trabajadores',
   'fecha programada': 'fecha_orden',
   'fecha ejecutada': null,
@@ -58,13 +63,16 @@ const SIPAB_HEADERS = {
   'hora programada': '@hora_programada',
   'hora ejecutada': null,
   'nivel aplicacion': null,
-  'valor transporte': null,
-  'valor alojamiento': null,
-  'valor alimentacion': null,
-  'valor tiempo muerto': null,
-  'valor desplazamiento': null,
-  'autoriza viaticos': null,
-  'valor material complementario': null,
+  // Viáticos: el SIPAB los trae y hasta ago-2026 se descartaban, así que en
+  // Bolívar no hay que teclearlos. Van como columnas auxiliares porque el campo
+  // de la orden es UNO (`viaticos_valor`) y sale de sumarlas.
+  'valor transporte': '@viat_transporte',
+  'valor alojamiento': '@viat_alojamiento',
+  'valor alimentacion': '@viat_alimentacion',
+  'valor tiempo muerto': '@viat_tiempo_muerto',
+  'valor desplazamiento': '@viat_desplazamiento',
+  'autoriza viaticos': '@autoriza_viaticos',
+  'valor material complementario': '@viat_material',
   'proveedor': null,
   'nombre proveedor': null,                 // JD&D, el proveedor: no es la empresa cliente
   'profesional': null,
@@ -256,6 +264,56 @@ function horaDeCelda(row, col) {
   return /^\d{1,2}:\d{2}/.test(s) ? s : null;
 }
 
+/** El número de una celda de valor del SIPAB: '21.020', '21020,00' o 21020. */
+function valorPesos(bruto) {
+  const s = String(bruto ?? '').trim();
+  if (!s) return 0;
+  // Se quitan los separadores de miles y se normaliza la coma decimal: el SIPAB
+  // exporta unas veces con formato y otras con el número crudo.
+  // El punto solo es separador de miles si le siguen EXACTAMENTE tres dígitos
+  // y nada más pegado: así '21.020' es 21020, pero '21.02' sigue siendo 21,02.
+  const limpio = s.replace(/[^0-9,.-]/g, '').replace(/\.(?=[0-9]{3}(?:[^0-9]|$))/g, '');
+  const n = Number(limpio.replace(',', '.'));
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+/**
+ * VIÁTICOS · Lo que la ARL autoriza además de las horas.
+ *
+ * `Autoriza Viaticos` (S/N) es el interruptor: con 'N' no hay viáticos aunque
+ * alguna columna traiga un número.
+ *
+ * ⚠️ **No se suman las seis columnas.** En el único caso autorizado del export
+ * real, `Valor Transporte` y `Valor Desplazamiento` traían **el mismo valor**
+ * (21.020 los dos), así que sumarlos duplicaría el reembolso. Se suman los
+ * cuatro conceptos de gasto y `desplazamiento` se guarda en el desglose como
+ * dato; si algún día resulta ser un concepto independiente, la cifra se corrige
+ * a mano y el desglose deja ver de dónde salía. (Pendiente de confirmar con el
+ * cliente — decisión D-9 del plan de la tanda.)
+ *
+ * `Valor Material Complementario` NO entra: es material de la actividad, no un
+ * gasto de desplazamiento. Se conserva aparte para no perderlo.
+ */
+function viaticosDelSipab(fila) {
+  const autoriza = String(fila.autoriza ?? '').trim().toUpperCase() === 'S';
+  const d = {
+    transporte: valorPesos(fila.transporte),
+    alojamiento: valorPesos(fila.alojamiento),
+    alimentacion: valorPesos(fila.alimentacion),
+    tiempo_muerto: valorPesos(fila.tiempo_muerto),
+    desplazamiento: valorPesos(fila.desplazamiento),
+    material_complementario: valorPesos(fila.material),
+  };
+  const total = d.transporte + d.alojamiento + d.alimentacion + d.tiempo_muerto;
+  return {
+    autoriza,
+    detalle: d,
+    // Sin ninguna columna de gasto pero con el visto bueno de la ARL, el
+    // desplazamiento es lo único que hay: se toma como total.
+    valor: autoriza ? (total || d.desplazamiento) : 0,
+  };
+}
+
 /**
  * Parsing determinista del Excel SIPAB (Bolívar). Confianza alta (99) para lo
  * que viene en su propia columna, más baja para lo que se deduce de un texto
@@ -313,12 +371,28 @@ export async function parseExcelSipab(buffer) {
       fields[campo] = { value: value || '', confidence: value ? confidence : 0 };
     };
 
-    // 1) Columnas directas.
+    // 1) Columnas directas. Se recorren los campos del BORRADOR y no solo los
+    //    canónicos: así `modalidad_ejecucion` nace en el JSON con valor vacío
+    //    —la hoja no la trae y la escribe quien revisa, igual que la fecha de
+    //    vencimiento— y la vista previa puede pedirla como obligatoria.
     let hasData = false;
-    for (const canonical of CANONICAL_FIELDS) {
+    for (const canonical of CAMPOS_BORRADOR) {
       const value = celda(row, colMap[canonical]);
       if (value) hasData = true;
       poner(canonical, value);
+    }
+
+    // 1b) La letra del tipo de actividad solo vale si es una de las seis del
+    //     AT-031. Una celda con otra cosa se deja VACÍA en vez de arriesgar una
+    //     equivalencia: esa casilla se radica ante la ARL, y marcar la
+    //     equivocada es peor que no marcar ninguna. El valor crudo se conserva
+    //     abajo, en el contexto `sipab`.
+    const letra = normalizarTipoActividadBolivar(fields.tipo_servicio_arl.value);
+    if (!letra) {
+      fields.tipo_servicio_arl.value = '';
+      fields.tipo_servicio_arl.confidence = 0;
+    } else {
+      fields.tipo_servicio_arl.value = letra;
     }
 
     // 2) Fechas: la misma columna trae fechas de Excel y texto "01/aug/2026".
@@ -365,9 +439,26 @@ export async function parseExcelSipab(buffer) {
       // conserva en `metadatos_extraccion` para auditoría (y para las decisiones
       // que vengan después: la unidad de medida y la hora programada son las que
       // permiten entender una orden que no se midió en horas).
+      const viaticos = viaticosDelSipab({
+        autoriza: celda(row, auxMap.autoriza_viaticos),
+        transporte: celda(row, auxMap.viat_transporte),
+        alojamiento: celda(row, auxMap.viat_alojamiento),
+        alimentacion: celda(row, auxMap.viat_alimentacion),
+        tiempo_muerto: celda(row, auxMap.viat_tiempo_muerto),
+        desplazamiento: celda(row, auxMap.viat_desplazamiento),
+        material: celda(row, auxMap.viat_material),
+      });
+      // El campo de la orden solo se rellena si de verdad hay algo que
+      // reembolsar: un 0 en el formulario invita a "corregirlo" y acaba
+      // pareciendo que la orden lleva viáticos.
+      if (viaticos.valor > 0) poner('viaticos_valor', String(viaticos.valor), 99);
+
       const sipab = {
         unidad_medida: unidad || null,
-        tipo_servicio: celda(row, auxMap.tipo_servicio) || null,
+        viaticos,
+        // En crudo, tal como venía la celda: es lo que permite entender por qué
+        // el campo `tipo_servicio_arl` salió vacío cuando la letra no encaja.
+        tipo_servicio: celda(row, colMap.tipo_servicio_arl) || null,
         nro_trabajadores: celda(row, auxMap.nro_trabajadores) || null,
         hora_programada: horaDeCelda(row, auxMap.hora_programada),
         num_poliza: (celda(row, auxMap.num_poliza) || '').replace(/^nro\.?\s*/i, '') || null,

@@ -80,5 +80,12 @@ export const uploadSupports = soportes.fields([
   { name: 'acta', maxCount: 5 },
   { name: 'asistencia', maxCount: 5 },
   { name: 'evidencias', maxCount: 5 },
+  // Informe técnico o de gestión: lo piden las asistencias técnicas de Bolívar,
+  // las asesorías de AXA y las de Colmena (ver `entrega-arl.service.js`). El
+  // campo se declara SIEMPRE aunque la orden no lo pida — multer rechaza con un
+  // error críptico ("Unexpected field") cualquier campo que no esté en la lista,
+  // y quién puede mandarlo lo decide el servidor más adelante, con un mensaje
+  // que se entiende.
+  { name: 'informe', maxCount: 5 },
   { name: 'files', maxCount: 10 },
 ]);

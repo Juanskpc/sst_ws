@@ -16,14 +16,21 @@
  */
 
 /**
- * Las tres casillas del portal, en el orden en que se piden y se revisan. El
- * `orden` es el del acta primero: es el documento que decide si la visita se
- * da por buena, así que es el que el administrador quiere ver al abrir.
+ * TODAS las casillas que el portal sabe pedir, en el orden en que se piden y se
+ * revisan. El `orden` es el del acta primero: es el documento que decide si la
+ * visita se da por buena, así que es el que el administrador quiere ver al abrir.
+ *
+ * ⚠️ **No son las que se le piden a una orden concreta.** Desde ago-2026 cada
+ * orden pide solo las suyas, que salen de la misma regla que decide sus
+ * formatos (`entrega-arl.service.js`): una asesoría de Bolívar no lleva registro
+ * fotográfico, y una asistencia técnica sí lleva informe. Esta lista es el
+ * catálogo; `casillasDeOrden()` es lo que hay que usar para una orden.
  */
 export const CATEGORIAS_SOPORTE = [
   { clave: 'acta', etiqueta: 'Acta de visita firmada', orden: 1 },
   { clave: 'asistencia', etiqueta: 'Lista de asistencia', orden: 2 },
   { clave: 'evidencias', etiqueta: 'Registro fotográfico / evidencias', orden: 3 },
+  { clave: 'informe', etiqueta: 'Informe técnico o de gestión', orden: 4 },
 ];
 
 /**
@@ -36,6 +43,35 @@ export const CATEGORIA_OTROS = { clave: 'otros', etiqueta: 'Otros soportes', ord
 const PORCLAVE = new Map(
   [...CATEGORIAS_SOPORTE, CATEGORIA_OTROS].map((c) => [c.clave, c]),
 );
+
+/**
+ * Las casillas que hay que pedirle al profesional de ESTA orden, ya expandidas
+ * a `{clave, etiqueta}` y en el orden de revisión.
+ *
+ * `requeridas` es lo que quedó congelado en `ordenes_servicio.soportes_requeridos`
+ * al asignar. Se congela y no se recalcula al vuelo a propósito: cambiar una
+ * regla mañana no puede alterar lo que ya se le pidió a alguien por un enlace
+ * que ya tiene en el correo.
+ *
+ * Sin lista —órdenes anteriores al cambio— se piden las tres de siempre, que es
+ * exactamente lo que se les pidió cuando se asignaron.
+ */
+export function casillasDeOrden(requeridas) {
+  const claves = Array.isArray(requeridas) && requeridas.length
+    ? requeridas.map((c) => String(c).trim().toLowerCase()).filter((c) => PORCLAVE.has(c))
+    : CASILLAS_HISTORICAS;
+  return [...new Set(claves)]
+    .map((c) => PORCLAVE.get(c))
+    .sort((a, b) => a.orden - b.orden)
+    .map((c) => ({ clave: c.clave, etiqueta: c.etiqueta }));
+}
+
+/**
+ * Lo que se pedía antes de que las casillas dependieran de la ARL. Es el
+ * respaldo de las órdenes ya asignadas: sus enlaces siguen vivos y el
+ * profesional tiene que poder entregar lo mismo que se le pidió.
+ */
+const CASILLAS_HISTORICAS = ['acta', 'asistencia', 'evidencias'];
 
 /** Clave válida o 'otros'. Nunca lanza: un soporte siempre se puede guardar. */
 export function normalizarCategoria(clave) {
