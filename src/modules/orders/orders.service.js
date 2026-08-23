@@ -81,8 +81,14 @@ async function aliadoEstrategico(client = pool) {
  */
 export async function generateOrderDocuments(orderId, client = pool) {
   const order = await getOrderExpanded(orderId, client);
-  const professional = order.profesional_asignado_id
-    ? (await client.query(`SELECT * FROM sst.profesionales WHERE id=$1`, [order.profesional_asignado_id])).rows[0]
+  // ASG · El nombre que va IMPRESO es el del profesional registrado ante la ARL
+  // cuando la orden lleva suplente (`profesional_formatos_id`), y el del ejecutor
+  // en el caso normal. Es el único sitio donde los dos papeles se separan: el
+  // correo, el `.ics`, el enlace de soportes, la agenda, la cuenta de cobro y la
+  // encuesta siguen apuntando a `profesional_asignado_id`, que es quien trabaja.
+  const firmanteId = order.profesional_formatos_id || order.profesional_asignado_id;
+  const professional = firmanteId
+    ? (await client.query(`SELECT * FROM sst.profesionales WHERE id=$1`, [firmanteId])).rows[0]
     : null;
 
   // Se leen aquí y no se reciben por parámetro para que el formato salga con lo

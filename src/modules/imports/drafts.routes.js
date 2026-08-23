@@ -42,13 +42,22 @@ const DRAFT_SELECT = `
          -- corregirse después.
          COALESCE(o.tipo_orden_id, d.tipo_orden_id) AS tipo_orden_id,
          tp.nombre AS tipo_orden,
-         o.valor_hora_cobro, o.valor_hora_origen, o.valor_cobro_total
+         o.valor_hora_cobro, o.valor_hora_origen, o.valor_cobro_total,
+         -- ASG · A nombre de quién salen los formatos cuando no es el ejecutor.
+         -- La vista Órdenes lo enseña en la fila para que la suplencia no sea
+         -- invisible: es un dato que hay que poder ver sin abrir la orden.
+         o.profesional_formatos_id AS os_profesional_formatos_id,
+         pfo.nombre AS os_profesional_formatos_nombre,
+         -- Eje de facturación (ago-2026): columna, pastilla y filtro de Órdenes.
+         o.estado_cobro::text AS os_estado_cobro,
+         o.cobro_numero_factura AS os_cobro_numero_factura
   FROM sst.borradores_extraccion d
   LEFT JOIN sst.arls a ON a.id = d.arl_id
   LEFT JOIN sst.lotes_importacion b ON b.id = d.lote_importacion_id
   LEFT JOIN sst.profesionales p ON p.id = d.profesional_asignado_id
   LEFT JOIN sst.ordenes_servicio o ON o.id = d.orden_servicio_id
   LEFT JOIN sst.profesionales po ON po.id = o.profesional_asignado_id
+  LEFT JOIN sst.profesionales pfo ON pfo.id = o.profesional_formatos_id
   LEFT JOIN sst.tipos_orden tp ON tp.id = COALESCE(o.tipo_orden_id, d.tipo_orden_id)`;
 
 // Vista "Órdenes" (M3). Filtrable por estado y por soft-delete.

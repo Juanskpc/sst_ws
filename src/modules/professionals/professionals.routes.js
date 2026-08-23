@@ -1,11 +1,12 @@
 import { Router } from 'express';
-import { pool } from '../../config/db.js';
+import { pool, withTransaction } from '../../config/db.js';
 import { asyncHandler } from '../../utils/asyncHandler.js';
 import { badRequest, conflict, notFound } from '../../utils/httpError.js';
 import { authRequired, requireRole } from '../../middleware/auth.js';
 import {
   validarNombre, validarCorreo, validarTelefono, validarTextoOpcional, validarValorHora,
 } from '../../utils/personas.js';
+import { parseFechaCO } from '../../utils/parseo.js';
 
 const router = Router();
 router.use(authRequired);
@@ -95,6 +96,33 @@ async function enlazarCuenta(profesionalId, correo) {
   }
 }
 
+/**
+ * ASG · El registro del profesional ante cada ARL, agregado en una sola columna.
+ *
+ * Va como subconsulta con `json_agg` y no como JOIN por el motivo de siempre:
+ * un JOIN multiplicaría la ficha por cada ARL y el desempeño (órdenes, notas)
+ * saldría repetido en cada copia.
+ *
+ * Solo se listan los registros VIGENTES en el sentido de la fecha —
+ * `vigente_hasta` nulo o futuro—, pero el `registrado` se devuelve tal cual: un
+ * registro caducado no es lo mismo que no tenerlo, y quien asigna necesita ver
+ * la diferencia.
+ */
+const REGISTROS_ARL = `COALESCE((
+  SELECT json_agg(json_build_object(
+           'arl_id', pa.arl_id,
+           'arl_nombre', a.nombre,
+           'registrado', pa.registrado,
+           'codigo_registro', pa.codigo_registro,
+           'vigente_hasta', to_char(pa.vigente_hasta, 'YYYY-MM-DD'),
+           'vencido', pa.vigente_hasta IS NOT NULL AND pa.vigente_hasta < CURRENT_DATE,
+           'observacion', pa.observacion
+         ) ORDER BY a.nombre)
+    FROM sst.profesionales_arl pa
+    JOIN sst.arls a ON a.id = pa.arl_id
+   WHERE pa.profesional_id = p.id
+), '[]'::json)`;
+
 // CFG-01 · Listado (con buscador rápido opcional ?q=)
 router.get('/', asyncHandler(async (req, res) => {
   const { q } = req.query;
@@ -114,7 +142,12 @@ router.get('/', asyncHandler(async (req, res) => {
             d.encuestas_enviadas,
             d.encuestas_respondidas,
             d.calificacion_promedio,
-            d.ultima_calificacion_en
+            d.ultima_calificacion_en,
+            -- ASG · Ante qué ARL está registrado. Viaja con la ficha porque lo
+            -- leen dos pantallas a la vez: la columna de pastillas de
+            -- /profesionales y el segundo selector del modal de asignación, que
+            -- solo puede ofrecer a los registrados ante la ARL de esa orden.
+            ${REGISTROS_ARL} AS registros_arl
        FROM sst.profesionales p
        JOIN sst.vw_profesionales_desempeno d ON d.profesional_id = p.id
        ${where}
@@ -146,6 +179,119 @@ router.get('/:id/encuestas', asyncHandler(async (req, res) => {
     `SELECT * FROM sst.vw_profesionales_desempeno WHERE profesional_id = $1`, [req.params.id]
   );
   res.json({ data: r.rows, resumen: resumen.rows[0] || null });
+}));
+
+// ---------------------------------------------------------------------------
+// ASG · Registro del profesional ante las ARL
+//
+// Bolívar solo acepta que ejecuten sus órdenes profesionales que ella misma
+// tiene registrados y aprobados, y no todo el equipo lo está. El registro es
+// POR ARL, caduca y lo identifica un código que asigna la propia ARL, así que
+// no cabe como un campo más de la ficha.
+//
+// De aquí sale la lista del segundo selector del modal de asignación: cuando la
+// visita la ejecuta alguien sin registro, los formatos salen a nombre de uno
+// que sí lo tenga (`ordenes_servicio.profesional_formatos_id`).
+// ---------------------------------------------------------------------------
+
+/**
+ * Lo que hay registrado hoy para este profesional, con una fila por cada ARL
+ * del catálogo —tenga registro o no—. Devolver también las que faltan es lo que
+ * permite que el formulario sea una sola tabla: sin ellas la pantalla tendría
+ * que cruzar el catálogo por su cuenta y "no registrado" y "ARL nueva" se
+ * verían distinto sin serlo.
+ */
+router.get('/:id/arls', asyncHandler(async (req, res) => {
+  await ensureProfessional(req.params.id);
+  const r = await pool.query(
+    `SELECT a.id AS arl_id, a.nombre AS arl_nombre,
+            COALESCE(pa.registrado, FALSE) AS registrado,
+            pa.codigo_registro,
+            to_char(pa.vigente_hasta, 'YYYY-MM-DD') AS vigente_hasta,
+            (pa.vigente_hasta IS NOT NULL AND pa.vigente_hasta < CURRENT_DATE) AS vencido,
+            pa.observacion, pa.actualizado_en
+       FROM sst.arls a
+       LEFT JOIN sst.profesionales_arl pa
+              ON pa.arl_id = a.id AND pa.profesional_id = $1
+      ORDER BY a.nombre`,
+    [req.params.id]
+  );
+  res.json({ data: r.rows });
+}));
+
+/**
+ * Guarda el registro ante TODAS las ARL de una vez (admin).
+ *
+ * Es un reemplazo en bloque y no un PATCH por ARL a propósito: la pantalla es
+ * una tabla con una fila por ARL y un solo botón de guardar, así que mandar el
+ * estado completo evita el caso de una fila guardada y otra no. Las ARL que
+ * llegan sin registro se BORRAN de la tabla en vez de guardarse con
+ * `registrado = false`: "no está registrado" es la ausencia de registro, y
+ * dejar filas vacías llenaría la tabla de ruido.
+ */
+router.put('/:id/arls', requireRole('admin'), asyncHandler(async (req, res) => {
+  await ensureProfessional(req.params.id);
+  const registros = req.body?.registros;
+  if (!Array.isArray(registros)) throw badRequest('Se esperaba una lista "registros"');
+
+  const arls = await pool.query(`SELECT id FROM sst.arls`);
+  const validas = new Set(arls.rows.map((a) => a.id));
+
+  await withTransaction(async (client) => {
+    for (const reg of registros) {
+      const arlId = String(reg?.arl_id ?? '').trim();
+      if (!validas.has(arlId)) throw badRequest('Una de las ARL enviadas no existe en el catálogo');
+
+      if (!reg?.registrado) {
+        await client.query(
+          `DELETE FROM sst.profesionales_arl WHERE profesional_id=$1 AND arl_id=$2`,
+          [req.params.id, arlId]
+        );
+        continue;
+      }
+      // La fecha se valida aquí y no en la columna: un texto que no es fecha
+      // llegaría a Postgres como error del driver, y lo que hay que decirle a
+      // quien lo escribió es qué campo está mal, no `invalid input syntax`.
+      const vigenteHasta = reg?.vigente_hasta ? parseFechaCO(reg.vigente_hasta) : null;
+      if (reg?.vigente_hasta && !vigenteHasta) {
+        throw badRequest('La vigencia del registro debe ser una fecha (AAAA-MM-DD).');
+      }
+      await client.query(
+        `INSERT INTO sst.profesionales_arl
+           (profesional_id, arl_id, registrado, codigo_registro, vigente_hasta, observacion)
+         VALUES ($1,$2,TRUE,$3,$4,$5)
+         ON CONFLICT (profesional_id, arl_id) DO UPDATE SET
+           registrado = TRUE,
+           codigo_registro = EXCLUDED.codigo_registro,
+           vigente_hasta   = EXCLUDED.vigente_hasta,
+           observacion     = EXCLUDED.observacion,
+           actualizado_en  = now()`,
+        [
+          req.params.id, arlId,
+          // El código lo asigna la ARL y puede ser corto ("B-7"): el mínimo de
+          // 3 caracteres de `validarTextoOpcional` lo rechazaría.
+          validarTextoOpcional(reg?.codigo_registro, 'El código de registro', { minimo: 1, maximo: 60 }),
+          vigenteHasta,
+          validarTextoOpcional(reg?.observacion, 'La observación', { minimo: 1, maximo: 300 }),
+        ]
+      );
+    }
+  });
+
+  const r = await pool.query(
+    `SELECT a.id AS arl_id, a.nombre AS arl_nombre,
+            COALESCE(pa.registrado, FALSE) AS registrado,
+            pa.codigo_registro,
+            to_char(pa.vigente_hasta, 'YYYY-MM-DD') AS vigente_hasta,
+            (pa.vigente_hasta IS NOT NULL AND pa.vigente_hasta < CURRENT_DATE) AS vencido,
+            pa.observacion, pa.actualizado_en
+       FROM sst.arls a
+       LEFT JOIN sst.profesionales_arl pa
+              ON pa.arl_id = a.id AND pa.profesional_id = $1
+      ORDER BY a.nombre`,
+    [req.params.id]
+  );
+  res.json({ data: r.rows });
 }));
 
 router.get('/:id', asyncHandler(async (req, res) => {

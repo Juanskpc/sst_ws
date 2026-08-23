@@ -67,6 +67,57 @@ async function valorHoraDeOrden({ ordenId, profesional }, client) {
 }
 
 /**
+ * ASG · Quién firma los formatos cuando NO es quien ejecuta la visita.
+ *
+ * Bolívar solo acepta radicados a nombre de profesionales que ella tiene
+ * registrados y aprobados, y no todo el equipo lo está. El puente es este: la
+ * visita la hace quien puede hacerla y **el formato sale a nombre de un
+ * registrado**. Todo lo demás —correo, `.ics`, enlace de soportes, agenda,
+ * cuenta de cobro, encuesta— sigue siendo del ejecutor.
+ *
+ * Devuelve `null` cuando no hay suplencia (nadie elegido, o el elegido es el
+ * propio ejecutor): la columna se guarda en NULL y los formatos salen como
+ * siempre, a nombre de quien ejecuta.
+ *
+ * Se comprueba el registro ANTE LA ARL DE ESTA ORDEN, no "que esté registrado en
+ * algo": poner a un registrado de Colmena en un AT-031 de Bolívar deja el mismo
+ * formato que la ARL va a devolver, y encima con la apariencia de estar bien.
+ */
+async function resolverProfesionalDeFormatos({ ordenId, ejecutorId, elegidoId }, client) {
+  if (!elegidoId || elegidoId === ejecutorId) return null;
+
+  const r = await client.query(
+    `SELECT p.*, a.nombre AS arl_nombre,
+            pa.registrado, pa.codigo_registro,
+            to_char(pa.vigente_hasta, 'YYYY-MM-DD') AS vigente_hasta,
+            (pa.vigente_hasta IS NOT NULL AND pa.vigente_hasta < CURRENT_DATE) AS vencido
+       FROM sst.profesionales p
+       CROSS JOIN LATERAL (SELECT o.arl_id FROM sst.ordenes_servicio o WHERE o.id = $2) ord
+       JOIN sst.arls a ON a.id = ord.arl_id
+       LEFT JOIN sst.profesionales_arl pa
+              ON pa.profesional_id = p.id AND pa.arl_id = ord.arl_id
+      WHERE p.id = $1`,
+    [elegidoId, ordenId]
+  );
+  const elegido = r.rows[0];
+  if (!elegido) throw badRequest('El profesional elegido para los formatos no existe.');
+  if (elegido.estado !== 'Activo') {
+    throw badRequest(`${elegido.nombre} está Inactivo y no puede figurar en los formatos.`);
+  }
+  if (!elegido.registrado) {
+    throw badRequest(
+      `${elegido.nombre} no está registrado ante ${elegido.arl_nombre}. Los formatos solo pueden ` +
+      'salir a nombre de un profesional registrado ante la ARL de la orden; el registro se ' +
+      'marca en Profesionales → Registro ante las ARL.'
+    );
+  }
+  // La vigencia caducada NO bloquea: la fecha la teclea el administrador y
+  // puede estar desactualizada, mientras que la orden hay que asignarla hoy.
+  // Se avisa en la respuesta (`avisoFormatos`) para que alguien la revise.
+  return elegido;
+}
+
+/**
  * ENC-01 · Dispara la encuesta de satisfacción cuando una OS queda FINALIZADA.
  *
  * El disparador es el cierre REAL del ciclo, no la subida de soportes: mandarla
@@ -196,10 +247,17 @@ function franjasEnTexto(franjas) {
 // M3 · Listado filtrable (EST-05): estado, arl_id, profesional_id, q.
 router.get('/', asyncHandler(async (req, res) => {
   const estado = req.query.estado || req.query.status;
-  const { arl_id, profesional_id, q } = req.query;
+  const { arl_id, profesional_id, q, estado_cobro } = req.query;
   const clauses = [];
   const params = [];
   if (estado) { params.push(estado); clauses.push(`estado = $${params.length}::sst.estado_orden`); }
+  // El eje de facturación filtra aparte del ciclo operativo: la pregunta que se
+  // hace desde Órdenes es "qué está finalizado y sin radicar", que son los dos
+  // ejes a la vez.
+  if (estado_cobro) {
+    params.push(estado_cobro);
+    clauses.push(`estado_cobro = $${params.length}::sst.estado_cobro`);
+  }
   if (arl_id) { params.push(arl_id); clauses.push(`arl_id = $${params.length}`); }
   if (profesional_id) { params.push(profesional_id); clauses.push(`profesional_asignado_id = $${params.length}`); }
   if (q) {
@@ -288,10 +346,128 @@ router.get('/mias', asyncHandler(async (req, res) => {
   });
 }));
 
+// ---------------------------------------------------------------------------
+// Estado de FACTURACIÓN de la orden (ago-2026, petición 6 del cliente)
+//
+// Es un eje INDEPENDIENTE del ciclo operativo: una OS FINALIZADA puede estar sin
+// facturar, radicada ante la ARL, aprobada, facturada o pagada. Por eso no toca
+// `sst.estado_orden` —que está protegido por su matriz de transiciones y por el
+// trigger de EST-06— sino su propia columna, su propio enum y su propio historial.
+//
+// No es la Cartera (RPT-06) que se retiró el 19-ago-2026: aquello era un reporte
+// con tres fechas sueltas que nadie llenaba. Esto es un estado de la orden, se
+// marca en lote y deja constancia de quién lo movió.
+// ---------------------------------------------------------------------------
+
+/** El eje, en orden. El primero es el valor por defecto de toda orden nueva. */
+const ESTADOS_COBRO = ['NO FACTURADA', 'RADICADA', 'APROBADA', 'FACTURADA', 'PAGADA'];
+
+/**
+ * Marcado en LOTE del estado de cobro (admin y contador).
+ *
+ * En lote porque así es como se factura: se radica un paquete de órdenes ante la
+ * ARL y se marcan todas de una vez. Un endpoint de a una obligaría a cuarenta
+ * clics y acabaría sin usarse, que es exactamente lo que le pasó a la Cartera.
+ *
+ * Va declarado ANTES de `/:id` por la misma razón que `/mias`: Express resuelve
+ * por orden de declaración y un comodín que aceptara 'cobro' como id sería un
+ * error de Postgres, no un 404.
+ *
+ * El eje solo se mueve sobre órdenes FINALIZADAS (decisión D-7): antes del
+ * cierre no hay nada que facturarle a la ARL. Las que no cumplen no tumban el
+ * lote —marcar treinta y perderlas todas por una sería peor— pero se devuelven
+ * enumeradas para que quien marca sepa cuáles quedaron fuera.
+ */
+router.patch('/cobro', requireRole('admin', 'contador'), asyncHandler(async (req, res) => {
+  const ids = Array.isArray(req.body?.ids) ? req.body.ids.map((x) => String(x ?? '').trim()).filter(Boolean) : [];
+  const estado = String(req.body?.estado ?? '').trim().toUpperCase();
+  if (!ids.length) throw badRequest('Seleccione al menos una orden.');
+  if (!ESTADOS_COBRO.includes(estado)) {
+    throw badRequest(`El estado de cobro debe ser uno de: ${ESTADOS_COBRO.join(', ')}.`);
+  }
+  const numeroFactura = String(req.body?.numero_factura ?? '').trim() || null;
+  const observacion = String(req.body?.observacion ?? '').trim() || null;
+  // El número de factura es el dato por el que se busca una orden cuando la ARL
+  // pregunta: exigirlo justo en el estado que lo produce evita una tabla llena
+  // de "FACTURADA" sin decir con qué factura.
+  if (estado === 'FACTURADA' && !numeroFactura) {
+    throw badRequest('Indique el número de factura para marcar las órdenes como FACTURADA.');
+  }
+
+  const resultado = await withTransaction(async (client) => {
+    const filas = await client.query(
+      `SELECT id, codigo, estado::text AS estado, estado_cobro::text AS estado_cobro
+         FROM sst.ordenes_servicio WHERE id = ANY($1::uuid[]) FOR UPDATE`,
+      [ids]
+    );
+    const encontradas = new Set(filas.rows.map((f) => f.id));
+    const inexistentes = ids.filter((id) => !encontradas.has(id));
+
+    const aptas = filas.rows.filter((f) => f.estado === 'FINALIZADA');
+    const sinCerrar = filas.rows.filter((f) => f.estado !== 'FINALIZADA');
+    // Las que ya estaban en ese estado se saltan en silencio: volver a marcar lo
+    // mismo no es un error, pero escribir otra fila de historial idéntica
+    // llenaría la auditoría de ruido y taparía el cambio de verdad.
+    const cambian = aptas.filter((f) => f.estado_cobro !== estado);
+
+    for (const fila of cambian) {
+      await client.query(
+        `UPDATE sst.ordenes_servicio
+            SET estado_cobro = $2::sst.estado_cobro,
+                cobro_numero_factura = COALESCE($3, cobro_numero_factura),
+                cobro_observacion = $4,
+                cobro_actualizado_en = now(),
+                cobro_actualizado_por = $5,
+                actualizado_en = now()
+          WHERE id = $1`,
+        [fila.id, estado, numeroFactura, observacion, req.user.sub]
+      );
+      await client.query(
+        `INSERT INTO sst.historial_cobro_orden
+           (orden_id, estado_anterior, estado_nuevo, numero_factura, observacion, cambiado_por)
+         VALUES ($1,$2::sst.estado_cobro,$3::sst.estado_cobro,$4,$5,$6)`,
+        [fila.id, fila.estado_cobro, estado, numeroFactura, observacion, req.user.sub]
+      );
+    }
+    return {
+      actualizadas: cambian.map((f) => f.id),
+      sin_cambio: aptas.filter((f) => f.estado_cobro === estado).map((f) => f.codigo),
+      no_finalizadas: sinCerrar.map((f) => f.codigo),
+      inexistentes,
+    };
+  });
+
+  const n = resultado.actualizadas.length;
+  const partes = [`${n} orden${n === 1 ? '' : 'es'} marcada${n === 1 ? '' : 's'} como ${estado}.`];
+  if (resultado.sin_cambio.length) {
+    partes.push(`${resultado.sin_cambio.length} ya estaba${resultado.sin_cambio.length === 1 ? '' : 'n'} en ese estado.`);
+  }
+  if (resultado.no_finalizadas.length) {
+    partes.push(
+      `Quedaron fuera ${resultado.no_finalizadas.join(', ')}: el estado de cobro solo se mueve ` +
+      'sobre órdenes FINALIZADAS.'
+    );
+  }
+  res.json({ message: partes.join(' '), estado, ...resultado });
+}));
+
+/** Historial del eje de cobro de UNA orden: quién la movió, cuándo y por qué. */
+router.get('/:id/cobro', asyncHandler(async (req, res) => {
+  const r = await pool.query(
+    `SELECT h.*, u.nombre AS cambiado_por_nombre
+       FROM sst.historial_cobro_orden h
+       LEFT JOIN sst.usuarios u ON u.id = h.cambiado_por
+      WHERE h.orden_id = $1
+      ORDER BY h.cambiado_en`,
+    [req.params.id]
+  );
+  res.json({ data: r.rows });
+}));
+
 // Detalle completo: OS + historial + documentos + soportes + enlace público.
 router.get('/:id', asyncHandler(async (req, res) => {
   const orden = await getOrderExpanded(req.params.id);
-  const [historial, docs, soportes, enlace, franjas] = await Promise.all([
+  const [historial, docs, soportes, enlace, franjas, historialCobro] = await Promise.all([
     pool.query(
       `SELECT h.*, u.nombre AS cambiado_por_nombre FROM sst.historial_estados_orden h
        LEFT JOIN sst.usuarios u ON u.id = h.cambiado_por
@@ -300,11 +476,19 @@ router.get('/:id', asyncHandler(async (req, res) => {
     pool.query(`SELECT * FROM sst.archivos_soporte WHERE orden_id=$1 ORDER BY subido_en`, [req.params.id]),
     pool.query(`SELECT * FROM sst.enlaces_publicos WHERE orden_id=$1 AND activo ORDER BY creado_en DESC LIMIT 1`, [req.params.id]),
     franjasDeOrden(req.params.id),
+    // El eje de cobro lleva su propio historial, aparte del de estados: son dos
+    // líneas de tiempo distintas sobre la misma orden y mezclarlas haría ilegible
+    // cualquiera de las dos.
+    pool.query(
+      `SELECT h.*, u.nombre AS cambiado_por_nombre FROM sst.historial_cobro_orden h
+       LEFT JOIN sst.usuarios u ON u.id = h.cambiado_por
+       WHERE h.orden_id=$1 ORDER BY h.cambiado_en`, [req.params.id]),
   ]);
   res.json({
     data: {
       ...orden,
       historial: historial.rows,
+      historial_cobro: historialCobro.rows,
       documentos: docs.rows,
       soportes: soportes.rows,
       franjas,
@@ -481,6 +665,11 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
     ? instanteCO(franjas[0].fecha, franjas[0].hora_inicio)
     : req.body?.fecha_programada || req.body?.scheduled_at || null;
 
+  // ASG · A nombre de quién salen los formatos, cuando no es quien ejecuta.
+  // Vacío o igual al ejecutor = el caso normal, y se guarda NULL: una columna
+  // que repite el valor de al lado invita a leerla como si dijera algo.
+  const formatosIdBruto = String(req.body?.profesional_formatos_id ?? '').trim() || null;
+
   const result = await withTransaction(async (client) => {
     const prof = await client.query(`SELECT * FROM sst.profesionales WHERE id=$1`, [profesionalId]);
     if (!prof.rows[0]) throw badRequest('Profesional no existe');
@@ -515,6 +704,14 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
     // Solo se programa cuando la visita está repartida por completo.
     const completa = cuadranLasHoras(franjas, horasOrden);
 
+    // ASG · El profesional a cuyo nombre salen los formatos. Solo tiene sentido
+    // si está REGISTRADO ante la ARL de esta orden: el punto entero de la
+    // petición es que Bolívar solo acepta radicados a nombre de los suyos, así
+    // que dejar poner a cualquiera devolvería el formato al mismo problema.
+    const formatosProf = await resolverProfesionalDeFormatos(
+      { ordenId: req.params.id, ejecutorId: profesionalId, elegidoId: formatosIdBruto }, client,
+    );
+
     // ASG-05 · La secuencia sube en el mismo UPDATE que la fecha: si se llevara
     // aparte, dos reprogramaciones seguidas podrían mandar el mismo SEQUENCE y
     // el calendario del profesional ignoraría la segunda.
@@ -535,10 +732,14 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
               fecha_programada=$3,
               valor_hora_cobro=$4,
               valor_hora_origen=$5,
+              profesional_formatos_id=$6,
               secuencia_calendario = secuencia_calendario + 1
         WHERE id=$1
       RETURNING secuencia_calendario`,
-      [req.params.id, profesionalId, fechaProgramada, tarifa.valorHora, tarifa.origen]
+      [
+        req.params.id, profesionalId, fechaProgramada, tarifa.valorHora, tarifa.origen,
+        formatosProf?.id ?? null,
+      ]
     );
 
     // ASG-02 · Las franjas se reemplazan en bloque: reprogramar es volver a
@@ -629,6 +830,7 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
     const orden = await getOrderExpanded(req.params.id, client);
     return {
       orden, profesional: prof.rows[0], docs, token, esReprogramacion, completa, entrega,
+      formatosProf,
       secuenciaCalendario: guardada.rows[0].secuencia_calendario,
       franjas: await franjasDeOrden(req.params.id, client),
       franjasPrevias,
@@ -697,6 +899,14 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
   // con ese dato, y descubrirlos al recibir la cuenta de cobro llega tarde.
   const viaticos = Number(o.viaticos_valor) || 0;
   const viaticosTexto = viaticos > 0 ? enPesosCO(viaticos) : null;
+  // ASG · Si los formatos van a nombre de OTRO, el profesional tiene que
+  // enterarse por este correo. Si no, abre el AT-031, ve un nombre que no es el
+  // suyo y llama por teléfono creyendo que hubo un error de la plataforma.
+  const notaSuplente = result.formatosProf
+    ? `Los formatos de esta orden salen a nombre de ${result.formatosProf.nombre}, que es quien ` +
+      `está registrado ante ${o.arl_nombre}. La visita la ejecuta usted: firme como asistente y ` +
+      `deje el nombre impreso tal como viene.`
+    : null;
 
   let correoEnviado = true;
   let correoError = null;
@@ -724,6 +934,7 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
         `Horas: ${horasTexto(o.horas_asignadas)}\n` +
         (lugar ? `Lugar: ${lugar}\n` : '') +
         (contacto ? `Contacto SST: ${contacto}\n` : '') +
+        (notaSuplente ? `\n${notaSuplente}\n` : '') +
         '\n' +
         // Sin plantillas activas para la ARL no hay PDFs que adjuntar (CFG-03):
         // prometer unos formatos que no van deja al profesional buscándolos.
@@ -758,6 +969,7 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
             filaDato('Viáticos aprobados', viaticosTexto),
             filaDato('Lugar', lugar),
             filaDato('Contacto SST', contacto),
+            filaDato('Formatos a nombre de', result.formatosProf?.nombre ?? null),
           ]),
           // Con una sola franja el bloque igual se usa: es donde el ojo va a
           // buscar el cuándo, y mantenerlo evita dos maquetas distintas.
@@ -775,6 +987,9 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
                 `los datos de esta orden. Solo tienes que imprimirlos y completar en la sesión ` +
                 `lo que falta: asistentes, temas desarrollados, observaciones y firmas.`,
               ),
+          // ASG · El nombre impreso no es el suyo, y hay que decírselo aquí: es
+          // lo primero que va a ver al abrir el PDF adjunto.
+          notaSuplente ? bloqueAviso(notaSuplente) : '',
           // La regla de la ARL, cuando hay algo que explicar: por qué esta
           // capacitación virtual no lleva AT-028, o que hay que redactar un
           // informe. Va como aviso destacado, no como un párrafo más.
@@ -823,6 +1038,14 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
   // actividad, sin la letra del AT-031, sin horas) se dice AQUÍ, que es el único
   // momento en que alguien puede corregirlo antes de que el profesional ejecute.
   const avisoEntrega = avisoDeEntrega(result.orden, result.entrega);
+  // ASG · La vigencia caducada no bloquea la asignación (la fecha la teclea un
+  // administrador y puede estar sin actualizar), pero sí se dice: si el registro
+  // de verdad venció, la ARL va a devolver el radicado.
+  const avisoFormatos = result.formatosProf?.vencido
+    ? `El registro de ${result.formatosProf.nombre} ante ${result.orden.arl_nombre} figura ` +
+      `vencido el ${result.formatosProf.vigente_hasta}. Los formatos salieron a su nombre; ` +
+      'confirme la vigencia con la ARL o actualícela en Profesionales.'
+    : null;
   res.json({
     message: correoEnviado
       ? `OS ${accion}, formatos generados y correo enviado.`
@@ -836,8 +1059,14 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
       tipo_actividad: result.entrega.tipo,
       formatos: result.docs.map((d) => d.tipo),
       soportes: result.entrega.soportes,
-      aviso: avisoEntrega,
+      // Los dos avisos se juntan aquí y no en dos campos: la vista los enseña en
+      // el mismo sitio y separarlos solo obligaría a repetir el mismo `if`.
+      aviso: [avisoFormatos, avisoEntrega].filter(Boolean).join(' ') || null,
     },
+    // ASG · A nombre de quién salieron los formatos, cuando no es el ejecutor.
+    profesional_formatos: result.formatosProf
+      ? { id: result.formatosProf.id, nombre: result.formatosProf.nombre }
+      : null,
     // CFG-03 · Cuántos formatos salieron adjuntos. En cero el correo llegó sin
     // documentos porque la ARL no tiene plantillas activas, y eso hay que
     // decírselo a quien asigna: es un vacío de configuración, no del envío.

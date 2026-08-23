@@ -10,9 +10,11 @@ Backend Node.js (Express 5 + PostgreSQL/Neon) para la plataforma de gestión de
 
 > 🚩 **"Continúa con el trabajo pendiente que nos pidió el cliente"** = la tanda
 > del **22-ago-2026**. Empieza por **`jdd_consultores_app/docs/plan-peticiones-22-ago-2026.md`**,
-> sección **§0 "Dónde retomar"**. Van construidas las fases 1, 2 y 3 (los
-> enumerados del AT-031 de Bolívar, la matriz de formatos y soportes por ARL, y
-> los viáticos); lo siguiente es la fase 4.
+> sección **§0 "Dónde retomar"**. **Las cinco fases están construidas y
+> migradas** (los enumerados del AT-031 de Bolívar, la matriz de formatos y
+> soportes por ARL, los viáticos, el profesional registrado ante la ARL con su
+> suplente, y el eje de facturación). Ya no queda código de la tanda: lo que
+> falta son las nueve decisiones con el cliente y verla funcionando en la app.
 >
 > ⚠️ Ese trabajo está en la rama **`tanda-22-ago-formatos-y-viaticos`**, que
 > existe con el mismo nombre en los dos repos. En `master` no está.

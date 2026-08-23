@@ -198,6 +198,29 @@ CREATE TABLE IF NOT EXISTS sst.arls (
   formato_origen  sst.formato_arl NOT NULL
 );
 
+-- ⭐ ASG · Profesionales REGISTRADOS ante cada ARL (ago-2026, a pedido del cliente)
+--
+-- Bolívar solo acepta que ejecuten sus órdenes profesionales que ella misma tiene
+-- registrados y aprobados en su base, y no todo el equipo de JD&D lo está. El
+-- registro NO es un atributo del profesional: es **por ARL**, caduca, y lo
+-- identifica un código que asigna la propia ARL. Por eso es tabla y no una
+-- columna booleana en `profesionales`.
+--
+-- De aquí sale la lista del segundo selector del modal de asignación: cuando
+-- ejecuta un profesional sin registro, los formatos salen a nombre de uno que sí
+-- lo tenga (`ordenes_servicio.profesional_formatos_id`, más abajo).
+CREATE TABLE IF NOT EXISTS sst.profesionales_arl (
+  profesional_id  UUID NOT NULL REFERENCES sst.profesionales(id) ON DELETE CASCADE,
+  arl_id          UUID NOT NULL REFERENCES sst.arls(id),
+  registrado      BOOLEAN NOT NULL DEFAULT TRUE,
+  codigo_registro TEXT,
+  vigente_hasta   DATE,
+  observacion     TEXT,
+  actualizado_en  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (profesional_id, arl_id)
+);
+CREATE INDEX IF NOT EXISTS idx_profesionales_arl_arl ON sst.profesionales_arl(arl_id) WHERE registrado;
+
 -- CFG-02 · Empresas clientes ---------------------------------------------------
 -- Hasta ahora la empresa vivía como texto suelto dentro de cada OS
 -- (empresa_nombre + nit_nic, tal como los extrae la IA del documento de la ARL).
@@ -533,6 +556,64 @@ ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS soportes_requeridos TE
 ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS viaticos_valor       NUMERIC(14,2);
 ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS viaticos_detalle     JSONB;
 ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS viaticos_observacion TEXT;
+
+
+-- ⭐ ASG · El profesional a cuyo NOMBRE salen los formatos (ago-2026).
+--
+-- Bolívar solo acepta profesionales registrados ante ella (ver
+-- `sst.profesionales_arl`). Cuando la visita la ejecuta alguien sin registro, el
+-- formato tiene que ir a nombre de un registrado, pero **todo lo demás sigue
+-- siendo de quien ejecuta**: el correo, el enlace de soportes, la agenda, la
+-- cuenta de cobro y la encuesta.
+--
+-- Por eso NO se invierte el significado de `profesional_asignado_id`, que sigue
+-- siendo QUIEN EJECUTA: sobre esa columna están construidas la agenda, las
+-- ocupaciones, `vw_horas_ejecutadas`, `vw_profesionales_desempeno`, la cuenta de
+-- cobro, la encuesta, `/orders/mias` y la campanita. Darle otro sentido obligaría
+-- a repasar todo eso y a equivocarse en algún sitio.
+--
+-- NULL = el caso normal: los formatos salen a nombre de quien ejecuta.
+ALTER TABLE sst.ordenes_servicio
+  ADD COLUMN IF NOT EXISTS profesional_formatos_id UUID REFERENCES sst.profesionales(id) ON DELETE SET NULL;
+
+-- ⭐ Estado de FACTURACIÓN de la orden (ago-2026, petición 6 del cliente).
+--
+-- Es un EJE INDEPENDIENTE del ciclo operativo, no un estado más de
+-- `sst.estado_orden`. Una OS FINALIZADA puede estar sin facturar, radicada ante
+-- la ARL, aprobada, facturada o pagada; meterlo en el mismo enum obligaría a un
+-- producto cartesiano de estados y a rehacer la matriz de transiciones y el
+-- trigger de EST-06.
+--
+-- No es la Cartera (RPT-06) que se retiró el 19-ago-2026: aquello era un REPORTE
+-- con tres fechas sueltas que nadie llenaba; esto es un estado de la orden, con
+-- su historial y su marcado en lote.
+DO $ BEGIN
+  CREATE TYPE sst.estado_cobro AS ENUM ('NO FACTURADA','RADICADA','APROBADA','FACTURADA','PAGADA');
+EXCEPTION WHEN duplicate_object THEN NULL; END $;
+
+ALTER TABLE sst.ordenes_servicio
+  ADD COLUMN IF NOT EXISTS estado_cobro sst.estado_cobro NOT NULL DEFAULT 'NO FACTURADA';
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS cobro_numero_factura  TEXT;
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS cobro_observacion     TEXT;
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS cobro_actualizado_en  TIMESTAMPTZ;
+ALTER TABLE sst.ordenes_servicio
+  ADD COLUMN IF NOT EXISTS cobro_actualizado_por UUID REFERENCES sst.usuarios(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_ordenes_estado_cobro ON sst.ordenes_servicio(estado_cobro);
+
+-- Espejo de `historial_estados_orden` para el eje de cobro. La pregunta que el
+-- cliente va a hacer es «¿quién marcó esto como radicado y cuándo?», y una fecha
+-- suelta en la orden no la responde: solo dice cuándo fue el ÚLTIMO cambio.
+CREATE TABLE IF NOT EXISTS sst.historial_cobro_orden (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  orden_id        UUID NOT NULL REFERENCES sst.ordenes_servicio(id) ON DELETE CASCADE,
+  estado_anterior sst.estado_cobro,
+  estado_nuevo    sst.estado_cobro NOT NULL,
+  numero_factura  TEXT,
+  observacion     TEXT,
+  cambiado_por    UUID REFERENCES sst.usuarios(id) ON DELETE SET NULL,
+  cambiado_en     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_historial_cobro_orden ON sst.historial_cobro_orden(orden_id, cambiado_en);
 
 -- ⭐ EST-03 · Historial de estados (auditoría + event source) ------------------
 CREATE TABLE IF NOT EXISTS sst.historial_estados_orden (
@@ -1043,6 +1124,9 @@ SELECT o.*,
        a.formato_origen AS arl_formato,
        p.nombre         AS profesional_nombre,
        p.correo         AS profesional_correo,
+       -- ASG · Quién firma los formatos cuando NO es quien ejecuta (el
+       -- profesional registrado ante la ARL). NULL en el caso normal.
+       pf.nombre        AS profesional_formatos_nombre,
        -- CFG-04 · El NOMBRE del tipo de orden viaja resuelto: la vista de
        -- Órdenes lo enseña en cada fila y pedir el catálogo aparte para
        -- traducir un id sería un viaje por pantalla.
@@ -1051,6 +1135,7 @@ SELECT o.*,
 FROM sst.ordenes_servicio o
 JOIN sst.arls a               ON a.id = o.arl_id
 LEFT JOIN sst.profesionales p ON p.id = o.profesional_asignado_id
+LEFT JOIN sst.profesionales pf ON pf.id = o.profesional_formatos_id
 LEFT JOIN sst.tipos_orden tp  ON tp.id = o.tipo_orden_id;
 
 -- RPT-01 · KPIs globales del dashboard.
