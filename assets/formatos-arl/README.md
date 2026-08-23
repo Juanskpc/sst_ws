@@ -4,26 +4,15 @@ Formatos **en blanco** que entrega cada ARL. `src/services/formatos-arl.service.
 los abre, les escribe encima los datos de la orden de servicio y los adjunta al
 correo de asignación del profesional.
 
-Los cinco primeros van versionados en el repositorio a propósito: sin ellos el
-despliegue no puede generar ningún formato, y son documentos públicos de la ARL
-(formularios vacíos), no documentación de clientes. Los ejemplos diligenciados
-que sirvieron para mapear las casillas **no** están aquí — llevan nombres,
-cédulas y firmas de asistentes reales; viven fuera de git, en `documentos/`.
+**Van TODOS versionados en el repositorio a propósito**, y hay que mantenerlo
+así: `formatos-arl.service.js` los abre en ejecución, de modo que un clon sin
+ellos no puede asignar una orden — falla con `ENOENT` en la ARL que le toque.
+Son documentos públicos de la ARL (formularios vacíos), no documentación de
+clientes.
 
-> 🔴 **SIETE DE ESTOS ARCHIVOS NO ESTÁN EN GIT** (decisión del equipo, 22-ago-2026):
-> `colpatria/ficha-gestion.pdf`, `colpatria/informe-tecnico.docx`,
-> `colmena/prestacion-servicios.pdf`, `colmena/informe-tipo-a.docx`,
-> `colmena/informe-tipo-b.docx`, `colmena/registro-ejecucion.xls` y
-> `colmena/plantilla-presentaciones.pptx`.
->
-> **El código de la fase 2 los abre en ejecución**, así que en una máquina o un
-> despliegue que no los tenga, asignar una orden de **AXA Colpatria** o de
-> **Colmena** falla con `ENOENT`. Bolívar no se ve afectada: sus dos formatos sí
-> están versionados.
->
-> **Se copian a mano** desde `jdd_consultores_app/docs/Formatos/` (que tampoco
-> viaja por git), con los nombres de la tabla de abajo. No están en `.gitignore`
-> a propósito: así aparecen como archivos sin rastrear y se ve que faltan.
+Los ejemplos ya diligenciados que sirvieron para mapear las casillas **no** están
+aquí: llevan nombres, cédulas y firmas de asistentes reales, y viven fuera de git
+(`jdd_consultores_app/docs/Formatos/`, también ignorada).
 
 **No salen todos en cada orden.** Cuáles se adjuntan lo decide
 `src/services/entrega-arl.service.js` a partir de la ARL, el tipo de actividad,
