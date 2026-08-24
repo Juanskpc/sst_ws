@@ -314,4 +314,92 @@ router.delete('/tipos-orden/:id', requireRole('admin'), asyncHandler(async (req,
   res.json({ message: `"${r.rows[0].nombre}" ya no se puede elegir en órdenes nuevas.` });
 }));
 
+// ---------------------------------------------------------------------------
+// Tipos de VIÁTICO y su valor (ago-2026, ajuste de la petición 4)
+//
+// Los viáticos se escribían a mano en la vista previa de Importar: un campo de
+// texto por orden, sin lista ni referencia. Así, dos órdenes del mismo
+// desplazamiento acababan con cifras distintas y nadie sabía cuál era la buena.
+// Ahora es un catálogo con valor por categoría, exactamente igual que los tipos
+// de orden, y quien carga la orden ELIGE en vez de escribir. "No aplica" no es
+// una fila: es no elegir ninguna, que es lo que trae casi toda orden.
+// ---------------------------------------------------------------------------
+
+/** Las categorías que se pueden elegir hoy; las retiradas solo si se piden. */
+router.get('/tipos-viatico', asyncHandler(async (req, res) => {
+  const incluirInactivos = req.query.todos === 'true';
+  const r = await pool.query(
+    `SELECT t.id, t.nombre, t.valor, t.activo, t.creado_en, t.actualizado_en,
+            (SELECT count(*)::int FROM sst.ordenes_servicio o WHERE o.viaticos_tipo_id = t.id) AS ordenes
+       FROM sst.tipos_viatico t
+      ${incluirInactivos ? '' : 'WHERE t.activo'}
+      ORDER BY t.activo DESC, t.nombre`
+  );
+  res.json({ data: r.rows });
+}));
+
+router.post('/tipos-viatico', requireRole('admin'), asyncHandler(async (req, res) => {
+  const nombre = limpiar(req.body?.nombre);
+  const valor = Number(req.body?.valor);
+  if (!nombre) throw badRequest('El nombre del tipo de viático es obligatorio.');
+  if (!Number.isFinite(valor) || valor < 0) throw badRequest('El valor debe ser un número mayor o igual que cero.');
+  try {
+    const r = await pool.query(
+      `INSERT INTO sst.tipos_viatico (nombre, valor) VALUES ($1,$2)
+       RETURNING id, nombre, valor, activo, creado_en, actualizado_en`,
+      [nombre, valor]
+    );
+    res.status(201).json({ data: { ...r.rows[0], ordenes: 0 } });
+  } catch (e) {
+    // El índice único es sobre el nombre en minúsculas, como en los tipos de
+    // orden: 'Transporte' y 'transporte' son la misma categoría.
+    if (e.code === '23505') throw conflict(`Ya existe un tipo de viático llamado "${nombre}".`);
+    throw e;
+  }
+}));
+
+/**
+ * Cambiar el valor NO reescribe las órdenes ya cargadas: cada una se quedó con
+ * su copia (`ordenes_servicio.viaticos_valor`) al elegir la categoría. Este
+ * valor manda sobre las órdenes que se carguen a partir de ahora.
+ */
+router.put('/tipos-viatico/:id', requireRole('admin'), asyncHandler(async (req, res) => {
+  const nombre = req.body?.nombre === undefined ? null : limpiar(req.body.nombre);
+  if (req.body?.nombre !== undefined && !nombre) throw badRequest('El nombre no puede quedar vacío.');
+  const valor = req.body?.valor === undefined ? null : Number(req.body.valor);
+  if (valor !== null && (!Number.isFinite(valor) || valor < 0)) {
+    throw badRequest('El valor debe ser un número mayor o igual que cero.');
+  }
+  const activo = req.body?.activo === undefined ? null : Boolean(req.body.activo);
+
+  try {
+    const r = await pool.query(
+      `UPDATE sst.tipos_viatico
+          SET nombre = COALESCE($2, nombre),
+              valor  = COALESCE($3, valor),
+              activo = COALESCE($4, activo),
+              actualizado_en = now()
+        WHERE id = $1
+        RETURNING id, nombre, valor, activo, creado_en, actualizado_en`,
+      [req.params.id, nombre, valor, activo]
+    );
+    if (!r.rows[0]) throw notFound('Tipo de viático no encontrado');
+    res.json({ data: r.rows[0] });
+  } catch (e) {
+    if (e.code === '23505') throw conflict(`Ya existe un tipo de viático llamado "${nombre}".`);
+    throw e;
+  }
+}));
+
+/** "Eliminar" es desactivar, por lo mismo que en los tipos de orden. */
+router.delete('/tipos-viatico/:id', requireRole('admin'), asyncHandler(async (req, res) => {
+  const r = await pool.query(
+    `UPDATE sst.tipos_viatico SET activo = FALSE, actualizado_en = now()
+      WHERE id = $1 RETURNING id, nombre`,
+    [req.params.id]
+  );
+  if (!r.rows[0]) throw notFound('Tipo de viático no encontrado');
+  res.json({ message: `"${r.rows[0].nombre}" ya no se puede elegir en órdenes nuevas.` });
+}));
+
 export default router;

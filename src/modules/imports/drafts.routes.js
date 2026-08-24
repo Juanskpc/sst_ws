@@ -43,6 +43,14 @@ const DRAFT_SELECT = `
          COALESCE(o.tipo_orden_id, d.tipo_orden_id) AS tipo_orden_id,
          tp.nombre AS tipo_orden,
          o.valor_hora_cobro, o.valor_hora_origen, o.valor_cobro_total,
+         -- Viáticos: la categoría elegida (NULL = "No aplica") y su valor. Manda
+         -- la de la OS cuando existe, igual que con el tipo de orden. El importe
+         -- que se enseña es el CONGELADO en la orden, no el vigente del
+         -- catálogo: si mañana sube la categoría, la orden ya cargada no cambia.
+         COALESCE(o.viaticos_tipo_id, d.tipo_viatico_id) AS tipo_viatico_id,
+         tv.nombre AS tipo_viatico,
+         tv.valor  AS tipo_viatico_valor,
+         o.viaticos_valor AS os_viaticos_valor,
          -- ASG · A nombre de quién salen los formatos cuando no es el ejecutor.
          -- La vista Órdenes lo enseña en la fila para que la suplencia no sea
          -- invisible: es un dato que hay que poder ver sin abrir la orden.
@@ -58,7 +66,8 @@ const DRAFT_SELECT = `
   LEFT JOIN sst.ordenes_servicio o ON o.id = d.orden_servicio_id
   LEFT JOIN sst.profesionales po ON po.id = o.profesional_asignado_id
   LEFT JOIN sst.profesionales pfo ON pfo.id = o.profesional_formatos_id
-  LEFT JOIN sst.tipos_orden tp ON tp.id = COALESCE(o.tipo_orden_id, d.tipo_orden_id)`;
+  LEFT JOIN sst.tipos_orden tp ON tp.id = COALESCE(o.tipo_orden_id, d.tipo_orden_id)
+  LEFT JOIN sst.tipos_viatico tv ON tv.id = COALESCE(o.viaticos_tipo_id, d.tipo_viatico_id)`;
 
 // Vista "Órdenes" (M3). Filtrable por estado y por soft-delete.
 //   ?estado=PENDIENTE_VALIDACION | VALIDADA | ... | ALL
@@ -157,8 +166,18 @@ router.put('/:id', requireRole('admin'), asyncHandler(async (req, res) => {
   const tipoOrdenId = req.body?.tipo_orden_id === undefined
     ? undefined
     : (String(req.body.tipo_orden_id ?? '').trim() || null);
-  if (!fields && tipoOrdenId === undefined) {
-    throw badRequest('Envía "fields" con los campos editados, o "tipo_orden_id".');
+  // Los viáticos, igual: se ELIGEN de un catálogo (`sst.tipos_viatico`), no se
+  // escriben. null es "No aplica" y es un valor legítimo —el más frecuente—, por
+  // eso se distingue de "no vino en el cuerpo" con undefined.
+  const tipoViaticoId = req.body?.tipo_viatico_id === undefined
+    ? undefined
+    : (String(req.body.tipo_viatico_id ?? '').trim() || null);
+  if (!fields && tipoOrdenId === undefined && tipoViaticoId === undefined) {
+    throw badRequest('Envía "fields" con los campos editados, "tipo_orden_id" o "tipo_viatico_id".');
+  }
+  if (tipoViaticoId) {
+    const tv = await pool.query(`SELECT id FROM sst.tipos_viatico WHERE id=$1 AND activo`, [tipoViaticoId]);
+    if (!tv.rows[0]) throw badRequest('El tipo de viático no existe o fue retirado del catálogo.');
   }
   if (fields && typeof fields !== 'object') throw badRequest('"fields" debe ser un objeto');
   const cur = await pool.query(
@@ -196,10 +215,13 @@ router.put('/:id', requireRole('admin'), asyncHandler(async (req, res) => {
   const r = await pool.query(
     `UPDATE sst.borradores_extraccion
        SET metadatos_extraccion=$2, confianza_general=$3,
-           tipo_orden_id = CASE WHEN $4::boolean THEN $5::uuid ELSE tipo_orden_id END,
+           tipo_orden_id   = CASE WHEN $4::boolean THEN $5::uuid ELSE tipo_orden_id END,
+           tipo_viatico_id = CASE WHEN $6::boolean THEN $7::uuid ELSE tipo_viatico_id END,
            actualizado_en=now()
      WHERE id=$1 RETURNING id`,
-    [req.params.id, merged, merged.overall_confidence, tipoOrdenId !== undefined, tipoOrdenId ?? null]
+    [req.params.id, merged, merged.overall_confidence,
+      tipoOrdenId !== undefined, tipoOrdenId ?? null,
+      tipoViaticoId !== undefined, tipoViaticoId ?? null]
   );
   if (!r.rows[0]) throw notFound('Borrador no encontrado');
   // Se devuelve expandido (arl_nombre, archivo, profesional) para que el cliente
@@ -287,11 +309,20 @@ export async function materializarOrden(draftId, userId, client) {
   // AT-031 en presencial y en virtual, pero el AT-028 solo en presencial.
   // Descubrirlo al asignar —cuando el correo ya va camino del profesional— es
   // demasiado tarde, así que se exige aquí, igual que el tipo de orden.
-  // Viáticos: el valor es un campo del formulario (corregible a mano) y el
-  // desglose viaja como contexto del SIPAB. Se guardan los dos: sin el desglose
-  // la cifra no se puede justificar ante la ARL ni explicar cuando alguien la
-  // discuta.
-  const viaticos = parseNumeroCO(val('viaticos_valor'));
+  // Viáticos (ago-2026): la cifra ya NO se escribe a mano. Sale de la categoría
+  // elegida en la vista previa (`sst.tipos_viatico`), y se congela en la orden
+  // para que un cambio posterior del catálogo no reescriba lo ya cargado.
+  //
+  // Sin categoría —"No aplica"— la orden queda sin viáticos, que es el caso de
+  // casi todas. Lo que el SIPAB de Bolívar traía se conserva igualmente en
+  // `viaticos_detalle`: es el desglose con el que se justifica la cifra ante la
+  // ARL, y perderlo dejaría el importe sin explicación.
+  const tipoViatico = draft.tipo_viatico_id
+    ? (await client.query(
+        `SELECT id, nombre, valor FROM sst.tipos_viatico WHERE id=$1`, [draft.tipo_viatico_id]
+      )).rows[0]
+    : null;
+  const viaticos = tipoViatico ? Number(tipoViatico.valor) : null;
   const detalleViaticos = m.sipab?.viaticos?.detalle ?? null;
 
   const tipoServicioArl = normalizarTipoActividadBolivar(val('tipo_servicio_arl'));
@@ -352,16 +383,19 @@ export async function materializarOrden(draftId, userId, client) {
        fecha_orden, fecha_vencimiento, ciudad_ejecucion, direccion, descripcion,
        contacto_empresa_nombre, contacto_empresa_cargo, contacto_empresa_telefono,
        contacto_sst_nombre, contacto_sst_telefono, contacto_sst_correo,
-       lote_importacion_id, url_archivo_original, metadatos_extraccion, estado)
+       lote_importacion_id, url_archivo_original, metadatos_extraccion, viaticos_tipo_id, estado)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,
-             $20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,'SIN PROGRAMAR')
+             $20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,'SIN PROGRAMAR')
      RETURNING *`,
     [
       codigo, draft.arl_id, numeroOrden, cron, sec, val('nro_afiliacion'),
       val('nit_nic'), val('empresa_nombre'), empresaId, val('actividad_economica'),
       val('tipo_actividad'), draft.tipo_orden_id, val('modalidad'),
       tipoServicioArl, modalidadEjecucion,
-      viaticos && viaticos > 0 ? viaticos : null,
+      // Sin categoría queda NULL; con categoría se guarda su valor tal cual,
+      // aunque sea 0: la orden apunta al tipo y el importe tiene que cuadrar con
+      // él, no desaparecer por ser cero.
+      viaticos,
       detalleViaticos ? JSON.stringify(detalleViaticos) : null,
       parseNumeroCO(val('horas_asignadas')), parseNumeroCO(val('valor_unitario')),
       parseNumeroCO(val('valor_total')),
@@ -370,6 +404,7 @@ export async function materializarOrden(draftId, userId, client) {
       val('contacto_empresa_nombre'), val('contacto_empresa_cargo'), val('contacto_empresa_telefono'),
       val('contacto_sst_nombre'), val('contacto_sst_telefono'), val('contacto_sst_correo'),
       draft.lote_importacion_id, draft.url_archivo_original, m,
+      tipoViatico ? tipoViatico.id : null,
     ]
   );
   const orden = ord.rows[0];

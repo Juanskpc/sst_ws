@@ -13,8 +13,12 @@ Backend Node.js (Express 5 + PostgreSQL/Neon) para la plataforma de gestión de
 > sección **§0 "Dónde retomar"**. **Las cinco fases están construidas y
 > migradas** (los enumerados del AT-031 de Bolívar, la matriz de formatos y
 > soportes por ARL, los viáticos, el profesional registrado ante la ARL con su
-> suplente, y el eje de facturación). Ya no queda código de la tanda: lo que
-> falta son las nueve decisiones con el cliente y verla funcionando en la app.
+> suplente, y el eje de facturación), **más los cuatro ajustes del 23-ago** (§10
+> del plan): el estado de cobro se cambia solo desde el icono de la fila, el eje
+> se queda en **dos** estados —NO FACTURADA y FACTURADA—, su diálogo es estrecho
+> y los **viáticos se eligen de `sst.tipos_viatico`** en vez de escribirse. Ya no
+> queda código de la tanda: lo que falta son las decisiones con el cliente y
+> verla funcionando en la app.
 >
 > ⚠️ Ese trabajo está en la rama **`tanda-22-ago-formatos-y-viaticos`**, que
 > existe con el mismo nombre en los dos repos. En `master` no está.

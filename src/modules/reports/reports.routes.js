@@ -176,9 +176,9 @@ router.get('/horas', asyncHandler(async (req, res) => {
  * Estado de FACTURACIÓN de las órdenes cerradas (ago-2026, petición 6).
  *
  * Responde a la pregunta que el cliente hizo en la reunión: «de lo que ya
- * ejecutamos, ¿qué falta por radicar, por facturar y por cobrar?». Solo entran
- * las FINALIZADAS, que es donde arranca el eje (decisión D-7): una orden sin
- * cerrar no tiene nada que facturarse.
+ * ejecutamos, ¿qué falta por facturar?». Solo entran las FINALIZADAS, que es
+ * donde arranca el eje (decisión D-7): una orden sin cerrar no tiene nada que
+ * facturarse.
  *
  * ⚠️ La cifra es `valor_total`, el valor de la orden SEGÚN EL DOCUMENTO DE LA
  * ARL — que es lo que se le cobra a ella—, no `valor_cobro_total`, que es lo que
@@ -196,7 +196,7 @@ router.get('/cobro', asyncHandler(async (req, res) => {
   }
   const where = `WHERE ${clauses.join(' AND ')}`;
   // El desglose por estado se calcula SIN el filtro de estado de cobro: si no,
-  // marcar "RADICADA" en el filtro dejaría el resumen con una sola barra y ya no
+  // marcar "FACTURADA" en el filtro dejaría el resumen con una sola barra y ya no
   // se podría ver contra qué se compara.
   const whereSinEstado = `WHERE ${clauses.filter((c) => !c.includes('estado_cobro')).join(' AND ')}`;
   const paramsSinEstado = req.query.arl_id ? [req.query.arl_id] : [];
@@ -210,26 +210,28 @@ router.get('/cobro', asyncHandler(async (req, res) => {
     pool.query(
       `SELECT arl_nombre, count(*)::int AS ordenes,
               coalesce(sum(valor_total), 0)::numeric AS valor,
-              -- "Pendiente" es todo lo que aún no está pagado: es la cifra que
-              -- la contadora persigue, y separarla por estado ya la da el bloque
-              -- de arriba.
-              coalesce(sum(valor_total) FILTER (WHERE estado_cobro <> 'PAGADA'), 0)::numeric AS pendiente
+              -- Lo que falta por facturarle a cada ARL: es la cifra que la
+              -- contadora persigue, y es por ARL porque se radica ARL por ARL.
+              coalesce(sum(valor_total) FILTER (WHERE estado_cobro = 'NO FACTURADA'), 0)::numeric AS sin_facturar
          FROM sst.vw_ordenes_expandidas ${where}
-        GROUP BY 1 ORDER BY pendiente DESC`, params),
+        GROUP BY 1 ORDER BY sin_facturar DESC`, params),
     pool.query(
       `SELECT id, codigo, arl_nombre, empresa_nombre, nit_nic, tipo_actividad,
-              horas_asignadas, valor_total, viaticos_valor,
+              horas_asignadas, valor_total, viaticos_valor, viaticos_tipo,
               estado_cobro::text AS estado_cobro, cobro_numero_factura, cobro_observacion,
               cobro_actualizado_en, fecha_ejecucion, profesional_nombre
          FROM sst.vw_ordenes_expandidas ${where}
         ORDER BY estado_cobro, fecha_ejecucion DESC NULLS LAST
         LIMIT 1000`, params),
+    // Con dos estados los totales son dos y suman el valor: lo que falta por
+    // facturar y lo ya facturado. No hay "pendiente de cobro" separado —eso
+    // exigiría un estado PAGADA que el cliente retiró—, y fingirlo con la misma
+    // cifra que "sin facturar" sería enseñar dos veces el mismo número.
     pool.query(
       `SELECT count(*)::int AS ordenes,
               coalesce(sum(valor_total), 0)::numeric AS valor,
               coalesce(sum(valor_total) FILTER (WHERE estado_cobro = 'NO FACTURADA'), 0)::numeric AS sin_facturar,
-              coalesce(sum(valor_total) FILTER (WHERE estado_cobro <> 'PAGADA'), 0)::numeric AS pendiente,
-              coalesce(sum(valor_total) FILTER (WHERE estado_cobro = 'PAGADA'), 0)::numeric AS pagado,
+              coalesce(sum(valor_total) FILTER (WHERE estado_cobro = 'FACTURADA'), 0)::numeric AS facturado,
               coalesce(sum(viaticos_valor), 0)::numeric AS viaticos
          FROM sst.vw_ordenes_expandidas ${where}`, params),
   ]);

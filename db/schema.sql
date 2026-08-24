@@ -436,6 +436,34 @@ INSERT INTO sst.tipos_orden (nombre, valor_hora) VALUES
   ('Inspección',   95000)
 ON CONFLICT DO NOTHING;
 
+-- ⭐ Catálogo de TIPOS DE VIÁTICO con su valor (ago-2026).
+--
+-- Mismo patrón que los tipos de orden y por el mismo motivo: el viático era un
+-- número suelto que cada quien escribía como quería, y así dos órdenes del mismo
+-- desplazamiento acababan con cifras distintas. Ahora se elige la categoría y el
+-- valor sale de ella.
+--
+-- Y el mismo cuidado con el histórico: la orden se queda con una COPIA del valor
+-- (`ordenes_servicio.viaticos_valor`) en el momento en que se elige. Si mañana
+-- sube el viático de "Transporte intermunicipal", las órdenes ya cargadas siguen
+-- valiendo lo que valían.
+--
+-- Nace VACÍO a propósito: las categorías y sus importes los pone JD&D desde
+-- Configuración → Preferencias del sistema. Sembrar cifras inventadas sería peor
+-- que no tener ninguna, porque nadie las revisaría.
+CREATE TABLE IF NOT EXISTS sst.tipos_viatico (
+  id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  nombre         TEXT NOT NULL,
+  valor          NUMERIC(14,2) NOT NULL DEFAULT 0,
+  -- No se borran: una orden vieja puede seguir apuntando a una categoría
+  -- retirada, y perder el nombre dejaría su historial sin explicación.
+  activo         BOOLEAN NOT NULL DEFAULT TRUE,
+  creado_en      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  actualizado_en TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_tipos_viatico_nombre
+  ON sst.tipos_viatico (lower(btrim(nombre)));
+
 -- ⭐ CFG-04 / PRE-02 · Categoría de la orden y lo que se paga por ella.
 --
 -- `tipo_orden_id` es OBLIGATORIO al cargar una OS (lo exige el backend, no un
@@ -468,6 +496,9 @@ CREATE INDEX IF NOT EXISTS idx_ordenes_tipo ON sst.ordenes_servicio(tipo_orden_i
 -- la OS nazca con él. Se guarda en columna y no en el JSON de la extracción: no
 -- lo dice el documento de la ARL, lo decide quien revisa.
 ALTER TABLE sst.borradores_extraccion ADD COLUMN IF NOT EXISTS tipo_orden_id UUID REFERENCES sst.tipos_orden(id);
+-- Y la categoría del viático, por lo mismo: se elige en la vista previa y la OS
+-- nace con ella. NULL = "No aplica" (la inmensa mayoría de las órdenes).
+ALTER TABLE sst.borradores_extraccion ADD COLUMN IF NOT EXISTS tipo_viatico_id UUID REFERENCES sst.tipos_viatico(id);
 
 -- VER-04 · QUÉ soportes se devolvieron para corregir, no solo que "hubo rechazo".
 --
@@ -553,9 +584,16 @@ ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS soportes_requeridos TE
 -- `viaticos_detalle` guarda el desglose tal como venía (transporte, alojamiento,
 -- alimentación…). Es lo que permite justificar la cifra ante la ARL y ver de
 -- dónde salió cuando alguien la discuta.
+--
+-- Desde ago-2026 la cifra NO se escribe a mano: se elige una categoría del
+-- catálogo (`sst.tipos_viatico`) y de ella sale el valor. `viaticos_valor` es la
+-- copia congelada en el momento de elegirla; `viaticos_tipo_id` dice cuál fue.
+-- NULL en las dos = "No aplica", que es el caso de casi toda orden.
 ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS viaticos_valor       NUMERIC(14,2);
 ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS viaticos_detalle     JSONB;
 ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS viaticos_observacion TEXT;
+ALTER TABLE sst.ordenes_servicio
+  ADD COLUMN IF NOT EXISTS viaticos_tipo_id UUID REFERENCES sst.tipos_viatico(id);
 
 
 -- ⭐ ASG · El profesional a cuyo NOMBRE salen los formatos (ago-2026).
@@ -579,17 +617,23 @@ ALTER TABLE sst.ordenes_servicio
 -- ⭐ Estado de FACTURACIÓN de la orden (ago-2026, petición 6 del cliente).
 --
 -- Es un EJE INDEPENDIENTE del ciclo operativo, no un estado más de
--- `sst.estado_orden`. Una OS FINALIZADA puede estar sin facturar, radicada ante
--- la ARL, aprobada, facturada o pagada; meterlo en el mismo enum obligaría a un
--- producto cartesiano de estados y a rehacer la matriz de transiciones y el
--- trigger de EST-06.
+-- `sst.estado_orden`. Una OS FINALIZADA puede estar sin facturar o facturada;
+-- meterlo en el mismo enum obligaría a un producto cartesiano de estados y a
+-- rehacer la matriz de transiciones y el trigger de EST-06.
+--
+-- SON DOS, no cinco. Nació con cinco (NO FACTURADA → RADICADA → APROBADA →
+-- FACTURADA → PAGADA) y el cliente los recortó el 23-ago-2026: de los otros tres
+-- no lleva registro, y un estado que nadie mueve es un estado que miente. Si
+-- alguna vez vuelven, se añaden con `ALTER TYPE ... ADD VALUE` y hay que tocar
+-- también `ESTADOS_COBRO` en `orders.routes.js` y `ESTADOS_COBRO` en el
+-- frontend (`core/models.ts`), que son las otras dos copias de esta lista.
 --
 -- No es la Cartera (RPT-06) que se retiró el 19-ago-2026: aquello era un REPORTE
 -- con tres fechas sueltas que nadie llenaba; esto es un estado de la orden, con
--- su historial y su marcado en lote.
-DO $ BEGIN
-  CREATE TYPE sst.estado_cobro AS ENUM ('NO FACTURADA','RADICADA','APROBADA','FACTURADA','PAGADA');
-EXCEPTION WHEN duplicate_object THEN NULL; END $;
+-- su historial.
+DO $$ BEGIN
+  CREATE TYPE sst.estado_cobro AS ENUM ('NO FACTURADA','FACTURADA');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 ALTER TABLE sst.ordenes_servicio
   ADD COLUMN IF NOT EXISTS estado_cobro sst.estado_cobro NOT NULL DEFAULT 'NO FACTURADA';
@@ -1131,12 +1175,18 @@ SELECT o.*,
        -- Órdenes lo enseña en cada fila y pedir el catálogo aparte para
        -- traducir un id sería un viaje por pantalla.
        tp.nombre        AS tipo_orden,
-       tp.valor_hora    AS tipo_orden_valor_hora
+       tp.valor_hora    AS tipo_orden_valor_hora,
+       -- La categoría del viático, resuelta por el mismo motivo: el detalle de
+       -- la orden y el informe de facturación la enseñan junto a la cifra, y sin
+       -- el nombre un importe suelto no dice de qué es.
+       tv.nombre        AS viaticos_tipo,
+       tv.valor         AS viaticos_tipo_valor
 FROM sst.ordenes_servicio o
 JOIN sst.arls a               ON a.id = o.arl_id
 LEFT JOIN sst.profesionales p ON p.id = o.profesional_asignado_id
 LEFT JOIN sst.profesionales pf ON pf.id = o.profesional_formatos_id
-LEFT JOIN sst.tipos_orden tp  ON tp.id = o.tipo_orden_id;
+LEFT JOIN sst.tipos_orden tp  ON tp.id = o.tipo_orden_id
+LEFT JOIN sst.tipos_viatico tv ON tv.id = o.viaticos_tipo_id;
 
 -- RPT-01 · KPIs globales del dashboard.
 -- DROP + CREATE (y no CREATE OR REPLACE): la vista ganó `ejecutadas_mes` en medio

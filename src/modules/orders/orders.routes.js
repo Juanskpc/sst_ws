@@ -350,24 +350,33 @@ router.get('/mias', asyncHandler(async (req, res) => {
 // Estado de FACTURACIÓN de la orden (ago-2026, petición 6 del cliente)
 //
 // Es un eje INDEPENDIENTE del ciclo operativo: una OS FINALIZADA puede estar sin
-// facturar, radicada ante la ARL, aprobada, facturada o pagada. Por eso no toca
-// `sst.estado_orden` —que está protegido por su matriz de transiciones y por el
-// trigger de EST-06— sino su propia columna, su propio enum y su propio historial.
+// facturar o facturada. Por eso no toca `sst.estado_orden` —que está protegido
+// por su matriz de transiciones y por el trigger de EST-06— sino su propia
+// columna, su propio enum y su propio historial.
 //
 // No es la Cartera (RPT-06) que se retiró el 19-ago-2026: aquello era un reporte
-// con tres fechas sueltas que nadie llenaba. Esto es un estado de la orden, se
-// marca en lote y deja constancia de quién lo movió.
+// con tres fechas sueltas que nadie llenaba. Esto es un estado de la orden y
+// deja constancia de quién lo movió.
 // ---------------------------------------------------------------------------
 
-/** El eje, en orden. El primero es el valor por defecto de toda orden nueva. */
-const ESTADOS_COBRO = ['NO FACTURADA', 'RADICADA', 'APROBADA', 'FACTURADA', 'PAGADA'];
+/**
+ * El eje entero. El primero es el valor por defecto de toda orden nueva.
+ *
+ * SON DOS, no cinco: nació con RADICADA, APROBADA y PAGADA por medio y el
+ * cliente las retiró el 23-ago-2026 porque no lleva registro de ellas. La lista
+ * está copiada en otros dos sitios —el enum `sst.estado_cobro` de `schema.sql` y
+ * `ESTADOS_COBRO` del frontend—: si vuelve alguno hay que tocar los tres.
+ */
+const ESTADOS_COBRO = ['NO FACTURADA', 'FACTURADA'];
 
 /**
- * Marcado en LOTE del estado de cobro (admin y contador).
+ * Cambio del estado de cobro (admin y contador).
  *
- * En lote porque así es como se factura: se radica un paquete de órdenes ante la
- * ARL y se marcan todas de una vez. Un endpoint de a una obligaría a cuarenta
- * clics y acabaría sin usarse, que es exactamente lo que le pasó a la Cartera.
+ * Acepta una LISTA de ids aunque la vista mande siempre una sola orden: el
+ * marcado en lote se retiró de la interfaz el 23-ago-2026 —el cliente lo pidió
+ * de a una, desde el icono de la fila— pero el endpoint conserva la forma,
+ * porque es la que deja mover un paquete recién radicado sin cuarenta viajes al
+ * servidor si algún día vuelve a hacer falta.
  *
  * Va declarado ANTES de `/:id` por la misma razón que `/mias`: Express resuelve
  * por orden de declaración y un comodín que aceptara 'cobro' como id sería un
@@ -543,12 +552,12 @@ const CAMPOS_EDITABLES = {
   // corrección entera de la orden.
   tipo_servicio_arl: normalizarTipoActividadBolivar,
   modalidad_ejecucion: normalizarModalidadEjecucion,
-  // Viáticos. El valor es opcional: vaciarlo deja la orden SIN viáticos (NULL),
-  // que es distinto de llevarlos en cero.
-  viaticos_valor: (v) => {
-    const n = parseNumeroCO(v);
-    return n && n > 0 ? n : null;
-  },
+  // Viáticos (ago-2026): la cifra ya no se escribe. Se elige la CATEGORÍA del
+  // catálogo y el valor sale de ella; vaciarla ('') es el "No aplica", que deja
+  // la orden sin viáticos. `viaticos_valor` no está en esta lista a propósito:
+  // dejarlo editable a mano habría vuelto a permitir dos cifras distintas para
+  // el mismo desplazamiento, que es justo lo que el catálogo viene a evitar.
+  viaticos_tipo_id: (v) => (String(v ?? '').trim() || null),
   viaticos_observacion: String,
 };
 
@@ -587,6 +596,22 @@ router.put('/:id', requireRole('admin'), asyncHandler(async (req, res) => {
 
     const valores = {};
     for (const campo of campos) valores[campo] = valorEditable(campo, body[campo]);
+
+    // Cambiar la categoría del viático arrastra el importe: es lo que hace que
+    // la cifra y la categoría no puedan contradecirse. Se congela el valor
+    // VIGENTE del catálogo, igual que al cargar la orden; "No aplica" (null)
+    // borra los dos.
+    if ('viaticos_tipo_id' in valores) {
+      if (!valores.viaticos_tipo_id) {
+        valores.viaticos_valor = null;
+      } else {
+        const tv = (await client.query(
+          `SELECT valor FROM sst.tipos_viatico WHERE id=$1 AND activo`, [valores.viaticos_tipo_id]
+        )).rows[0];
+        if (!tv) throw badRequest('El tipo de viático no existe o fue retirado del catálogo.');
+        valores.viaticos_valor = Number(tv.valor);
+      }
+    }
 
     // La identidad de la OS no puede quedar vacía: sin ella no hay forma de
     // reconocerla contra el documento de la ARL ni de detectar duplicados
@@ -897,8 +922,12 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
   const queDevolver = listaEtiquetas(result.entrega.soportes);
   // Los viáticos se dicen ANTES de la visita: el profesional decide cómo viaja
   // con ese dato, y descubrirlos al recibir la cuenta de cobro llega tarde.
+  // Con la categoría delante: "Transporte intermunicipal · $45.000" dice qué se
+  // le reconoce, que es lo que el profesional necesita para decidir cómo viaja.
   const viaticos = Number(o.viaticos_valor) || 0;
-  const viaticosTexto = viaticos > 0 ? enPesosCO(viaticos) : null;
+  const viaticosTexto = viaticos > 0
+    ? [o.viaticos_tipo, enPesosCO(viaticos)].filter(Boolean).join(' · ')
+    : null;
   // ASG · Si los formatos van a nombre de OTRO, el profesional tiene que
   // enterarse por este correo. Si no, abre el AT-031, ve un nombre que no es el
   // suyo y llama por teléfono creyendo que hubo un error de la plataforma.
