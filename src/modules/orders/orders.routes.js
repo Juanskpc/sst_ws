@@ -973,7 +973,11 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
           : `Adjuntamos los formatos de ${o.arl_nombre} ya diligenciados con los datos de ` +
             `esta orden: imprímelos y completa en la sesión lo que falta ` +
             `(asistentes, temas desarrollados, observaciones y firmas).\n\n`) +
-        `Al terminar, sube los soportes firmados aquí (sin login):\n${supportUrl}\n` +
+        // La lista concreta, también en texto plano. Estaba calculada y no se
+        // imprimía: quien lee el correo en texto solo veía «los soportes
+        // firmados», que es justo lo que este bloque vino a quitar.
+        (queDevolver ? `Al terminar tendrás que subir: ${queDevolver}.\n` : '') +
+        `Enlace para subir los soportes (sin login):\n${supportUrl}\n` +
         (invitaciones.length
           ? `\nAdjuntamos ${invitaciones.length === 1 ? 'la invitación' : `${invitaciones.length} invitaciones`} para tu calendario.\n`
           : ''),

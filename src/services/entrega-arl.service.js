@@ -20,12 +20,19 @@
  * exige, y no pedirle el informe de una asistencia técnica es descubrir que
  * falta cuando ya no hay a quién reclamárselo.
  *
+ * Desde el **24-ago-2026** eso ya no se escribe dos veces. Lo que hay que
+ * devolver se DERIVA de los formatos que salen (`DEVUELVE`), y a mano solo se
+ * declara lo que vuelve sin haber ido adjunto (`extras`). Antes eran dos listas
+ * paralelas y se separaron: el correo de una asistencia técnica de Bolívar
+ * mandaba un solo formato y pedía de vuelta dos.
+ *
  * Por qué vive aparte de `formatos-arl.service.js`: aquí están las REGLAS (qué
  * documentos y qué soportes), allí el REGISTRO (dónde está cada archivo y cómo
  * se rellena). El portal público y la asignación necesitan lo primero sin
  * arrastrar `pdf-lib` ni los assets.
  */
 import { esBolivar, normalizarTipoActividadBolivar } from '../utils/bolivar.js';
+import { esCategoriaValida, ordenCategoria } from './soportes.service.js';
 
 /** 'AXA Colpatria' → 'colpatria'; 'Bolívar' → 'bolivar'. Sin tildes. */
 export function carpetaArl(nombre) {
@@ -156,11 +163,57 @@ export function tipoActividadDeOrden(orden) {
 const CORTE_HORAS_AXA = 16;
 
 /**
+ * En qué casilla del portal vuelve cada formato, ya diligenciado y firmado.
+ *
+ * Esto es lo que arregla el desajuste que reportó el cliente el 24-ago-2026:
+ * la lista de lo que había que devolver se escribía A MANO en cada regla, al
+ * lado de la lista de formatos, y las dos se separaron. Una asistencia técnica
+ * de Bolívar sale con un solo formato —el AT-031 de seguimiento— y el correo le
+ * pedía además una «Lista de asistencia» que no iba adjunta y que la ARL no
+ * exige: los asistentes se firman DENTRO del propio AT-031.
+ *
+ * Ahora la lista se DERIVA de los formatos que salen. Lo que se escribe a mano
+ * es solo lo que vuelve sin haber ido adjunto (`extras`), que por definición no
+ * puede deducirse de aquí.
+ *
+ * `null` = ese formato no vuelve por el portal. Son de dos clases: los que son
+ * material de trabajo (la plantilla de presentaciones de Colmena) y los que sí
+ * se devuelven a la ARL pero para los que el portal **no tiene casilla**
+ * (evaluación y registro de ejecución de Colmena). Lo segundo es un hueco
+ * conocido, no una decisión: se pedirían el día que se añadan las casillas.
+ */
+const DEVUELVE = {
+  // Bolívar · el AT-031 de seguimiento ES el acta de la visita.
+  at031: 'acta',
+  at028: 'asistencia',
+
+  // AXA Colpatria · la ficha de gestión y el informe técnico ocupan la misma
+  // casilla: son el informe de la actividad, y nunca salen los dos a la vez.
+  asistentesAxa: 'asistencia',
+  fichaAxa: 'informe',
+  informeAxa: 'informe',
+
+  // Colmena · la prestación de servicios es lo que firma la empresa para dar la
+  // visita por prestada; hace de acta.
+  prestacionColmena: 'acta',
+  asistenciaColmena: 'asistencia',
+  informeColmenaA: 'informe',
+  informeColmenaB: 'informe',
+  evaluacionColmena: null,
+  registroEjecucionColmena: null,
+  plantillaColmena: null,
+};
+
+/**
  * Qué se manda y qué se pide, en orden de especificidad: **gana la primera
  * regla que encaje**, así que las condicionadas van antes que las generales.
  *
- * `formatos` son claves del registro de `formatos-arl.service.js`.
- * `soportes` son casillas del portal (`soportes.service.js`).
+ * `formatos` son claves del registro de `formatos-arl.service.js`. De ellos
+ * sale, por `DEVUELVE`, casi toda la lista de lo que hay que subir.
+ * `extras` son las casillas que se piden SIN mandar formato: el registro
+ * fotográfico, que no tiene formulario, y el informe de una ARL que no nos ha
+ * entregado el suyo en blanco. Va por separado para que se lea como lo que es
+ * —una excepción— y no se pueda volver a desajustar de los formatos.
  * `nota` sale en el correo del profesional cuando hace falta explicarle algo
  * que no viaja como adjunto.
  */
@@ -171,22 +224,23 @@ const REGLAS = [
   {
     arl: 'bolivar', tipo: TIPOS_ACTIVIDAD.CAPACITACION, modalidad: 'PRESENCIAL',
     formatos: ['at031', 'at028'],
-    soportes: ['acta', 'asistencia', 'evidencias'],
+    extras: ['evidencias'],
   },
   {
     arl: 'bolivar', tipo: TIPOS_ACTIVIDAD.CAPACITACION, modalidad: 'VIRTUAL',
     formatos: ['at031'],
-    soportes: ['acta', 'evidencias'],
+    extras: ['evidencias'],
     nota: 'Al ser una capacitación VIRTUAL no se adjunta el registro de asistencia AT-028: ' +
           'la ARL solo lo admite en actividades presenciales. En su lugar suba la evidencia de ' +
           'la sesión (captura de los asistentes conectados).',
   },
   // Asesoría y asistencia técnica no llevan registro fotográfico (lo dijo el
-  // cliente). La asistencia técnica sí entrega informe de gestión.
+  // cliente) ni lista de asistencia aparte: los asistentes se firman dentro del
+  // propio AT-031. La asistencia técnica sí entrega informe de gestión.
   {
     arl: 'bolivar', tipo: TIPOS_ACTIVIDAD.ASISTENCIA_TECNICA,
     formatos: ['at031'],
-    soportes: ['acta', 'asistencia', 'informe'],
+    extras: ['informe'],
     nota: 'Esta asistencia técnica requiere INFORME DE GESTIÓN. Aún no tenemos el formato en ' +
           'blanco de la ARL cargado en la plataforma, así que redáctelo con el modelo habitual ' +
           'de Bolívar y súbalo en la casilla "Informe técnico o de gestión".',
@@ -194,26 +248,29 @@ const REGLAS = [
   {
     arl: 'bolivar', tipo: TIPOS_ACTIVIDAD.ASESORIA,
     formatos: ['at031'],
-    soportes: ['acta', 'asistencia'],
   },
 
   // --- AXA Colpatria -------------------------------------------------------
   // El corte de 16 parte las asesorías en dos: por debajo, ficha de gestión;
   // por encima, informe técnico completo.
+  //
+  // AXA no entrega formato de acta: la ficha de gestión (o el informe técnico)
+  // es su registro de la visita, así que no se pide un «acta» aparte que el
+  // profesional tendría que inventarse.
   {
     arl: 'colpatria', tipo: TIPOS_ACTIVIDAD.ASESORIA, horasHasta: CORTE_HORAS_AXA,
     formatos: ['asistentesAxa', 'fichaAxa'],
-    soportes: ['acta', 'asistencia', 'evidencias', 'informe'],
+    extras: ['evidencias'],
   },
   {
     arl: 'colpatria', tipo: TIPOS_ACTIVIDAD.ASESORIA,
     formatos: ['asistentesAxa', 'informeAxa'],
-    soportes: ['acta', 'asistencia', 'evidencias', 'informe'],
+    extras: ['evidencias'],
   },
   {
     arl: 'colpatria', tipo: TIPOS_ACTIVIDAD.CAPACITACION,
     formatos: ['asistentesAxa'],
-    soportes: ['acta', 'asistencia', 'evidencias'],
+    extras: ['evidencias'],
   },
 
   // --- Colmena -------------------------------------------------------------
@@ -221,12 +278,12 @@ const REGLAS = [
     arl: 'colmena', tipo: TIPOS_ACTIVIDAD.CAPACITACION,
     formatos: ['prestacionColmena', 'asistenciaColmena', 'registroEjecucionColmena',
                'evaluacionColmena', 'plantillaColmena'],
-    soportes: ['acta', 'asistencia', 'evidencias'],
+    extras: ['evidencias'],
   },
   {
     arl: 'colmena', tipo: TIPOS_ACTIVIDAD.ASESORIA,
     formatos: ['prestacionColmena', 'asistenciaColmena', 'informeColmenaA', 'informeColmenaB'],
-    soportes: ['acta', 'asistencia', 'evidencias', 'informe'],
+    extras: ['evidencias'],
     nota: 'Se adjuntan los DOS modelos de informe de Colmena (tipo A y tipo B). Use el que ' +
           'corresponda a esta actividad y descarte el otro.',
   },
@@ -243,16 +300,54 @@ const REGLAS = [
  * siempre.
  */
 const RESPALDO = {
-  bolivar: { formatos: ['at031'], soportes: ['acta', 'asistencia'] },
-  colpatria: { formatos: ['asistentesAxa'], soportes: ['acta', 'asistencia', 'evidencias'] },
+  bolivar: { formatos: ['at031'] },
+  colpatria: { formatos: ['asistentesAxa'], extras: ['evidencias'] },
   colmena: {
     formatos: ['prestacionColmena', 'asistenciaColmena'],
-    soportes: ['acta', 'asistencia', 'evidencias'],
+    extras: ['evidencias'],
   },
 };
 
-/** Casillas que se piden cuando no se sabe nada de la orden (ARL desconocida). */
+/**
+ * Casillas que se piden cuando no se sabe nada de la orden (ARL desconocida).
+ *
+ * Aquí no hay formatos de los que deducir nada —no salió ni un PDF—, así que se
+ * piden los tres soportes de siempre y que el administrador afine al revisar.
+ */
 export const SOPORTES_POR_DEFECTO = ['acta', 'asistencia', 'evidencias'];
+
+/**
+ * Lo que el profesional tiene que subir: los formatos que se le mandaron, ya
+ * firmados, más los extras de la regla. Sin repeticiones —dos formatos pueden
+ * volver en la misma casilla, como los dos informes de Colmena— y en el orden
+ * en que se revisan.
+ */
+function soportesDe(formatos = [], extras = []) {
+  const claves = [
+    ...formatos.map((f) => DEVUELVE[f]).filter(Boolean),
+    ...extras,
+  ];
+  return [...new Set(claves)].sort((a, b) => ordenCategoria(a) - ordenCategoria(b));
+}
+
+/**
+ * Comprobación al arrancar, no al asignar: un formato sin entrada en `DEVUELVE`
+ * saldría adjunto y NO se pediría de vuelta, y un `extra` mal escrito se
+ * perdería en la casilla «otros». Las dos cosas solo se notarían al revisar los
+ * soportes de una visita que ya ocurrió, así que es mejor no arrancar.
+ */
+for (const regla of [...REGLAS, ...Object.values(RESPALDO)]) {
+  for (const clave of regla.formatos ?? []) {
+    if (!(clave in DEVUELVE)) {
+      throw new Error(`[entrega-arl] el formato '${clave}' no dice en qué casilla vuelve (DEVUELVE).`);
+    }
+  }
+  for (const extra of regla.extras ?? []) {
+    if (!esCategoriaValida(extra)) {
+      throw new Error(`[entrega-arl] '${extra}' no es una casilla del portal.`);
+    }
+  }
+}
 
 const numero = (v) => {
   const n = Number(v);
@@ -287,7 +382,7 @@ export function entregaDeLaOrden(orden) {
   if (regla) {
     return {
       formatos: [...regla.formatos],
-      soportes: [...regla.soportes],
+      soportes: soportesDe(regla.formatos, regla.extras),
       nota: regla.nota ?? null,
       arl, tipo, origen, porRespaldo: false,
     };
@@ -296,7 +391,8 @@ export function entregaDeLaOrden(orden) {
   const respaldo = RESPALDO[arl];
   return {
     formatos: respaldo ? [...respaldo.formatos] : [],
-    soportes: respaldo ? [...respaldo.soportes] : [...SOPORTES_POR_DEFECTO],
+    // Sin ARL conocida no hay formatos, y sin formatos no hay nada que derivar.
+    soportes: respaldo ? soportesDe(respaldo.formatos, respaldo.extras) : [...SOPORTES_POR_DEFECTO],
     nota: null,
     arl, tipo, origen, porRespaldo: true,
   };
