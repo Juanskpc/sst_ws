@@ -31,7 +31,7 @@
  * se rellena). El portal público y la asignación necesitan lo primero sin
  * arrastrar `pdf-lib` ni los assets.
  */
-import { esBolivar, normalizarTipoActividadBolivar } from '../utils/bolivar.js';
+import { normalizarTipoActividadBolivar } from '../utils/bolivar.js';
 import { esCategoriaValida, ordenCategoria } from './soportes.service.js';
 
 /** 'AXA Colpatria' → 'colpatria'; 'Bolívar' → 'bolivar'. Sin tildes. */
@@ -71,12 +71,17 @@ const POR_LETRA = {
 };
 
 /**
- * El nombre del catálogo CFG-04 → la clave de enrutamiento.
+ * Un nombre de actividad → la clave de enrutamiento.
  *
- * Se compara por subcadena y sin tildes porque el catálogo lo edita el cliente
- * desde Configuración: hoy dice "Capacitación", mañana puede decir
- * "Capacitaciones" o "CAPACITACION". Lo que no encaja no se fuerza — devuelve
- * null y la orden cae en la regla de respaldo de su ARL.
+ * Se compara por subcadena y sin tildes porque el texto no está normalizado: es
+ * como la ARL redactó el título de la orden. Lo que no encaja no se fuerza —
+ * devuelve null y la orden cae en la regla de respaldo de su ARL.
+ *
+ * ⚠️ Hasta el 24-ago-2026 esto se aplicaba también al **tipo de orden** del
+ * catálogo CFG-04, y era una confusión: ese catálogo dice **cuánto se le paga la
+ * hora al profesional**, no qué formatos exige la ARL. Una asistencia técnica se
+ * puede estar cobrando a tarifa de asesoría —es una decisión de precios— y eso
+ * no puede cambiarle los papeles que se radican. Ya no se consulta.
  */
 function porNombreDeTipo(nombre) {
   const t = String(nombre ?? '')
@@ -94,10 +99,9 @@ function porNombreDeTipo(nombre) {
 /**
  * El TÍTULO de la actividad, tal como lo escribió la ARL en el documento.
  *
- * Es la tercera fuente y existe por una razón muy concreta: el catálogo CFG-04
- * lo edita el cliente para **cobrar**, no para clasificar formatos, y hoy no
- * tiene una entrada "Asesoría" — así que una asesoría de AXA o de Colmena no se
- * puede reconocer por ahí (ver la decisión D-8 del plan de la tanda).
+ * Es el respaldo para las órdenes que nadie diligenció: las cargadas antes de
+ * que el desplegable existiera para AXA y Colmena, y las que se guardaron sin
+ * elegir tipo.
  *
  * AXA abrevia con un prefijo de tres letras en el propio título de la orden
  * ("ASE CONTROL ACCIDENTALIDAD PROFESIONAL", "CAP TRABAJO SEGURO EN ALTURAS");
@@ -117,30 +121,55 @@ function porTituloDeActividad(titulo) {
 }
 
 /**
+ * Los tipos de actividad que ofrece cada ARL, por su letra.
+ *
+ * Bolívar usa las seis del AT-031 porque son las que trae su Excel SIPAB. AXA y
+ * Colmena solo distinguen asesoría de capacitación; **AXA parte además las
+ * asesorías por las HORAS** (el corte está en 16), y eso no es un tipo más que
+ * elegir: son dos juegos de formatos que salen del mismo tipo y de un dato que
+ * la orden ya tiene.
+ *
+ * Espejo de `LETRAS_POR_ARL` en `sst_app/src/app/core/bolivar.ts`.
+ */
+export const TIPOS_ACTIVIDAD_POR_ARL = {
+  bolivar: ['A', 'T', 'C', 'E', 'M', 'O'],
+  colpatria: ['A', 'C'],
+  colmena: ['A', 'C'],
+};
+
+/** Lo que se ofrece cuando la ARL no es ninguna de las tres conocidas. */
+const TIPOS_POR_DEFECTO = ['A', 'T', 'C'];
+
+/** Las letras que se le pueden elegir a una orden de esta ARL. */
+export function tiposActividadDeArl(arlNombre) {
+  return TIPOS_ACTIVIDAD_POR_ARL[carpetaArl(arlNombre)] ?? TIPOS_POR_DEFECTO;
+}
+
+/**
  * El tipo de actividad de una orden, y DE DÓNDE salió.
+ *
+ * ⚠️ **Esto no es el «tipo de orden» del catálogo de Configuración.** Son dos
+ * conceptos que se llamaban casi igual y llegaron a mezclarse en este archivo:
+ *
+ *   * **Tipo de actividad ante la ARL** (`tipo_servicio_arl`, este) → decide
+ *     **qué formatos** se le mandan al profesional y qué tiene que devolver.
+ *   * **Tipo de orden** (CFG-04, `tipo_orden_id`) → decide **el valor de la hora**
+ *     que se le paga. No interviene aquí en absoluto.
  *
  * Por orden de autoridad:
  *
- *  1. **La letra del SIPAB**, en Bolívar. La escribió la ARL en el documento de
- *     origen y es la que se marca en el formato que se le radica: no hay fuente
- *     mejor.
- *  2. **El tipo de orden** (CFG-04). Ojo: es la categoría con la que se le
- *     **paga** al profesional y puede no coincidir con la actividad — una
- *     asistencia técnica se puede estar cobrando a tarifa de asesoría, que es
- *     una decisión de precios y no de formatos.
- *  3. **El título de la actividad**, que es lo único que queda cuando el
- *     catálogo no tiene una categoría equivalente.
+ *  1. **`tipo_servicio_arl`**, que es lo que se eligió al cargar la orden (y en
+ *     Bolívar llega ya puesto desde la columna del SIPAB). En las tres ARL: la
+ *     letra es el código interno, no un invento de Bolívar.
+ *  2. **El título de la actividad**, tal como lo escribió la ARL en el
+ *     documento. Es lo único que queda cuando nadie eligió el tipo.
  *
  * Devolver el origen no es un adorno: permite avisar a quien asigna de que el
  * juego de formatos se decidió con la fuente más débil.
  */
 export function tipoActividadDeOrden(orden) {
-  if (esBolivar(orden?.arl_nombre)) {
-    const letra = normalizarTipoActividadBolivar(orden?.tipo_servicio_arl);
-    if (letra) return { tipo: POR_LETRA[letra], origen: 'letra' };
-  }
-  const porCatalogo = porNombreDeTipo(orden?.tipo_orden);
-  if (porCatalogo) return { tipo: porCatalogo, origen: 'catalogo' };
+  const letra = normalizarTipoActividadBolivar(orden?.tipo_servicio_arl);
+  if (letra) return { tipo: POR_LETRA[letra], origen: 'seleccion' };
 
   const porTitulo = porTituloDeActividad(orden?.tipo_actividad);
   if (porTitulo) return { tipo: porTitulo, origen: 'titulo' };
@@ -414,8 +443,9 @@ export function avisoDeEntrega(orden, entrega) {
     return entrega.tipo
       ? `No hay una regla de formatos para ${entrega.tipo.toLowerCase().replace(/_/g, ' ')} en ` +
         `esta ARL: se envió el juego base. Confírmelo antes de que el profesional ejecute.`
-      : 'No se pudo determinar el tipo de actividad de la orden (falta el tipo de orden, o la ' +
-        'letra del AT-031 en Bolívar): se envió el juego base de formatos de la ARL.';
+      : 'La orden no tiene diligenciado el "Tipo de actividad ARL", que es lo que decide los ' +
+        'formatos, y su título tampoco lo dice: se envió el juego base de la ARL. Diligéncielo ' +
+        'en la ficha y vuelva a asignar.';
   }
   // El corte de AXA se aplica sobre `horas_asignadas`, y las carpetas de la ARL
   // hablan de "unidades". En una orden que no se mide en horas el número
@@ -427,12 +457,12 @@ export function avisoDeEntrega(orden, entrega) {
              'de más de 16 unidades). Si son 16 o menos, corresponde la ficha de gestión.';
     }
   }
-  // El título es la fuente más débil de las tres: no lo eligió nadie, se dedujo
-  // de cómo la ARL redactó la orden.
+  // El título es la fuente débil: no lo eligió nadie, se dedujo de cómo la ARL
+  // redactó la orden.
   if (entrega.origen === 'titulo') {
-    return `El tipo de actividad se dedujo del título de la orden (${entrega.tipo.toLowerCase().replace(/_/g, ' ')}), ` +
-           'porque el catálogo de tipos de orden no tiene una categoría equivalente. ' +
-           'Compruebe que los formatos adjuntos son los correctos.';
+    return `El tipo de actividad se dedujo del título de la orden (${entrega.tipo.toLowerCase().replace(/_/g, ' ')}) ` +
+           'porque la orden no lo tiene elegido. Diligencie "Tipo de actividad ARL" en la ficha, ' +
+           'o compruebe que los formatos adjuntos son los correctos.';
   }
   return null;
 }
