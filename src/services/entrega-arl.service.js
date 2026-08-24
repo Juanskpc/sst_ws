@@ -186,6 +186,7 @@ const DEVUELVE = {
   // Bolívar · el AT-031 de seguimiento ES el acta de la visita.
   at031: 'acta',
   at028: 'asistencia',
+  informeBolivar: 'informe',
 
   // AXA Colpatria · la ficha de gestión y el informe técnico ocupan la misma
   // casilla: son el informe de la actividad, y nunca salen los dos a la vez.
@@ -239,11 +240,12 @@ const REGLAS = [
   // propio AT-031. La asistencia técnica sí entrega informe de gestión.
   {
     arl: 'bolivar', tipo: TIPOS_ACTIVIDAD.ASISTENCIA_TECNICA,
-    formatos: ['at031'],
-    extras: ['informe'],
-    nota: 'Esta asistencia técnica requiere INFORME DE GESTIÓN. Aún no tenemos el formato en ' +
-          'blanco de la ARL cargado en la plataforma, así que redáctelo con el modelo habitual ' +
-          'de Bolívar y súbalo en la casilla "Informe técnico o de gestión".',
+    formatos: ['at031', 'informeBolivar'],
+    nota: 'El informe de gestión que va adjunto es un EJEMPLO ya diligenciado de otra visita: ' +
+          'es el modelo que usa Bolívar, no un formato en blanco. Úselo como guía y reescriba ' +
+          'TODO su contenido con los datos de esta orden —empresa, NIT, fechas, hallazgos, ' +
+          'fotografías y su propia firma— antes de subirlo en la casilla "Informe técnico o de ' +
+          'gestión". No lo devuelva con los datos del ejemplo.',
   },
   {
     arl: 'bolivar', tipo: TIPOS_ACTIVIDAD.ASESORIA,

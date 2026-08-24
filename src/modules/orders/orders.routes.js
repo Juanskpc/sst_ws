@@ -920,6 +920,38 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
   // visita. Antes el correo hablaba de "los soportes firmados" en abstracto y la
   // lista solo aparecía al abrir el portal, ya de vuelta de la empresa.
   const queDevolver = listaEtiquetas(result.entrega.soportes);
+  // FOR · Qué va adjunto, con su nombre y en el orden en que se generó.
+  //
+  // El correo hablaba de "los formatos de la ARL" en abstracto y describía lo
+  // que había que hacer con ellos —imprimirlos y completar asistentes, temas,
+  // observaciones y firmas— como si todas las órdenes llevaran lo mismo. Una
+  // asistencia técnica de Bolívar lleva un PDF y un informe en Word, y de ese
+  // segundo no se imprime nada. Se enumera lo que de verdad viaja.
+  const adjuntos = [];
+  for (const d of result.docs) {
+    const etiqueta = d._etiqueta || d.tipo;
+    const ya = adjuntos.find((a) => a.etiqueta === etiqueta);
+    // Los de alcance 'sesion' salen repetidos, uno por franja: se cuentan en
+    // vez de repetir la misma línea tres veces.
+    if (ya) ya.copias += 1;
+    else adjuntos.push({ etiqueta, copias: 1, prediligenciado: d._prediligenciado !== false });
+  }
+  const listaAdjuntos = adjuntos.map(
+    (a) => (a.copias > 1 ? `${a.etiqueta} · ${a.copias} juegos, uno por franja` : a.etiqueta),
+  );
+  const hayPrediligenciados = adjuntos.some((a) => a.prediligenciado);
+  const hayTalCual = adjuntos.some((a) => !a.prediligenciado);
+  // Cada frase solo aparece si le corresponde un adjunto de esa clase.
+  const queHacerConEllos = [
+    hayPrediligenciados
+      ? `Los formatos en PDF van ya diligenciados con los datos de esta orden: imprímelos y ` +
+        `completa en la sesión lo que falta (asistentes, temas desarrollados, observaciones y firmas).`
+      : null,
+    hayTalCual
+      ? `Los documentos de Word, Excel o PowerPoint no se pueden prediligenciar: los redactas tú ` +
+        `con los datos de esta orden.`
+      : null,
+  ].filter(Boolean);
   // Los viáticos se dicen ANTES de la visita: el profesional decide cómo viaja
   // con ese dato, y descubrirlos al recibir la cuenta de cobro llega tarde.
   // Con la categoría delante: "Transporte intermunicipal · $45.000" dice qué se
@@ -970,9 +1002,9 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
         (sinFormatos
           ? `Los formatos de esta ARL todavía no están cargados en la plataforma; ` +
             `te los haremos llegar aparte.\n\n`
-          : `Adjuntamos los formatos de ${o.arl_nombre} ya diligenciados con los datos de ` +
-            `esta orden: imprímelos y completa en la sesión lo que falta ` +
-            `(asistentes, temas desarrollados, observaciones y firmas).\n\n`) +
+          : `Documentos adjuntos de ${o.arl_nombre}:\n` +
+            listaAdjuntos.map((a) => `  · ${a}\n`).join('') +
+            `\n${queHacerConEllos.join(' ')}\n\n`) +
         // La lista concreta, también en texto plano. Estaba calculada y no se
         // imprimía: quien lee el correo en texto solo veía «los soportes
         // firmados», que es justo lo que este bloque vino a quitar.
@@ -1015,11 +1047,10 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
                 'Los formatos de esta ARL todavía no están cargados en la plataforma. ' +
                 'Te los haremos llegar aparte.',
               )
-            : parrafo(
-                `Adjuntamos los formatos de ${o.arl_nombre} ya diligenciados con ` +
-                `los datos de esta orden. Solo tienes que imprimirlos y completar en la sesión ` +
-                `lo que falta: asistentes, temas desarrollados, observaciones y firmas.`,
-              ),
+            // Los documentos por su nombre, no "los formatos de la ARL": lo que
+            // se lista es exactamente lo que trae ESTE correo.
+            : bloqueLista(`Documentos adjuntos de ${o.arl_nombre}`, listaAdjuntos),
+          sinFormatos ? '' : parrafo(queHacerConEllos.join(' ')),
           // ASG · El nombre impreso no es el suyo, y hay que decírselo aquí: es
           // lo primero que va a ver al abrir el PDF adjunto.
           notaSuplente ? bloqueAviso(notaSuplente) : '',

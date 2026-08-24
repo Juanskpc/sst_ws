@@ -114,7 +114,12 @@ export async function generateOrderDocuments(orderId, client = pool) {
        VALUES ($1,NULL,$2,$3) RETURNING *`,
       [orderId, formato.tipo, key]
     );
-    created.push({ ...doc.rows[0], _buffer: formato.buffer, _filename: formato.filename });
+    // `_etiqueta` y `_prediligenciado` no van a BD: los usa el correo para
+    // enumerar lo que ESTA orden lleva adjunto, con el nombre de la ARL.
+    created.push({
+      ...doc.rows[0], _buffer: formato.buffer, _filename: formato.filename,
+      _etiqueta: formato.etiqueta, _prediligenciado: formato.prediligenciado,
+    });
   }
   if (created.length) return created;
 
@@ -134,7 +139,10 @@ export async function generateOrderDocuments(orderId, client = pool) {
        VALUES ($1,$2,$3,$4) RETURNING *`,
       [orderId, template.id, template.tipo, key]
     );
-    created.push({ ...doc.rows[0], _buffer: buffer, _filename: `${template.tipo}.pdf` });
+    created.push({
+      ...doc.rows[0], _buffer: buffer, _filename: `${template.tipo}.pdf`,
+      _etiqueta: template.nombre || template.tipo, _prediligenciado: true,
+    });
   }
   return created;
 }

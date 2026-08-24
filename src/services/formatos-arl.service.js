@@ -90,61 +90,85 @@ const FORMATOS = {
   at031: {
     archivo: 'bolivar/seguimiento.pdf', modo: 'acroform', alcance: 'sesion',
     tipo: 'seguimiento', nombre: 'seguimiento.pdf',
+    etiqueta: 'Seguimiento de reuniones y actividades (AT-031)',
     campos: camposSeguimientoBolivar, marcas: marcasSeguimientoBolivar,
   },
   at028: {
     archivo: 'bolivar/asistencia.pdf', modo: 'acroform', alcance: 'sesion',
     tipo: 'asistencia', nombre: 'asistencia.pdf',
+    etiqueta: 'Registro de asistencia (AT-028)',
     campos: camposAsistenciaBolivar,
+  },
+  // El informe de gestión de las asistencias técnicas. ⚠️ NO es un formato en
+  // blanco: es un informe REAL ya redactado, el único modelo que entregó el
+  // cliente, y lleva la razón social y el NIT de una empresa, el nombre y la
+  // licencia del profesional que lo firmó y el registro fotográfico de aquella
+  // visita. Va como EJEMPLO —así se llama el adjunto y así lo dice el correo—
+  // para que el profesional escriba el suyo encima, no para diligenciarlo.
+  // Cuando la ARL entregue el formato en blanco, se reemplaza el archivo.
+  informeBolivar: {
+    archivo: 'bolivar/informe-gestion.docx', modo: 'adjunto', alcance: 'orden',
+    tipo: 'informe_gestion', nombre: 'informe de gestion (EJEMPLO diligenciado).docx',
+    etiqueta: 'Informe de gestión · EJEMPLO de otra visita, para reescribirlo entero',
   },
 
   // --- AXA Colpatria ---
   asistentesAxa: {
     archivo: 'colpatria/asistencia.pdf', modo: 'plano', alcance: 'sesion',
     tipo: 'asistencia', nombre: 'asistencia.pdf',
+    etiqueta: 'Registro listado de asistencia',
     casillas: () => CASILLAS_ASISTENCIA_COLPATRIA, valores: valoresAsistenciaColpatria,
   },
   fichaAxa: {
     archivo: 'colpatria/ficha-gestion.pdf', modo: 'acroform', alcance: 'orden',
     tipo: 'ficha_gestion', nombre: 'ficha-de-gestion.pdf',
+    etiqueta: 'Ficha de gestión del proveedor',
     campos: camposFichaAxa,
   },
   informeAxa: {
     archivo: 'colpatria/informe-tecnico.docx', modo: 'adjunto', alcance: 'orden',
     tipo: 'informe_tecnico', nombre: 'informe-tecnico (plantilla).docx',
+    etiqueta: 'Formato de informe técnico (Word)',
   },
 
   // --- Colmena ---
   prestacionColmena: {
     archivo: 'colmena/prestacion-servicios.pdf', modo: 'plano', alcance: 'sesion',
     tipo: 'prestacion_servicios', nombre: 'prestacion-de-servicios.pdf',
+    etiqueta: 'Informe de prestación de servicios (PSP-F-007)',
     casillas: () => CASILLAS_PRESTACION_COLMENA, valores: valoresPrestacionColmena,
   },
   asistenciaColmena: {
     archivo: 'colmena/asistencia.pdf', modo: 'plano', alcance: 'sesion',
     tipo: 'asistencia', nombre: 'asistencia.pdf',
+    etiqueta: 'Registro de asistencia (PSP-F-006)',
     casillas: () => CASILLAS_ASISTENCIA_COLMENA, valores: valoresAsistenciaColmena,
   },
   evaluacionColmena: {
     archivo: 'colmena/evaluacion.pdf', modo: 'plano', alcance: 'sesion',
     tipo: 'evaluacion', nombre: 'evaluacion.pdf',
+    etiqueta: 'Evaluación de la sesión (PSP-F-010)',
     casillas: () => CASILLAS_EVALUACION_COLMENA, valores: valoresEvaluacionColmena,
   },
   registroEjecucionColmena: {
     archivo: 'colmena/registro-ejecucion.xls', modo: 'adjunto', alcance: 'orden',
     tipo: 'registro_ejecucion', nombre: 'registro-de-ejecucion.xls',
+    etiqueta: 'Registro de ejecución de actividades (Excel)',
   },
   plantillaColmena: {
     archivo: 'colmena/plantilla-presentaciones.pptx', modo: 'adjunto', alcance: 'orden',
     tipo: 'plantilla_presentacion', nombre: 'plantilla-de-presentaciones.pptx',
+    etiqueta: 'Plantilla de presentaciones (PowerPoint)',
   },
   informeColmenaA: {
     archivo: 'colmena/informe-tipo-a.docx', modo: 'adjunto', alcance: 'orden',
     tipo: 'informe_tipo_a', nombre: 'informe tipo A (plantilla).docx',
+    etiqueta: 'Informe de prestación de servicios · tipo A (Word)',
   },
   informeColmenaB: {
     archivo: 'colmena/informe-tipo-b.docx', modo: 'adjunto', alcance: 'orden',
     tipo: 'informe_tipo_b', nombre: 'informe tipo B (plantilla).docx',
+    etiqueta: 'Informe técnico de servicios · tipo B (Word)',
   },
 };
 
@@ -713,7 +737,14 @@ function salida(def, buffer, sufijo) {
   const filename = sufijo && punto > 0
     ? `${def.nombre.slice(0, punto)}${sufijo}${def.nombre.slice(punto)}`
     : def.nombre;
-  return { tipo: def.tipo, filename, buffer };
+  // `etiqueta` y `prediligenciado` viajan hasta el correo: es lo que permite
+  // enumerar en el cuerpo los documentos que ESTA orden lleva de verdad, en vez
+  // de hablar en abstracto de "los formatos de la ARL".
+  return {
+    tipo: def.tipo, filename, buffer,
+    etiqueta: def.etiqueta || def.nombre,
+    prediligenciado: def.modo !== 'adjunto',
+  };
 }
 
 /**

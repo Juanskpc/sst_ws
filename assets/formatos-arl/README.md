@@ -7,12 +7,13 @@ correo de asignación del profesional.
 **Van TODOS versionados en el repositorio a propósito**, y hay que mantenerlo
 así: `formatos-arl.service.js` los abre en ejecución, de modo que un clon sin
 ellos no puede asignar una orden — falla con `ENOENT` en la ARL que le toque.
-Son documentos públicos de la ARL (formularios vacíos), no documentación de
-clientes.
+Salvo una excepción anotada más abajo, son documentos públicos de la ARL
+(formularios vacíos), no documentación de clientes.
 
 Los ejemplos ya diligenciados que sirvieron para mapear las casillas **no** están
 aquí: llevan nombres, cédulas y firmas de asistentes reales, y viven fuera de git
-(`jdd_consultores_app/docs/Formatos/`, también ignorada).
+(`jdd_consultores_app/docs/Formatos/`, también ignorada). La única excepción es
+`bolivar/informe-gestion.docx`, y está explicada abajo.
 
 **No salen todos en cada orden.** Cuáles se adjuntan lo decide
 `src/services/entrega-arl.service.js` a partir de la ARL, el tipo de actividad,
@@ -22,6 +23,7 @@ las horas y la modalidad; este README solo dice qué es cada archivo.
 |---|---|---|---|
 | `bolivar/seguimiento.pdf` | Seguimiento de Reuniones y Actividades · Forma AT-031 | AcroForm + marcas dibujadas | sesión |
 | `bolivar/asistencia.pdf` | Registro de Asistencia · FORMA AT-028 | AcroForm | sesión |
+| `bolivar/informe-gestion.docx` | Informe de gestión · **ejemplo diligenciado**, no formato en blanco | **se adjunta tal cual** | **orden** |
 | `colpatria/asistencia.pdf` | Registro Listado de Asistencia | Coordenadas | sesión |
 | `colpatria/ficha-gestion.pdf` | Ficha de Gestión · Proveedor de Gestión del Riesgo (3 págs.) | AcroForm | **orden** |
 | `colpatria/informe-tecnico.docx` | Formato Informe Técnico | **se adjunta tal cual** | **orden** |
@@ -42,12 +44,23 @@ casillas, son guiones que el profesional redacta en Word o en Excel. No se
 prediligencian a propósito — reescribirles el contenido los descuadraría sin
 ganar nada (ver abajo el caso de Colmena).
 
-⚠️ **Falta el informe de gestión de Bolívar.** Las asistencias técnicas lo
-exigen, pero lo único que entregó el cliente es un ejemplo **ya diligenciado**,
-con la razón social y el NIT de una empresa real y el nombre y el número de
-licencia del profesional que lo firmó. No se versiona por eso. Mientras tanto la
-regla se lo pide al profesional como soporte y el correo se lo advierte; hay que
-pedirle a la ARL (o al cliente) el formato en blanco.
+⚠️ **`bolivar/informe-gestion.docx` es la excepción a la primera regla de este
+archivo: NO está en blanco.** Es un informe real de otra visita —razón social y
+NIT de una empresa, nombre y número de licencia del profesional que lo firmó,
+contacto de la empresa y el registro fotográfico de aquel día—, y es lo único que
+entregó el cliente. Se decidió el **24-ago-2026** mandarlo igual, porque las
+asistencias técnicas de Bolívar lo exigen y sin un modelo el profesional
+escribía el informe a ciegas.
+
+Va con las cautelas puestas: el adjunto se llama
+`informe de gestion (EJEMPLO diligenciado).docx` y el correo le dice al
+profesional, en un aviso destacado, que reescriba TODO su contenido y que no lo
+devuelva con los datos del ejemplo. **En cuanto la ARL entregue el formato en
+blanco hay que reemplazar el archivo** — el resto del código no cambia, la clave
+del registro y el nombre del adjunto son los mismos.
+
+Los demás ejemplos ya diligenciados que sirvieron para mapear casillas siguen
+fuera de git.
 
 La carpeta de AXA Colpatria se llama `colpatria` porque así se le llama aquí; el
 nombre en la BD es "AXA Colpatria" y `carpetaArl()` hace la traducción.
