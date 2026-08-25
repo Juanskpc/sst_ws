@@ -211,17 +211,17 @@ export async function generatePrecuentaPdf(precuenta) {
   page.drawText(String(Number(precuenta.total_horas) || 0), { x: 505, y, size: 10, font });
 
   // Con viáticos, el total deja de ser horas × tarifa: hay que desglosarlo o la
-  // cifra no cuadra con las cuentas del profesional. Son un REEMBOLSO, no
-  // honorarios, y se dice así — la contadora los trata distinto.
+  // cifra no cuadra con las cuentas del profesional. Van en su propia línea
+  // porque no son honorarios — la contadora los trata distinto.
   const viaticos = Number(precuenta.total_viaticos) || 0;
   if (viaticos > 0) {
     y -= 16;
     page.drawText('Honorarios:', { x: 380, y, size: 10, font: bold });
     page.drawText(pesos((Number(precuenta.total_monto) || 0) - viaticos), { x: 480, y, size: 10, font });
     y -= 16;
-    // "Viáticos" a secas: la etiqueta larga ("Viáticos (reembolso)") mide más de
-    // los 100 pt que hay hasta la columna de cifras y se comía el valor. Que es
-    // un reembolso se explica en el correo y en la pantalla, donde hay sitio.
+    // "Viáticos" a secas, como en el correo y en las dos pantallas: el cliente
+    // retiró la coletilla "(reembolso)" el 24-ago-2026. Aquí además no cabía —
+    // la etiqueta larga pasaba de los 100 pt que hay hasta la columna de cifras.
     page.drawText('Viáticos:', { x: 380, y, size: 10, font: bold });
     page.drawText(pesos(viaticos), { x: 480, y, size: 10, font });
   }

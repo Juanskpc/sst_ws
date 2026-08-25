@@ -635,7 +635,7 @@ export async function enviarPrecuenta(id) {
             ...(Number(pc.total_viaticos) > 0
               ? [
                   filaDato('Honorarios', enPesos(Number(pc.total_monto) - Number(pc.total_viaticos))),
-                  filaDato('Viáticos (reembolso)', enPesos(pc.total_viaticos)),
+                  filaDato('Viáticos', enPesos(pc.total_viaticos)),
                 ]
               : []),
           ]),
