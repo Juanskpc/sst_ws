@@ -492,14 +492,6 @@ DO $$ BEGIN
 END $$;
 CREATE INDEX IF NOT EXISTS idx_ordenes_tipo ON sst.ordenes_servicio(tipo_orden_id);
 
--- El borrador arrastra el tipo elegido en la vista previa de Importar, para que
--- la OS nazca con él. Se guarda en columna y no en el JSON de la extracción: no
--- lo dice el documento de la ARL, lo decide quien revisa.
-ALTER TABLE sst.borradores_extraccion ADD COLUMN IF NOT EXISTS tipo_orden_id UUID REFERENCES sst.tipos_orden(id);
--- Y la categoría del viático, por lo mismo: se elige en la vista previa y la OS
--- nace con ella. NULL = "No aplica" (la inmensa mayoría de las órdenes).
-ALTER TABLE sst.borradores_extraccion ADD COLUMN IF NOT EXISTS tipo_viatico_id UUID REFERENCES sst.tipos_viatico(id);
-
 -- VER-04 · QUÉ soportes se devolvieron para corregir, no solo que "hubo rechazo".
 --
 -- El rechazo era total: la orden volvía entera y el profesional podía subirlo
@@ -707,6 +699,14 @@ ALTER TABLE sst.borradores_extraccion
   ADD COLUMN IF NOT EXISTS deshabilitado_por UUID REFERENCES sst.usuarios(id) ON DELETE SET NULL;
 CREATE INDEX IF NOT EXISTS idx_borradores_deshabilitado ON sst.borradores_extraccion(deshabilitado);
 CREATE INDEX IF NOT EXISTS idx_borradores_prof          ON sst.borradores_extraccion(profesional_asignado_id);
+
+-- El borrador arrastra el tipo elegido en la vista previa de Importar, para que
+-- la OS nazca con él. Se guarda en columna y no en el JSON de la extracción: no
+-- lo dice el documento de la ARL, lo decide quien revisa.
+ALTER TABLE sst.borradores_extraccion ADD COLUMN IF NOT EXISTS tipo_orden_id UUID REFERENCES sst.tipos_orden(id);
+-- Y la categoría del viático, por lo mismo: se elige en la vista previa y la OS
+-- nace con ella. NULL = "No aplica" (la inmensa mayoría de las órdenes).
+ALTER TABLE sst.borradores_extraccion ADD COLUMN IF NOT EXISTS tipo_viatico_id UUID REFERENCES sst.tipos_viatico(id);
 
 -- Ocupaciones (agenda) del profesional: franjas fecha+hora en que NO está disponible.
 -- Alimenta el calendario del modal "Asignar profesional".
