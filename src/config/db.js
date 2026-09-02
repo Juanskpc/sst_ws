@@ -3,10 +3,15 @@ import { env } from './env.js';
 
 const { Pool } = pg;
 
-// Neon requiere SSL. El connection string trae sslmode=require; reforzamos aquí.
+// Neon requiere SSL y el connection string trae sslmode=require, así que por
+// defecto se refuerza aquí. En el VPS la base es local (127.0.0.1) y el túnel
+// TLS no aporta nada: `DB_SSL=false` lo apaga y deja que `pg` y Prisma digan lo
+// mismo sobre el mismo sslmode.
+const sslDeshabilitado = process.env.DB_SSL === 'false';
+
 export const pool = new Pool({
   connectionString: env.databaseUrl,
-  ssl: { rejectUnauthorized: false },
+  ssl: sslDeshabilitado ? false : { rejectUnauthorized: false },
   max: 10,
   idleTimeoutMillis: 30000,
 });
