@@ -1,7 +1,7 @@
-import ExcelJS from 'exceljs';
 import { CAMPOS_BORRADOR, CANONICAL_FIELDS, classifyPdfArl } from './gemini.service.js';
 import { extractPdfWithOpenAI } from './openai-extraction.bridge.js';
 import { normalizarTipoActividadBolivar } from '../utils/bolivar.js';
+import { leerRejillaExcel } from '../utils/excel-grid.js';
 
 /**
  * Confianza general de la OS (0-100): promedio de la confianza de los campos que
@@ -247,21 +247,32 @@ function horaTexto(valor) {
   return `${hh}:${mm}`;
 }
 
+/** "8:00" → "08:00". El texto renderizado de un .xls binario no siempre trae el cero. */
+function horaTextoNormalizada(s) {
+  const m = /^(\d{1,2}):(\d{2})/.exec(s);
+  return m ? `${m[1].padStart(2, '0')}:${m[2]}` : s;
+}
+
 /**
  * "Hora Programada" → "08:00". Es la hora a la que empieza la visita, NO su
  * duración: las horas de la orden salen de "Act Programadas" y solo cuando la
  * unidad de medida son HORAS.
  */
-function horaDeCelda(row, col) {
+function horaDeCelda(grid, r, col) {
   if (!col) return null;
-  const cell = row.getCell(col);
+  const cell = grid.celda(r, col);
   const raw = cell.value;
   if (esHoraSuelta(raw, cell.numFmt)) {
     const hora = horaTexto(raw);
     return hora === '00:00' ? null : hora;   // 00:00 = casilla sin diligenciar
   }
-  const s = String(raw ?? '').trim();
-  return /^\d{1,2}:\d{2}/.test(s) ? s : null;
+  // Respaldo por texto (y no por `raw`): en un .xls binario (BIFF/OLE2) la
+  // fecha "día cero" de una hora suelta cae fuera del rango que las zonas
+  // horarias resuelven de forma estable —el propio Excel arrastra el defecto
+  // del año 1900—, así que `esHoraSuelta` puede no reconocerla. El texto
+  // renderizado ("8:00") no depende de esa cuenta y siempre es fiable.
+  const s = String(cell.text ?? '').trim();
+  return /^\d{1,2}:\d{2}/.test(s) ? horaTextoNormalizada(s) : null;
 }
 
 /** El número de una celda de valor del SIPAB: '21.020', '21020,00' o 21020. */
@@ -321,22 +332,19 @@ function viaticosDelSipab(fila) {
  * Devuelve [{ fields: {campo:{value,confidence}}, sourceRow, sipab }].
  */
 export async function parseExcelSipab(buffer) {
-  const wb = new ExcelJS.Workbook();
-  await wb.xlsx.load(buffer);
-  const ws = wb.worksheets[0];
-  if (!ws) return [];
+  const grid = await leerRejillaExcel(buffer);
+  if (!grid) return [];
 
   // Localiza la fila de encabezados (la primera con ≥3 columnas reconocidas) y
   // arma dos mapas: campo canónico → columna, y columna auxiliar → columna.
   let headerRowIdx = 1;
   let colMap = {};
   let auxMap = {};
-  for (let r = 1; r <= Math.min(ws.rowCount, 10); r++) {
-    const row = ws.getRow(r);
+  for (let r = 1; r <= Math.min(grid.rowCount, 10); r++) {
     const map = {};
     const aux = {};
     const desconocidas = [];
-    row.eachCell((cell, col) => {
+    grid.eachCell(r, (cell, col) => {
       const clave = normalizarEncabezado(cell.value);
       if (!clave) return;
       if (clave in SIPAB_HEADERS) {
@@ -361,11 +369,10 @@ export async function parseExcelSipab(buffer) {
     }
   }
 
-  const celda = (row, col) => (col ? textoDeCelda(row.getCell(col)) : '');
+  const celda = (r, col) => (col ? textoDeCelda(grid.celda(r, col)) : '');
 
   const records = [];
-  for (let r = headerRowIdx + 1; r <= ws.rowCount; r++) {
-    const row = ws.getRow(r);
+  for (let r = headerRowIdx + 1; r <= grid.rowCount; r++) {
     const fields = {};
     const poner = (campo, value, confidence = 99) => {
       fields[campo] = { value: value || '', confidence: value ? confidence : 0 };
@@ -377,7 +384,7 @@ export async function parseExcelSipab(buffer) {
     //    vencimiento— y la vista previa puede pedirla como obligatoria.
     let hasData = false;
     for (const canonical of CAMPOS_BORRADOR) {
-      const value = celda(row, colMap[canonical]);
+      const value = celda(r, colMap[canonical]);
       if (value) hasData = true;
       poner(canonical, value);
     }
@@ -403,7 +410,7 @@ export async function parseExcelSipab(buffer) {
 
     // 3) "Ubicacion Actividad" → ciudad, dirección y contacto de la empresa.
     //    Confianza 95 y no 99: el dato es fiable, pero sale de partir un texto.
-    const ubic = parseUbicacionActividad(celda(row, auxMap.ubicacion));
+    const ubic = parseUbicacionActividad(celda(r, auxMap.ubicacion));
     if (ubic.ciudad) poner('ciudad_ejecucion', ubic.ciudad, 95);
     if (ubic.direccion) poner('direccion', ubic.direccion, 95);
     if (ubic.contacto) poner('contacto_empresa_nombre', ubic.contacto, 95);
@@ -427,7 +434,7 @@ export async function parseExcelSipab(buffer) {
     //    VACÍO para que lo diligencie quien revisa. Dejarlo con el número de
     //    actividades marcado en amarillo hacía que una orden de una investigación
     //    de accidente entrara a Órdenes como si fuera de una sola hora.
-    const unidad = celda(row, auxMap.unidad_medida);
+    const unidad = celda(r, auxMap.unidad_medida);
     if (fields.horas_asignadas.value && unidad && !/hora/i.test(unidad)) {
       fields.horas_asignadas.value = '';
       fields.horas_asignadas.confidence = 0;
@@ -440,13 +447,13 @@ export async function parseExcelSipab(buffer) {
       // que vengan después: la unidad de medida y la hora programada son las que
       // permiten entender una orden que no se midió en horas).
       const viaticos = viaticosDelSipab({
-        autoriza: celda(row, auxMap.autoriza_viaticos),
-        transporte: celda(row, auxMap.viat_transporte),
-        alojamiento: celda(row, auxMap.viat_alojamiento),
-        alimentacion: celda(row, auxMap.viat_alimentacion),
-        tiempo_muerto: celda(row, auxMap.viat_tiempo_muerto),
-        desplazamiento: celda(row, auxMap.viat_desplazamiento),
-        material: celda(row, auxMap.viat_material),
+        autoriza: celda(r, auxMap.autoriza_viaticos),
+        transporte: celda(r, auxMap.viat_transporte),
+        alojamiento: celda(r, auxMap.viat_alojamiento),
+        alimentacion: celda(r, auxMap.viat_alimentacion),
+        tiempo_muerto: celda(r, auxMap.viat_tiempo_muerto),
+        desplazamiento: celda(r, auxMap.viat_desplazamiento),
+        material: celda(r, auxMap.viat_material),
       });
       // El campo de la orden solo se rellena si de verdad hay algo que
       // reembolsar: un 0 en el formulario invita a "corregirlo" y acaba
@@ -458,12 +465,12 @@ export async function parseExcelSipab(buffer) {
         viaticos,
         // En crudo, tal como venía la celda: es lo que permite entender por qué
         // el campo `tipo_servicio_arl` salió vacío cuando la letra no encaja.
-        tipo_servicio: celda(row, colMap.tipo_servicio_arl) || null,
-        nro_trabajadores: celda(row, auxMap.nro_trabajadores) || null,
-        hora_programada: horaDeCelda(row, auxMap.hora_programada),
-        num_poliza: (celda(row, auxMap.num_poliza) || '').replace(/^nro\.?\s*/i, '') || null,
+        tipo_servicio: celda(r, colMap.tipo_servicio_arl) || null,
+        nro_trabajadores: celda(r, auxMap.nro_trabajadores) || null,
+        hora_programada: horaDeCelda(grid, r, auxMap.hora_programada),
+        num_poliza: (celda(r, auxMap.num_poliza) || '').replace(/^nro\.?\s*/i, '') || null,
         departamento: ubic.departamento || null,
-        profesional_sugerido_arl: celda(row, auxMap.profesional_arl) || null,
+        profesional_sugerido_arl: celda(r, auxMap.profesional_arl) || null,
       };
       // `sourceRow` = número de fila real en la hoja. Permite que la vista previa
       // del documento resalte la fila de la que salió cada orden extraída.
@@ -481,19 +488,16 @@ export async function parseExcelSipab(buffer) {
  * Se acota el tamaño porque viaja por HTTP y se renderiza en el navegador.
  */
 export async function readSheetPreview(buffer, { maxRows = 300, maxCols = 40 } = {}) {
-  const wb = new ExcelJS.Workbook();
-  await wb.xlsx.load(buffer);
-  const ws = wb.worksheets[0];
-  if (!ws) return { hoja: null, columnas: 0, filas: [], truncado: false };
+  const grid = await leerRejillaExcel(buffer);
+  if (!grid) return { hoja: null, columnas: 0, filas: [], truncado: false };
 
-  const totalCols = Math.min(ws.columnCount || 0, maxCols);
-  const totalRows = Math.min(ws.rowCount || 0, maxRows);
+  const totalCols = Math.min(grid.columnCount || 0, maxCols);
+  const totalRows = Math.min(grid.rowCount || 0, maxRows);
   const filas = [];
   for (let r = 1; r <= totalRows; r++) {
-    const row = ws.getRow(r);
     const celdas = [];
     for (let c = 1; c <= totalCols; c++) {
-      const cell = row.getCell(c);
+      const cell = grid.celda(r, c);
       // Las fechas se normalizan igual que en la extracción (ISO corto): así el
       // valor de la hoja y el campo extraído se leen idénticos al compararlos.
       // Incluye el texto `01/aug/2026` con el que el SIPAB escribe la mayoría de
@@ -502,7 +506,13 @@ export async function readSheetPreview(buffer, { maxRows = 300, maxCols = 40 } =
       // Las columnas de HORA se pintan como hora y no como fecha: Excel las
       // guarda en su día cero, así que "Hora Programada 08:00" aparecía en el
       // modal de revisión como `1899-12-30` —una fecha imposible al lado del
-      // campo de horas, que es justo lo que había que comparar—.
+      // campo de horas, que es justo lo que había que comparar—. Se prueba
+      // primero el texto renderizado ("8:00"): en un .xls binario el día cero
+      // no siempre resuelve limpio por zona horaria, pero el texto sí.
+      if (/^\d{1,2}:\d{2}$/.test(texto)) {
+        celdas.push(horaTextoNormalizada(texto));
+        continue;
+      }
       if (esHoraSuelta(cell.value, cell.numFmt)) {
         celdas.push(horaTexto(cell.value));
         continue;
@@ -517,10 +527,10 @@ export async function readSheetPreview(buffer, { maxRows = 300, maxCols = 40 } =
     filas.push({ n: r, celdas });
   }
   return {
-    hoja: ws.name,
+    hoja: grid.nombre,
     columnas: totalCols,
     filas,
-    truncado: (ws.rowCount || 0) > totalRows || (ws.columnCount || 0) > totalCols,
+    truncado: (grid.rowCount || 0) > totalRows || (grid.columnCount || 0) > totalCols,
   };
 }
 
