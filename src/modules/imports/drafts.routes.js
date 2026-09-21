@@ -157,6 +157,49 @@ router.patch('/:id/enable', requireRole('admin'), asyncHandler(async (req, res) 
   res.json({ message: 'Orden restaurada.', data: await loadDraftExpanded(req.params.id) });
 }));
 
+// ELIMINAR DEFINITIVAMENTE · borra el borrador y, si llegó a materializarse,
+// también la OS que dejó en `ordenes_servicio`.
+//
+// El soft-delete de arriba no libera el hueco: `dedup.service` compara contra
+// `ordenes_servicio`, no contra el borrador, así que una orden deshabilitada
+// por error de importación (duplicado, archivo corrupto…) seguía bloqueando
+// para siempre el reintento con "esta orden ya existe", sin decir dónde
+// mirar porque la fila ya no aparecía en ninguna pestaña activa. Solo se
+// permite sobre una orden YA deshabilitada: el "sí, deshabilítala" y el "sí,
+// bórrala definitivamente" son dos confirmaciones separadas a propósito.
+router.delete('/:id', requireRole('admin'), asyncHandler(async (req, res) => {
+  await withTransaction(async (client) => {
+    const cur = await client.query(
+      `SELECT id, deshabilitado, orden_servicio_id
+         FROM sst.borradores_extraccion WHERE id=$1 FOR UPDATE`,
+      [req.params.id]
+    );
+    const draft = cur.rows[0];
+    if (!draft) throw notFound('Borrador no encontrado');
+    if (!draft.deshabilitado) {
+      throw conflict('Solo se puede eliminar definitivamente una orden ya deshabilitada.');
+    }
+    if (draft.orden_servicio_id) {
+      try {
+        await client.query(`DELETE FROM sst.ordenes_servicio WHERE id=$1`, [draft.orden_servicio_id]);
+      } catch (e) {
+        // 23503 = violación de FK: hoy solo la deja `precuenta_items`, a
+        // propósito sin ON DELETE CASCADE (ver schema.sql), cuando la orden ya
+        // entró a una cuenta de cobro. Ahí no se borra nada: perder ese
+        // rastro de pago sería peor que el bloqueo que se quiere resolver.
+        if (e.code === '23503') {
+          throw conflict(
+            'Esta orden ya tiene una cuenta de cobro generada y no se puede eliminar sin perder ese registro.'
+          );
+        }
+        throw e;
+      }
+    }
+    await client.query(`DELETE FROM sst.borradores_extraccion WHERE id=$1`, [draft.id]);
+  });
+  res.json({ message: 'Orden eliminada definitivamente del sistema.' });
+}));
+
 // IMP-03/04 · Guardar correcciones manuales del split-view (sin validar aún).
 router.put('/:id', requireRole('admin'), asyncHandler(async (req, res) => {
   const { fields } = req.body || {}; // { codigo_cronograma: {value, confidence}, ... }
