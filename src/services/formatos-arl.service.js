@@ -27,8 +27,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
 import { horaAmPm, horasTexto } from '../utils/formato.js';
-import { indiceModalidad, indiceTipoActividadBolivar } from '../utils/bolivar.js';
-import { entregaDeLaOrden } from './entrega-arl.service.js';
+import { indiceModalidad, indiceTipoActividadBolivar, normalizarModalidadEjecucion } from '../utils/bolivar.js';
+import { entregaDeLaOrden, tipoActividadDeOrden } from './entrega-arl.service.js';
 
 const RAIZ = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'assets', 'formatos-arl');
 
@@ -141,19 +141,36 @@ const FORMATOS = {
   // GENERA el documento, no la de la visita, que sigue en blanco a propósito
   // (supuesto por defecto de la ficha; ninguna de las celdas DD/MM/AAAA impresas
   // se toca). Solo los tres formatos de Colmena la llevan.
+  // 29-sep · El informe de prestación que Colmena acepta es el SPM-F 38 que ELLA
+  // misma genera: es el PDF de la orden de servicio que llega a JD&D, y ya trae
+  // su "Fecha Impresión", la línea/programa/componente/actividad y las horas
+  // solicitadas. Por eso, cuando la orden se importó de ese PDF, se escribe
+  // encima del original (`sobreOriginal`); el PSP-F-007 de la plantilla solo
+  // queda de respaldo para una orden sin archivo (cargada a mano, o cuyo PDF ya
+  // no está en el almacenamiento). Así lo mostró JD&D con fotos del original
+  // frente a lo que generaba Orbita.
   prestacionColmena: {
     archivo: 'colmena/prestacion-servicios.pdf', modo: 'plano', alcance: 'sesion',
     tipo: 'prestacion_servicios', nombre: 'prestacion-de-servicios.pdf',
-    etiqueta: 'Informe de prestación de servicios (PSP-F-007)',
+    etiqueta: 'Informe de prestación de servicios',
     casillas: () => CASILLAS_PRESTACION_COLMENA, valores: valoresPrestacionColmena,
     fechaImpresion: true,
+    sobreOriginal: {
+      casillas: () => CASILLAS_PRESTACION_COLMENA_ORIGINAL,
+      valores: valoresPrestacionColmenaOriginal,
+    },
   },
+  // 29-sep · La asistencia vigente es el "Registro de Ejecución de Actividades
+  // de Prevención y de Formación" (PSP-F-006 V3 03/2026), el que JD&D radica de
+  // verdad. Colmena lo entrega en Excel (`registro-ejecucion.xls`); se exportó
+  // UNA vez a PDF carta apaisado para escribir encima sin que se descuadre,
+  // igual que se hizo con la V2.4 que reemplaza.
   asistenciaColmena: {
-    archivo: 'colmena/asistencia.pdf', modo: 'plano', alcance: 'sesion',
+    archivo: 'colmena/registro-ejecucion.pdf', modo: 'plano', alcance: 'sesion',
     tipo: 'asistencia', nombre: 'asistencia.pdf',
-    etiqueta: 'Registro de asistencia (PSP-F-006)',
-    casillas: () => CASILLAS_ASISTENCIA_COLMENA, valores: valoresAsistenciaColmena,
-    fechaImpresion: true,
+    etiqueta: 'Registro de ejecución de actividades (PSP-F-006 V3)',
+    casillas: () => CASILLAS_REGISTRO_EJECUCION_COLMENA, valores: valoresRegistroEjecucionColmena,
+    marcas: marcasRegistroEjecucionColmena,
   },
   evaluacionColmena: {
     archivo: 'colmena/evaluacion.pdf', modo: 'plano', alcance: 'sesion',
@@ -594,6 +611,47 @@ const CASILLAS_ASISTENCIA_COLMENA = [
   ['numero_orden', 142, 473, 127],
 ];
 
+/**
+ * Colmena · SPM-F 38, el PDF de la propia orden (carta vertical, 612 × 792).
+ * Medido sobre la orden 2246190 con `inspeccionar-formato.mjs`. Solo se rellena
+ * lo que ese documento deja en blanco y la orden ya sabe: la fecha y la hora de
+ * ESTA sesión, las horas ejecutadas en ella y el nombre del profesional. El
+ * quinto elemento `'centro'` centra el valor en su celda.
+ */
+const CASILLAS_PRESTACION_COLMENA_ORIGINAL = [
+  ['dia', 124, 686, 28, 'centro'],
+  ['mes', 152, 686, 29, 'centro'],
+  ['anio', 181, 686, 28, 'centro'],
+  ['hora', 210, 686, 53, 'centro'],
+  // Columna "Ejecutada (en la sesión programada)", a la altura del "Solicitada".
+  ['cantidad_ejecutada', 466, 540, 114, 'centro'],
+  ['nombre_profesional', 182, 214, 300],
+];
+
+/**
+ * Colmena · Registro de Ejecución de Actividades (PSP-F-006 V3), carta
+ * apaisada (792 × 612), sobre `colmena/registro-ejecucion.pdf`.
+ */
+const CASILLAS_REGISTRO_EJECUCION_COLMENA = [
+  ['ciudad', 170, 505, 160],
+  ['fecha', 458, 505, 70],
+  ['hora_inicio', 578, 505, 33],
+  ['hora_fin', 651, 505, 33],
+  ['empresa', 170, 489, 160],
+  ['numero_orden', 502, 489, 180],
+  ['razon_social_proveedor', 105, 98, 150],
+  ['nombre_profesional', 290, 98, 180],
+];
+
+/** Centro de los hexágonos de Modalidad y Tipo de actividad del PSP-F-006 V3. */
+const MARCAS_REGISTRO_EJECUCION_COLMENA = {
+  modalidad: { VIRTUAL: [197.5, 477], PRESENCIAL: [249.4, 477] },
+  // Colmena solo distingue asesoría y capacitación (`TIPOS_ACTIVIDAD_POR_ARL`):
+  // la asesoría es la última casilla, "Otra actividad de asesoría y/o
+  // acompañamiento al SG-SST". Chequeo preventivo y prueba tamiz no los presta JD&D.
+  tipo: { CAPACITACION: [227.6, 461], ASESORIA: [644.8, 461] },
+};
+
 /** AXA Colpatria · Formato Registro Listado de Asistencia, apaisado. */
 const CASILLAS_ASISTENCIA_COLPATRIA = [
   ['ciudad', 93, 512, 175],
@@ -644,6 +702,45 @@ function valoresAsistenciaColmena(orden, profesional, sesion) {
     contrato: '',
     tema: temaDeLaOrden(orden),
     numero_orden: orden.numero_orden,
+  };
+}
+
+/** Colmena · Registro de Ejecución de Actividades (PSP-F-006 V3). */
+function valoresRegistroEjecucionColmena(orden, profesional, sesion, aliado) {
+  return {
+    ciudad: orden.ciudad_ejecucion,
+    fecha: sesion.fechaCorta,
+    hora_inicio: sesion.horaInicio,
+    hora_fin: sesion.horaFin,
+    empresa: orden.empresa_nombre,
+    numero_orden: orden.numero_orden,
+    razon_social_proveedor: aliado.nombre,
+    nombre_profesional: profesional?.nombre,
+  };
+}
+
+/** Qué hexágonos del PSP-F-006 V3 se marcan: la modalidad y el tipo de actividad. */
+function marcasRegistroEjecucionColmena(orden) {
+  const { modalidad, tipo } = MARCAS_REGISTRO_EJECUCION_COLMENA;
+  return [
+    modalidad[normalizarModalidadEjecucion(orden.modalidad_ejecucion)],
+    tipo[tipoActividadDeOrden(orden).tipo],
+  ].filter(Boolean);
+}
+
+/**
+ * Colmena · SPM-F 38 original. La fecha y la hora son las de ESTA sesión y
+ * "Ejecutada" sus horas (T0-12: una orden de 12 h en dos días de 6 lleva 6 en
+ * cada copia); "Solicitada" ya la trae impresa el documento de Colmena.
+ */
+function valoresPrestacionColmenaOriginal(orden, profesional, sesion) {
+  return {
+    dia: sesion.dia,
+    mes: sesion.mes,
+    anio: sesion.anio,
+    hora: [sesion.horaInicio, sesion.horaFin].filter(Boolean).join(' - '),
+    cantidad_ejecutada: sesion.horas,
+    nombre_profesional: profesional?.nombre,
   };
 }
 
@@ -748,13 +845,15 @@ const MARGEN_FECHA_IMPRESION = 24;
  * pone el asesor a mano, tal como estaba). Solo lo piden los tres formatos de
  * Colmena; AXA, que también es `modo: 'plano'`, no lo lleva.
  */
-async function rellenarPdfPlano(rutaPlantilla, casillas, valores, { fechaImpresion = false } = {}) {
-  const doc = await PDFDocument.load(await fs.readFile(rutaPlantilla));
+async function rellenarPdfPlano(plantilla, casillas, valores, { fechaImpresion = false, marcas = [] } = {}) {
+  // `plantilla` es la ruta del formato en blanco o, para el SPM-F 38 de Colmena,
+  // el PDF original de la orden ya leído del almacenamiento.
+  const doc = await PDFDocument.load(Buffer.isBuffer(plantilla) ? plantilla : await fs.readFile(plantilla));
   const pagina = doc.getPage(0);
   const font = await doc.embedFont(StandardFonts.Helvetica);
   const negro = rgb(0, 0, 0);
 
-  for (const [clave, x, y, ancho] of casillas) {
+  for (const [clave, x, y, ancho, alineacion] of casillas) {
     let texto = enBlanco(valores[clave]);
     if (!texto) continue;
     let tamano = TAMANO_BASE;
@@ -762,7 +861,17 @@ async function rellenarPdfPlano(rutaPlantilla, casillas, valores, { fechaImpresi
     while (texto.length > 1 && font.widthOfTextAtSize(texto, tamano) > ancho) {
       texto = `${texto.slice(0, -2)}…`;
     }
-    pagina.drawText(texto, { x, y, size: tamano, font, color: negro });
+    const xFinal = alineacion === 'centro' ? x + (ancho - font.widthOfTextAtSize(texto, tamano)) / 2 : x;
+    pagina.drawText(texto, { x: xFinal, y, size: tamano, font, color: negro });
+  }
+
+  // Casillas de opción dibujadas (los hexágonos del PSP-F-006 V3): una "X"
+  // centrada en el punto medido. No son campos de formulario, así que se dibujan.
+  if (marcas.length) {
+    const negrita = await doc.embedFont(StandardFonts.HelveticaBold);
+    for (const [cx, cy] of marcas) {
+      pagina.drawText('X', { x: cx - negrita.widthOfTextAtSize('X', 8) / 2, y: cy - 2.8, size: 8, font: negrita, color: negro });
+    }
   }
 
   if (fechaImpresion) {
@@ -818,8 +927,9 @@ function tramoDe(franjas) {
 
   // Sin cero a la izquierda en la hora ("8:00", no "08:00"): así se ve el
   // ejemplo de la ficha, y ahorra espacio en una casilla que ya lleva varias
-  // sesiones seguidas.
-  const horaCorta = (hhmm) => String(hhmm ?? '').replace(/^0(\d:)/, '$1');
+  // sesiones seguidas. Las franjas llegan de Postgres como `time::text`
+  // ("08:00:00"): sin cortar los segundos salía "8:00:00-10:00:00".
+  const horaCorta = (hhmm) => String(hhmm ?? '').slice(0, 5).replace(/^0(\d:)/, '$1');
   const dias = [...new Set(ordenadas.map((f) => f.fecha))];
   const observaciones = dias.length > 1
     ? `Sesiones: ${ordenadas
@@ -867,7 +977,7 @@ function salida(def, buffer, sufijo) {
  *
  * Devuelve `[{ tipo, filename, buffer }]`, vacío si la ARL no tiene formatos.
  */
-export async function generarFormatosArl({ orden, profesional, franjas = [], aliado }) {
+export async function generarFormatosArl({ orden, profesional, franjas = [], aliado, original = null }) {
   const entrega = entregaDeLaOrden(orden);
   if (!entrega.formatos.length) return [];
 
@@ -887,7 +997,7 @@ export async function generarFormatosArl({ orden, profesional, franjas = [], ali
 
   // 1) Los de alcance 'orden': uno solo, con el tramo completo de la visita.
   for (const def of definiciones.filter((d) => d.alcance === 'orden')) {
-    generados.push(salida(def, await construir(def, orden, profesional, tramo, identidad), ''));
+    generados.push(salida(def, await construir(def, orden, profesional, tramo, identidad, original), ''));
   }
 
   // 2) Los de alcance 'sesion': uno por franja.
@@ -895,14 +1005,19 @@ export async function generarFormatosArl({ orden, profesional, franjas = [], ali
     const sesion = sesionDe(orden, franja);
     const sufijo = sesiones.length > 1 ? `-${i + 1}` : '';
     for (const def of definiciones.filter((d) => d.alcance === 'sesion')) {
-      generados.push(salida(def, await construir(def, orden, profesional, sesion, identidad), sufijo));
+      generados.push(salida(def, await construir(def, orden, profesional, sesion, identidad, original), sufijo));
     }
   }
   return generados;
 }
 
 /** Rellena UN formato según su modo. */
-async function construir(def, orden, profesional, sesion, aliado) {
+async function construir(def, orden, profesional, sesion, aliado, original = null) {
+  if (def.sobreOriginal && await esOriginalUtilizable(original)) {
+    return rellenarPdfPlano(
+      original, def.sobreOriginal.casillas(), def.sobreOriginal.valores(orden, profesional, sesion, aliado),
+    );
+  }
   const ruta = path.join(RAIZ, ...def.archivo.split('/'));
   if (def.modo === 'adjunto') {
     // Se manda tal cual: es una plantilla que el profesional redacta en Word o
@@ -918,6 +1033,25 @@ async function construir(def, orden, profesional, sesion, aliado) {
   }
   return rellenarPdfPlano(
     ruta, def.casillas(), def.valores(orden, profesional, sesion, aliado),
-    { fechaImpresion: !!def.fechaImpresion },
+    { fechaImpresion: !!def.fechaImpresion, marcas: def.marcas ? def.marcas(orden) : [] },
   );
+}
+
+/**
+ * ¿El archivo con el que se importó la orden sirve de informe de prestación?
+ * Las coordenadas de `CASILLAS_PRESTACION_COLMENA_ORIGINAL` son las del SPM-F 38:
+ * una sola página carta vertical. Cualquier otra cosa (un PDF con varias órdenes,
+ * un escaneo, otro tamaño) escribiría los datos fuera de sitio, así que en ese
+ * caso se vuelve a la plantilla PSP-F-007 en vez de arriesgarse.
+ */
+async function esOriginalUtilizable(original) {
+  if (!Buffer.isBuffer(original)) return false;
+  try {
+    const doc = await PDFDocument.load(original, { ignoreEncryption: true });
+    if (doc.getPageCount() !== 1) return false;
+    const { width, height } = doc.getPage(0).getSize();
+    return Math.abs(width - 612) < 2 && Math.abs(height - 792) < 2;
+  } catch {
+    return false;
+  }
 }

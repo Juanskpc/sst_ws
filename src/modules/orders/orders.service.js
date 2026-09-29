@@ -3,7 +3,7 @@ import { notFound } from '../../utils/httpError.js';
 import { storage } from '../../services/storage.service.js';
 import { generateFormatoPdf } from '../../services/pdf.service.js';
 import {
-  ALIADO_POR_DEFECTO, generarFormatosArl, tieneFormatosPropios,
+  ALIADO_POR_DEFECTO, generarFormatosArl, slugArl, tieneFormatosPropios,
 } from '../../services/formatos-arl.service.js';
 
 /** Carga una OS expandida (con nombres de ARL/profesional) o lanza 404. */
@@ -57,6 +57,31 @@ export async function changeStatus({ orderId, newStatus, userId, motivo = null }
 }
 
 /** Identidad de JD&D ante las ARL, editable desde `sst.configuracion`. */
+/**
+ * El PDF con el que se importó una orden de Colmena: es su informe de
+ * prestación (SPM-F 38) y el formato sale escrito encima de él. Vive en el lote
+ * de importación, no en la orden. Solo Colmena lo usa; cualquier fallo (orden
+ * cargada a mano, archivo borrado del almacenamiento) devuelve null y el
+ * generador vuelve a la plantilla, en vez de dejar la asignación sin formatos.
+ */
+async function pdfOriginalDeColmena(orderId, arlNombre, client = pool) {
+  if (!slugArl(arlNombre).includes('colmena')) return null;
+  const r = await client.query(
+    `SELECT l.url_archivo, l.tipo_mime
+       FROM sst.ordenes_servicio o JOIN sst.lotes_importacion l ON l.id = o.lote_importacion_id
+      WHERE o.id = $1`,
+    [orderId]
+  );
+  const lote = r.rows[0];
+  if (!lote?.url_archivo || !/pdf/i.test(`${lote.tipo_mime} ${lote.url_archivo}`)) return null;
+  try {
+    return await storage.get(lote.url_archivo);
+  } catch (err) {
+    console.warn(`[formatos] no se pudo leer el PDF original de la orden ${orderId}: ${err.message}`);
+    return null;
+  }
+}
+
 async function aliadoEstrategico(client = pool) {
   const r = await client.query(`SELECT valor FROM sst.configuracion WHERE clave='aliado_estrategico'`);
   const guardado = r.rows[0]?.valor;
@@ -102,6 +127,7 @@ export async function generateOrderDocuments(orderId, client = pool) {
   const propios = tieneFormatosPropios(order.arl_nombre)
     ? await generarFormatosArl({
         orden: order, profesional: professional, franjas, aliado: await aliadoEstrategico(client),
+        original: await pdfOriginalDeColmena(orderId, order.arl_nombre, client),
       })
     : [];
 

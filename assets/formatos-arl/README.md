@@ -27,8 +27,10 @@ las horas y la modalidad; este README solo dice qué es cada archivo.
 | `colpatria/asistencia.pdf` | Registro Listado de Asistencia | Coordenadas | sesión |
 | `colpatria/ficha-gestion.pdf` | Ficha de Gestión · Proveedor de Gestión del Riesgo (3 págs.) | AcroForm | **orden** |
 | `colpatria/informe-tecnico.docx` | Formato Informe Técnico | **se adjunta tal cual** | **orden** |
-| `colmena/prestacion-servicios.pdf` | Informe de Prestación de Servicios · PSP-F-007 V3.3 | Coordenadas | sesión |
-| `colmena/asistencia.pdf` | Registro de asistencia · PSP-F-006 V2.4 | Coordenadas | sesión |
+| *(PDF original de la orden)* | Informe de Prestación de Servicios · **SPM-F 38**, el que genera Colmena | Coordenadas sobre el original | sesión |
+| `colmena/prestacion-servicios.pdf` | PSP-F-007 V3.3 · solo **respaldo** si la orden no tiene su PDF original | Coordenadas | sesión |
+| `colmena/registro-ejecucion.pdf` | Registro de Ejecución de Actividades · **PSP-F-006 V3 03/2026** (exportado del `.xls`) | Coordenadas + marcas | sesión |
+| `colmena/asistencia.pdf` | PSP-F-006 V2.4 · **obsoleto** desde el 29-sep-2026, ya no se usa | — | — |
 | `colmena/evaluacion.pdf` | Evaluación Sesión de Capacitación · PSP-F-010 V1.2 | Coordenadas | sesión |
 | `colmena/informe-tipo-a.docx` | Informe de prestación de servicios · tipo A | **se adjunta tal cual** | **orden** |
 | `colmena/informe-tipo-b.docx` | Informe técnico de servicios · tipo B | **se adjunta tal cual** | **orden** |
@@ -133,6 +135,23 @@ rellena a bolígrafo, y la fecha va igualmente en los otros dos formatos de
 Colmena. La casilla PERSONA NATURAL / PERSONA JURÍDICA tampoco se marca: es una
 declaración sobre la figura legal del proveedor y la plataforma no guarda ese
 dato.
+
+## Colmena · los formatos correctos (29-sep-2026)
+
+JD&D mandó fotos del original frente a lo que generaba Orbita y quedaron claras dos
+cosas:
+
+- **El informe de prestación es el SPM-F 38 que genera Colmena**, que es literalmente
+  el PDF de la orden de servicio con el que se importa. Ya trae la "Fecha Impresión",
+  la línea/programa/componente/actividad y las horas solicitadas. Orbita escribe encima
+  de ese original la fecha, la hora y las horas ejecutadas de cada sesión y el nombre
+  del profesional (`CASILLAS_PRESTACION_COLMENA_ORIGINAL`). Si el original no es una
+  sola página carta, o no existe, se vuelve al PSP-F-007 de la plantilla.
+- **La asistencia es el "Registro de Ejecución de Actividades" PSP-F-006 V3**, que
+  Colmena entrega en Excel. Se exportó una vez a PDF con Excel. ⚠️ Excel exporta con el
+  papel de la impresora PREDETERMINADA: en el PC de desarrollo es una térmica de
+  tiquetes y la hoja salió de 842 × 204 pt. Se recortó el formulario y se colocó en
+  carta apaisada con `pdf-lib` (es vectorial: no pierde calidad).
 
 ## Colmena · por qué su asistencia ya no es un `.docx`
 
