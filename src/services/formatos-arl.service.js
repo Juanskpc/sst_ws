@@ -96,12 +96,18 @@ const FORMATOS = {
     tipo: 'seguimiento', nombre: 'seguimiento.pdf',
     etiqueta: 'Seguimiento de reuniones y actividades (AT-031)',
     campos: camposSeguimientoBolivar, marcas: marcasSeguimientoBolivar,
+    // Vista previa · van en "Observaciones y sugerencias", ANTES del detalle de
+    // sesiones que el sistema ya pone ahí.
+    observaciones: { campo: '42' },
   },
   at028: {
     archivo: 'bolivar/asistencia.pdf', modo: 'acroform', alcance: 'sesion',
     tipo: 'asistencia', nombre: 'asistencia.pdf',
     etiqueta: 'Registro de asistencia (AT-028)',
     campos: camposAsistenciaBolivar,
+    // Vista previa · el AT-028 no tiene campo de formulario para esto: se
+    // escribe sobre las rayas de "Observaciones del participante ARL".
+    observaciones: { renglones: () => RENGLONES_OBS_AT028 },
   },
   // El informe de gestión de las asistencias técnicas. ⚠️ NO es un formato en
   // blanco: es un informe REAL ya redactado, el único modelo que entregó el
@@ -158,6 +164,8 @@ const FORMATOS = {
     sobreOriginal: {
       casillas: () => CASILLAS_PRESTACION_COLMENA_ORIGINAL,
       valores: valoresPrestacionColmenaOriginal,
+      // Recuadro "OBSERVACIONES Y RECOMENDACIONES DEL PROVEEDOR Y/O DEL CLIENTE".
+      observaciones: { renglones: () => RENGLONES_OBS_SPM38 },
     },
   },
   // 29-sep · La asistencia vigente es el "Registro de Ejecución de Actividades
@@ -171,6 +179,7 @@ const FORMATOS = {
     etiqueta: 'Registro de ejecución de actividades (PSP-F-006 V3)',
     casillas: () => CASILLAS_REGISTRO_EJECUCION_COLMENA, valores: valoresRegistroEjecucionColmena,
     marcas: marcasRegistroEjecucionColmena,
+    observaciones: { renglones: () => RENGLONES_OBS_REGISTRO_EJECUCION },
   },
   evaluacionColmena: {
     archivo: 'colmena/evaluacion.pdf', modo: 'plano', alcance: 'sesion',
@@ -394,7 +403,7 @@ function paginaDelWidget(doc, widget) {
  * @param marcas  Casillas de grupos de opción a marcar: `[[grupo, índice], …]`.
  *                Ver `marcarOpcion` para por qué no se seleccionan por valor.
  */
-async function rellenarAcroForm(rutaPlantilla, valores, marcas = []) {
+async function rellenarAcroForm(rutaPlantilla, valores, marcas = [], { parrafo = null } = {}) {
   const doc = await PDFDocument.load(await fs.readFile(rutaPlantilla));
   const form = doc.getForm();
   const helvetica = await doc.embedFont(StandardFonts.Helvetica);
@@ -420,6 +429,9 @@ async function rellenarAcroForm(rutaPlantilla, valores, marcas = []) {
       continue;
     }
     const { texto: ajustado, tamano } = ajustarACasilla(campo, texto, helvetica);
+    // Varias líneas (observaciones de la vista previa + detalle de sesiones)
+    // solo se respetan si el campo está marcado como multilínea.
+    if (ajustado.includes('\n')) campo.enableMultiline();
     campo.setText(ajustado);
     // La apariencia se dibuja a partir de este "default appearance", y algunos
     // campos del formato traían un gris claro heredado. Se fija en negro: esto
@@ -437,6 +449,7 @@ async function rellenarAcroForm(rutaPlantilla, valores, marcas = []) {
   // página, no en el formulario, así que regenerarlas después las borraría.
   const negrita = await doc.embedFont(StandardFonts.HelveticaBold);
   for (const [grupo, indice] of marcas) marcarOpcion(doc, form, negrita, grupo, indice);
+  if (parrafo) escribirRenglones(doc.getPage(0), helvetica, parrafo.texto, parrafo.renglones);
 
   return Buffer.from(await doc.save());
 }
@@ -643,6 +656,16 @@ const CASILLAS_REGISTRO_EJECUCION_COLMENA = [
   ['nombre_profesional', 290, 98, 180],
 ];
 
+/**
+ * Vista previa · renglones donde se escriben las observaciones del administrador,
+ * `[x, línea base, ancho]`, de arriba abajo. El texto se reparte por palabras y,
+ * si no cabe, el último renglón termina en "…" (el límite de 500 caracteres de la
+ * API hace que eso sea raro).
+ */
+const RENGLONES_OBS_SPM38 = [[36, 503, 540], [36, 493, 540], [36, 483, 540], [36, 473, 540]];
+const RENGLONES_OBS_REGISTRO_EJECUCION = [[109, 132, 568], [109, 123, 568], [109, 114, 568]];
+const RENGLONES_OBS_AT028 = [[185, 99, 400], [32, 83, 555], [32, 67, 555]];
+
 /** Centro de los hexágonos de Modalidad y Tipo de actividad del PSP-F-006 V3. */
 const MARCAS_REGISTRO_EJECUCION_COLMENA = {
   modalidad: { VIRTUAL: [197.5, 477], PRESENCIAL: [249.4, 477] },
@@ -845,7 +868,7 @@ const MARGEN_FECHA_IMPRESION = 24;
  * pone el asesor a mano, tal como estaba). Solo lo piden los tres formatos de
  * Colmena; AXA, que también es `modo: 'plano'`, no lo lleva.
  */
-async function rellenarPdfPlano(plantilla, casillas, valores, { fechaImpresion = false, marcas = [] } = {}) {
+async function rellenarPdfPlano(plantilla, casillas, valores, { fechaImpresion = false, marcas = [], parrafo = null } = {}) {
   // `plantilla` es la ruta del formato en blanco o, para el SPM-F 38 de Colmena,
   // el PDF original de la orden ya leído del almacenamiento.
   const doc = await PDFDocument.load(Buffer.isBuffer(plantilla) ? plantilla : await fs.readFile(plantilla));
@@ -864,6 +887,8 @@ async function rellenarPdfPlano(plantilla, casillas, valores, { fechaImpresion =
     const xFinal = alineacion === 'centro' ? x + (ancho - font.widthOfTextAtSize(texto, tamano)) / 2 : x;
     pagina.drawText(texto, { x: xFinal, y, size: tamano, font, color: negro });
   }
+
+  if (parrafo) escribirRenglones(pagina, font, parrafo.texto, parrafo.renglones);
 
   // Casillas de opción dibujadas (los hexágonos del PSP-F-006 V3): una "X"
   // centrada en el punto medido. No son campos de formulario, así que se dibujan.
@@ -950,7 +975,7 @@ function tramoDe(franjas) {
 }
 
 /** Un formato ya generado, listo para adjuntarse al correo. */
-function salida(def, buffer, sufijo) {
+function salida(def, { buffer, admiteObservaciones }, sufijo) {
   // El sufijo solo aparece cuando de verdad hay varias sesiones: con una visita
   // normal el adjunto se llama "asistencia.pdf" a secas. Se inserta ANTES de la
   // extensión, no al final, o el archivo dejaría de abrirse ("asistencia.pdf-2").
@@ -965,6 +990,8 @@ function salida(def, buffer, sufijo) {
     tipo: def.tipo, filename, buffer,
     etiqueta: def.etiqueta || def.nombre,
     prediligenciado: def.modo !== 'adjunto',
+    clave: def.clave,
+    admiteObservaciones,
   };
 }
 
@@ -977,12 +1004,20 @@ function salida(def, buffer, sufijo) {
  *
  * Devuelve `[{ tipo, filename, buffer }]`, vacío si la ARL no tiene formatos.
  */
-export async function generarFormatosArl({ orden, profesional, franjas = [], aliado, original = null }) {
+export async function generarFormatosArl({
+  orden, profesional, franjas = [], aliado, original = null, observaciones = {},
+}) {
   const entrega = entregaDeLaOrden(orden);
   if (!entrega.formatos.length) return [];
 
   const identidad = { ...ALIADO_POR_DEFECTO, ...(aliado || {}) };
-  const definiciones = entrega.formatos.map((clave) => FORMATOS[clave]).filter(Boolean);
+  // La clave (at031, asistenciaColmena…) viaja con cada definición: es con la
+  // que se guardan las observaciones de la vista previa y con la que la pantalla
+  // las vuelve a pedir.
+  const definiciones = entrega.formatos
+    .filter((clave) => FORMATOS[clave])
+    .map((clave) => ({ ...FORMATOS[clave], clave }));
+  const obsDe = (def) => enBlanco(observaciones?.[def.clave]);
 
   // Sin franjas se emite igualmente un juego, con las casillas de fecha y
   // horario en blanco: el profesional ya tiene el formato correcto en la mano.
@@ -997,7 +1032,7 @@ export async function generarFormatosArl({ orden, profesional, franjas = [], ali
 
   // 1) Los de alcance 'orden': uno solo, con el tramo completo de la visita.
   for (const def of definiciones.filter((d) => d.alcance === 'orden')) {
-    generados.push(salida(def, await construir(def, orden, profesional, tramo, identidad, original), ''));
+    generados.push(salida(def, await construir(def, orden, profesional, tramo, identidad, original, obsDe(def)), ''));
   }
 
   // 2) Los de alcance 'sesion': uno por franja.
@@ -1005,36 +1040,80 @@ export async function generarFormatosArl({ orden, profesional, franjas = [], ali
     const sesion = sesionDe(orden, franja);
     const sufijo = sesiones.length > 1 ? `-${i + 1}` : '';
     for (const def of definiciones.filter((d) => d.alcance === 'sesion')) {
-      generados.push(salida(def, await construir(def, orden, profesional, sesion, identidad, original), sufijo));
+      generados.push(salida(def, await construir(def, orden, profesional, sesion, identidad, original, obsDe(def)), sufijo));
     }
   }
   return generados;
 }
 
 /** Rellena UN formato según su modo. */
-async function construir(def, orden, profesional, sesion, aliado, original = null) {
+async function construir(def, orden, profesional, sesion, aliado, original = null, observacion = '') {
+  // Devuelve `{ buffer, admiteObservaciones }`. Lo segundo le dice a la vista
+  // previa si ESTE archivo tiene dónde escribir las observaciones (el informe de
+  // Colmena sí sobre su original, no en la plantilla de respaldo), para no
+  // ofrecer un cuadro de texto que después no se imprime.
   if (def.sobreOriginal && await esOriginalUtilizable(original)) {
-    return rellenarPdfPlano(
-      original, def.sobreOriginal.casillas(), def.sobreOriginal.valores(orden, profesional, sesion, aliado),
-    );
+    const obs = def.sobreOriginal.observaciones;
+    return {
+      buffer: await rellenarPdfPlano(
+        original, def.sobreOriginal.casillas(), def.sobreOriginal.valores(orden, profesional, sesion, aliado),
+        { parrafo: obs && observacion ? { renglones: obs.renglones(), texto: observacion } : null },
+      ),
+      admiteObservaciones: !!obs,
+    };
   }
   const ruta = path.join(RAIZ, ...def.archivo.split('/'));
   if (def.modo === 'adjunto') {
     // Se manda tal cual: es una plantilla que el profesional redacta en Word o
     // en Excel, no un formato con casillas que se puedan prediligenciar.
-    return fs.readFile(ruta);
+    return { buffer: await fs.readFile(ruta), admiteObservaciones: false };
   }
+  const obs = def.observaciones;
+  const parrafo = obs?.renglones && observacion ? { renglones: obs.renglones(), texto: observacion } : null;
   if (def.modo === 'acroform') {
-    return rellenarAcroForm(
-      ruta,
-      def.campos(orden, profesional, sesion, aliado),
-      def.marcas ? def.marcas(orden) : [],
-    );
+    const campos = def.campos(orden, profesional, sesion, aliado);
+    // En un campo del formulario, lo que escribió el administrador va PRIMERO y
+    // lo que ya ponía el sistema (el detalle de sesiones del AT-031) debajo.
+    if (obs?.campo && observacion) {
+      campos[obs.campo] = [observacion, enBlanco(campos[obs.campo])].filter(Boolean).join('\n');
+    }
+    return {
+      buffer: await rellenarAcroForm(ruta, campos, def.marcas ? def.marcas(orden) : [], { parrafo }),
+      admiteObservaciones: !!obs,
+    };
   }
-  return rellenarPdfPlano(
-    ruta, def.casillas(), def.valores(orden, profesional, sesion, aliado),
-    { fechaImpresion: !!def.fechaImpresion, marcas: def.marcas ? def.marcas(orden) : [] },
-  );
+  return {
+    buffer: await rellenarPdfPlano(
+      ruta, def.casillas(), def.valores(orden, profesional, sesion, aliado),
+      { fechaImpresion: !!def.fechaImpresion, marcas: def.marcas ? def.marcas(orden) : [], parrafo },
+    ),
+    admiteObservaciones: !!obs,
+  };
+}
+
+/**
+ * Vista previa · escribe un texto libre repartido por palabras sobre renglones
+ * `[x, línea base, ancho]`. Los saltos de línea del usuario se aplanan: en un
+ * formato impreso manda el espacio de las rayas, no el formato del texto. Si no
+ * cabe, el último renglón acaba en "…", que al menos deja ver que falta algo.
+ */
+function escribirRenglones(pagina, font, texto, renglones, tamano = TAMANO_BASE) {
+  const palabras = enBlanco(texto).replace(/\s+/g, ' ').split(' ').filter(Boolean);
+  let i = 0;
+  renglones.forEach(([x, y, ancho], n) => {
+    let linea = '';
+    while (i < palabras.length) {
+      const prueba = linea ? `${linea} ${palabras[i]}` : palabras[i];
+      if (linea && font.widthOfTextAtSize(prueba, tamano) > ancho) break;
+      linea = prueba;
+      i += 1;
+    }
+    if (n === renglones.length - 1 && i < palabras.length) {
+      while (linea.length > 1 && font.widthOfTextAtSize(`${linea}…`, tamano) > ancho) linea = linea.slice(0, -1);
+      linea = `${linea}…`;
+    }
+    if (linea) pagina.drawText(linea, { x, y, size: tamano, font, color: rgb(0, 0, 0) });
+  });
 }
 
 /**

@@ -566,6 +566,14 @@ END $$;
 ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS asesor_gestion_riesgo TEXT;
 ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS tema_actividad        TEXT;
 
+-- 29-sep-2026 · Observaciones que el administrador escribe en la VISTA PREVIA de
+-- los formatos, antes de enviarlos al profesional: `{ "<formato>": "texto" }`,
+-- con la clave del formato de `formatos-arl.service.js` (at031, at028,
+-- prestacionColmena, asistenciaColmena). Se guardan en la orden y no solo en el
+-- PDF para que reprogramar o regenerar los formatos no las pierda.
+ALTER TABLE sst.ordenes_servicio
+  ADD COLUMN IF NOT EXISTS observaciones_formatos JSONB NOT NULL DEFAULT '{}'::jsonb;
+
 -- ⭐ T0-07 · Estado ARL + n.º de prefactura (revisiones del cliente, 27-sep-2026).
 --
 -- Eje propio, independiente del ciclo operativo y del de cobro: dice si la ARL
