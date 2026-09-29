@@ -193,6 +193,19 @@ async function intentarEmision({ doc, items, retenciones, formaPagoCodigo, medio
 // ─── Finalización (común a emitir y a reconciliar) ──────────────────────────
 
 /**
+ * Número "de pantalla" de un documento. Factus devuelve el número CON el prefijo
+ * ya pegado ("SETP990019103", visto en la respuesta real guardada en
+ * ADMIN_APP/admin_ws/tmp/factus), y aquí además se guarda el prefijo aparte: sin
+ * esta comprobación la orden quedaba facturada con "SETPSETP990019103" (bug de
+ * A1-05 encontrado al construir A2-01, 29-sep).
+ */
+export function numeroCompleto(prefijo, numero) {
+  if (!numero) return null;
+  const n = String(numero);
+  return prefijo && !n.startsWith(prefijo) ? `${prefijo}${n}` : n;
+}
+
+/**
  * VALIDADO: guarda número/CUFE/PDF/XML y marca cada orden como FACTURADA, todo
  * en una transacción. La factura ya quedó VALIDADO en la DIAN pase lo que pase
  * aquí abajo (Factus no depende de esto), así que si el PDF o el XML no se
@@ -225,7 +238,7 @@ async function finalizarValidado(documentoId, resultado, usuarioId) {
     await client.query(
       `INSERT INTO sst.documento_eventos (documento_id, codigo, descripcion, usuario_id)
        VALUES ($1, 'VALIDADO', $2, $3)`,
-      [documentoId, `Validada por la DIAN. Número ${resolucion?.prefijo ?? ''}${resultado.numeroDocumento}, CUFE ${resultado.cufe ?? '—'}.`, usuarioId],
+      [documentoId, `Validada por la DIAN. Número ${numeroCompleto(resolucion?.prefijo, resultado.numeroDocumento)}, CUFE ${resultado.cufe ?? '—'}.`, usuarioId],
     );
     if (avisosDescarga.length) {
       await client.query(
@@ -235,7 +248,7 @@ async function finalizarValidado(documentoId, resultado, usuarioId) {
     }
 
     const items = (await client.query(`SELECT orden_id FROM sst.documento_items WHERE documento_id = $1 AND orden_id IS NOT NULL`, [documentoId])).rows;
-    const numeroFactura = `${resolucion?.prefijo ?? ''}${resultado.numeroDocumento}`;
+    const numeroFactura = numeroCompleto(resolucion?.prefijo, resultado.numeroDocumento);
     for (const { orden_id: ordenId } of items) {
       const previa = (await client.query(`SELECT estado_cobro::text AS estado_cobro FROM sst.ordenes_servicio WHERE id = $1 FOR UPDATE`, [ordenId])).rows[0];
       if (!previa || previa.estado_cobro === 'FACTURADA') continue; // ya facturada (reconciliación repetida): no duplica el historial

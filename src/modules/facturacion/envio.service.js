@@ -1,3 +1,4 @@
+import { numeroCompleto as numeroDeDocumento } from './emision.service.js';
 import { pool } from '../../config/db.js';
 import { badRequest, notFound } from '../../utils/httpError.js';
 import { sendEmail } from '../../services/email.service.js';
@@ -36,7 +37,7 @@ export async function reenviarAlCliente(documentoId, usuarioId, { correo } = {})
   if (!destino) throw badRequest('El tercero no tiene correo de facturación y no se indicó uno alterno.');
 
   const [pdf, xml] = await Promise.all([storage.get(doc.pdf_path), storage.get(doc.xml_path)]);
-  const numeroCompleto = `${doc.prefijo ?? ''}${doc.numero ?? ''}` || doc.reference_code;
+  const numeroCompleto = numeroDeDocumento(doc.prefijo, doc.numero) || doc.reference_code;
   const totalTexto = enPesosCO(doc.total_a_pagar);
 
   await sendEmail({

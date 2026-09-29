@@ -5,7 +5,7 @@ import { badRequest } from '../../utils/httpError.js';
 import { authRequired, requireRole } from '../../middleware/auth.js';
 import { esBolivar, relacionPorFacturar, resolverSeleccion } from './relacion.service.js';
 import { actualizarBorrador, crearBorrador, eliminarBorrador, listarBorradores, obtenerBorrador } from './borrador.service.js';
-import { corregirDocumento, emitirDocumento, reconciliarDocumento } from './emision.service.js';
+import { corregirDocumento, emitirDocumento, numeroCompleto, reconciliarDocumento } from './emision.service.js';
 import { reenviarAlCliente } from './envio.service.js';
 import { storage } from '../../services/storage.service.js';
 import { actualizarEventosEnLote, consultarEventosDocumento, marcarAceptacionTacita } from './eventos.service.js';
@@ -173,7 +173,7 @@ router.post('/documentos/:id/emitir', OPERAR, asyncHandler(async (req, res) => {
   }
   const mensaje = resultado.estado === 'RECHAZADO'
     ? 'La DIAN rechazó el documento. Corrija el borrador y vuelva a emitir.'
-    : `Factura validada: ${resultado.prefijo ?? ''}${resultado.numero ?? ''} (CUFE ${resultado.cufe ?? '—'}).`;
+    : `Factura validada: ${numeroCompleto(resultado.prefijo, resultado.numero) ?? ''} (CUFE ${resultado.cufe ?? '—'}).`;
   res.json({ message: mensaje, data: resultado });
 }));
 
@@ -200,7 +200,7 @@ router.get('/documentos/:id/archivo/:tipo', LEER, asyncHandler(async (req, res) 
   const doc = await obtenerBorrador(uuidOpcional(req.params.id, 'id'));
   const ruta = tipo === 'pdf' ? doc.pdf_path : doc.xml_path;
   if (!ruta) throw badRequest(`Esta factura todavía no tiene ${tipo.toUpperCase()}: solo lo tienen las validadas por la DIAN.`);
-  const nombre = `${doc.prefijo ?? ''}${doc.numero ?? doc.reference_code}.${tipo}`;
+  const nombre = `${numeroCompleto(doc.prefijo, doc.numero) ?? doc.reference_code}.${tipo}`;
   res.setHeader('Content-Type', tipo === 'pdf' ? 'application/pdf' : 'application/xml');
   res.setHeader('Content-Disposition', `inline; filename="${nombre}"`);
   res.send(await storage.get(ruta));
