@@ -357,25 +357,28 @@ const DOCUMENTO_SELECT = `
   -- ellas, pdf_path/xml_path quedaban guardados en BD pero invisibles para
   -- quien los lee (el bug que costó una vuelta entera al verificar A1-05).
   d.cufe, d.qr_url, d.pdf_path, d.xml_path, d.errores,
+  -- A2-01 · en una nota crédito: a qué factura corrige y por qué causal DIAN.
+  d.causal, d.documento_referencia_id, ref.prefijo AS referencia_prefijo, ref.numero AS referencia_numero,
   d.creado_en, d.actualizado_en`;
 const DOCUMENTO_FROM = `
   FROM sst.documentos_electronicos d
   JOIN sst.terceros t ON t.id = d.tercero_id
   LEFT JOIN sst.prefacturas pf ON pf.id = d.prefactura_id
   LEFT JOIN sst.formas_pago fp ON fp.id = d.forma_pago_id
-  LEFT JOIN sst.medios_pago mp ON mp.id = d.medio_pago_id`;
+  LEFT JOIN sst.medios_pago mp ON mp.id = d.medio_pago_id
+  LEFT JOIN sst.documentos_electronicos ref ON ref.id = d.documento_referencia_id`;
 
-export async function listarBorradores({ estado = 'BORRADOR', arlId } = {}, client = pool) {
+export async function listarBorradores({ estado = 'BORRADOR', arlId, tipo = 'FACTURA' } = {}, client = pool) {
   // A1-08 · la pestaña «Emitidas» pide varios estados a la vez (VALIDADO,
   // RECHAZADO, ENVIANDO): se aceptan separados por coma.
-  const params = [String(estado).split(',').map((e) => e.trim().toUpperCase()).filter(Boolean)];
+  const params = [String(estado).split(',').map((e) => e.trim().toUpperCase()).filter(Boolean), tipo];
   let filtroArl = '';
   if (arlId) {
     params.push(arlId);
-    filtroArl = ` AND EXISTS (SELECT 1 FROM sst.arls a WHERE a.tercero_id = d.tercero_id AND a.id = $2)`;
+    filtroArl = ` AND EXISTS (SELECT 1 FROM sst.arls a WHERE a.tercero_id = d.tercero_id AND a.id = $3)`;
   }
   const r = await client.query(
-    `SELECT ${DOCUMENTO_SELECT} ${DOCUMENTO_FROM} WHERE d.tipo = 'FACTURA' AND d.estado::text = ANY($1)${filtroArl}
+    `SELECT ${DOCUMENTO_SELECT} ${DOCUMENTO_FROM} WHERE d.tipo = $2 AND d.estado::text = ANY($1)${filtroArl}
       ORDER BY d.creado_en DESC`,
     params,
   );
@@ -390,8 +393,9 @@ export async function listarBorradores({ estado = 'BORRADOR', arlId } = {}, clie
  * no se recalcula: quedó fijo en el momento de validarse.
  */
 export async function obtenerBorrador(id, client = pool) {
-  const doc = (await client.query(`SELECT ${DOCUMENTO_SELECT}, d.respuesta_proveedor ${DOCUMENTO_FROM} WHERE d.id = $1 AND d.tipo = 'FACTURA'`, [id])).rows[0];
-  if (!doc) throw notFound('Esa factura no existe.');
+  // A2-01 · el mismo detalle sirve para la nota crédito (mismas tablas).
+  const doc = (await client.query(`SELECT ${DOCUMENTO_SELECT}, d.respuesta_proveedor ${DOCUMENTO_FROM} WHERE d.id = $1 AND d.tipo IN ('FACTURA', 'NOTA_CREDITO')`, [id])).rows[0];
+  if (!doc) throw notFound('Ese documento no existe.');
 
   // A1-07 · la línea de tiempo del documento: propios de Orbita (CREADO,
   // ENVIANDO, VALIDADO, RECHAZADO, CORREGIDO…) y los que trae la DIAN vía
@@ -527,7 +531,7 @@ export async function actualizarBorrador(id, body, usuarioId, dbClient = null) {
 }
 
 export async function eliminarBorrador(id, dbClient = null) {
-  const r = await (dbClient ?? pool).query(`DELETE FROM sst.documentos_electronicos WHERE id = $1 AND tipo = 'FACTURA' AND estado = 'BORRADOR' RETURNING id`, [id]);
+  const r = await (dbClient ?? pool).query(`DELETE FROM sst.documentos_electronicos WHERE id = $1 AND tipo IN ('FACTURA', 'NOTA_CREDITO') AND estado = 'BORRADOR' RETURNING id`, [id]);
   if (!r.rows[0]) throw conflict('Solo se puede eliminar un documento en BORRADOR (o ya no existe).');
   return { id };
 }

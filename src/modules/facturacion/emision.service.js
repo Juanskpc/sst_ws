@@ -25,7 +25,7 @@ import { generarReferenceCode, obtenerBorrador } from './borrador.service.js';
 
 // ─── Construcción del payload (compartida por emitir y reconciliar) ────────
 
-async function cargarDocumentoParaEmitir(id, client) {
+export async function cargarDocumentoParaEmitir(id, client, tipo = 'FACTURA') {
   // Columnas explícitas (no se reutiliza `TERCERO_SELECT` de terceros.service):
   // ese SELECT trae `t.id` sin alias, y mezclado con `d.*` la columna `id` del
   // TERCERO pisaría la del DOCUMENTO en el objeto que arma `pg` (gana la
@@ -45,10 +45,10 @@ async function cargarDocumentoParaEmitir(id, client) {
        JOIN sst.terceros ter ON ter.id = d.tercero_id
        LEFT JOIN sst.tipos_documento_identidad td ON td.id = ter.tipo_documento_id
        LEFT JOIN sst.municipios m ON m.id = ter.municipio_id
-      WHERE d.id = $1 AND d.tipo = 'FACTURA'`,
-    [id],
+      WHERE d.id = $1 AND d.tipo = $2`,
+    [id, tipo],
   )).rows[0];
-  if (!doc) throw notFound('Esa factura no existe.');
+  if (!doc) throw notFound(tipo === 'FACTURA' ? 'Esa factura no existe.' : 'Esa nota crédito no existe.');
 
   const items = (await client.query(
     `SELECT it.id, it.orden_id, it.codigo, it.descripcion, it.cantidad, it.valor_unitario,
@@ -76,10 +76,15 @@ async function cargarDocumentoParaEmitir(id, client) {
     doc.medio_pago_id ? client.query(`SELECT codigo_dian FROM sst.medios_pago WHERE id = $1`, [doc.medio_pago_id]) : null,
   ]);
 
+  // A2-01 · con varios rangos activos del mismo tipo (el sandbox trae dos de
+  // nota crédito: CRTE y NC) se prefiere el prefijo «NC», que es el que JD&D usa
+  // de verdad (NC-1-87 en sus ejemplos). Si JD&D define otro, se ajusta aquí.
   const resolucion = (await client.query(
     `SELECT id, prefijo, desde, hasta, consecutivo_actual, factus_rango_id, activa,
             to_char(fecha_hasta, 'YYYY-MM-DD') AS fecha_hasta
-       FROM sst.resoluciones_numeracion WHERE tipo_documento = 'FACTURA' AND activa ORDER BY sincronizada_en DESC NULLS LAST LIMIT 1`,
+       FROM sst.resoluciones_numeracion WHERE tipo_documento = $1 AND activa
+      ORDER BY (prefijo = 'NC') DESC, sincronizada_en DESC NULLS LAST LIMIT 1`,
+    [tipo],
   )).rows[0];
 
   return {
@@ -93,7 +98,7 @@ async function cargarDocumentoParaEmitir(id, client) {
 }
 
 /** Paso 1 de la ficha: todo lo que debe cumplirse ANTES de llamar a Factus. */
-function validarParaEmitir({ doc, items, resolucion }) {
+export function validarParaEmitir({ doc, items, resolucion }) {
   if (doc.estado !== 'BORRADOR') {
     throw conflict(
       doc.estado === 'ENVIANDO' ? 'Este documento ya se está enviando: use "Consultar estado", no emitirlo de nuevo.'
@@ -108,7 +113,7 @@ function validarParaEmitir({ doc, items, resolucion }) {
     throw badRequest(`Al tercero le falta ${faltantes.join(', ')} para poder facturarle. Complete su ficha en Terceros.`);
   }
 
-  if (!resolucion) throw badRequest('No hay una resolución de numeración activa para facturas. Sincronícela en Parametrización → Resoluciones.');
+  if (!resolucion) throw badRequest(`No hay una resolución de numeración activa para ${doc.tipo === 'NOTA_CREDITO' ? 'notas crédito' : 'facturas'}. Sincronícela en Parametrización → Resoluciones.`);
   const hoy = new Date().toISOString().slice(0, 10);
   if (resolucion.fecha_hasta && resolucion.fecha_hasta < hoy) throw badRequest(`La resolución de numeración venció el ${resolucion.fecha_hasta}.`);
   if (resolucion.hasta != null && Number(resolucion.consecutivo_actual) >= Number(resolucion.hasta)) {
@@ -140,7 +145,7 @@ async function verificarOrdenesLibres(client, documentoId, items) {
   }
 }
 
-function construirReceptor(doc) {
+export function construirReceptor(doc) {
   return {
     nit: doc.numero_documento,
     dv: doc.dv ?? undefined,
@@ -269,7 +274,7 @@ async function finalizarValidado(documentoId, resultado, usuarioId) {
   });
 }
 
-async function finalizarRechazado(documentoId, mensajes, respuestaCruda, usuarioId) {
+export async function finalizarRechazado(documentoId, mensajes, respuestaCruda, usuarioId) {
   await pool.query(
     `UPDATE sst.documentos_electronicos SET estado = 'RECHAZADO', errores = $2, respuesta_proveedor = $3, actualizado_por = $4 WHERE id = $1`,
     [documentoId, JSON.stringify(mensajes), JSON.stringify(respuestaCruda ?? {}), usuarioId],
@@ -280,7 +285,7 @@ async function finalizarRechazado(documentoId, mensajes, respuestaCruda, usuario
   );
 }
 
-async function registrarSinDecision(documentoId, codigo, descripcion, usuarioId) {
+export async function registrarSinDecision(documentoId, codigo, descripcion, usuarioId) {
   await pool.query(
     `INSERT INTO sst.documento_eventos (documento_id, codigo, descripcion, usuario_id) VALUES ($1, $2, $3, $4)`,
     [documentoId, codigo, descripcion, usuarioId],
@@ -390,10 +395,11 @@ export async function reconciliarDocumento(documentoId, usuarioId) {
 export async function corregirDocumento(documentoId, usuarioId) {
   return withTransaction(async (client) => {
     const doc = (await client.query(
-      `SELECT id, estado, reference_code FROM sst.documentos_electronicos WHERE id = $1 AND tipo = 'FACTURA' FOR UPDATE`,
+      `SELECT id, estado, reference_code FROM sst.documentos_electronicos
+        WHERE id = $1 AND tipo IN ('FACTURA', 'NOTA_CREDITO') FOR UPDATE`,
       [documentoId],
     )).rows[0];
-    if (!doc) throw notFound('Esa factura no existe.');
+    if (!doc) throw notFound('Ese documento no existe.');
     if (doc.estado !== 'RECHAZADO') throw conflict(`Solo se corrige un documento RECHAZADO (este está ${doc.estado.toLowerCase()}).`);
 
     const nuevoReferenceCode = generarReferenceCode();

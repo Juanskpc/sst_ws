@@ -264,6 +264,85 @@ export class FactusAdaptador extends PuertoFacturacionElectronica {
     return { base64 };
   }
 
+  // ─── A2-01 · Nota crédito ─────────────────────────────────────────────────
+  // Endpoints de la documentación oficial (developers.factus.com.co/notas-credito,
+  // leída el 29-sep-2026): POST /v2/credit-notes/validate, GET /v2/credit-notes/:number,
+  // GET /v2/credit-notes/:number/download-pdf|download-xml. Mismo cuerpo que la
+  // factura más `correction_concept_code` (tabla 1..6 de la DIAN), `customization_id`
+  // "20" (nota que referencia una factura) y `bill_number` (la factura corregida,
+  // con su prefijo). La forma de la RESPUESTA no está en la doc: se lee tolerante
+  // (`credit_note` o el objeto raíz) y se guarda cruda, como con la factura.
+
+  /** @param {object} datos los de `emitirFactura` + `conceptoCorreccion` y `numeroFactura`. */
+  async emitirNotaCredito(datos) {
+    const nota = {
+      reference_code: datos.referenceCode,
+      correction_concept_code: String(datos.conceptoCorreccion),
+      customization_id: '20',
+      bill_number: datos.numeroFactura,
+      numbering_range_id: datos.numberingRangeId || undefined,
+      observation: datos.observacion ? String(datos.observacion).slice(0, 500) : undefined,
+      send_email: datos.enviarCorreo === true,
+      payment_details: [{
+        payment_form: datos.formaPagoCodigo || '1',
+        payment_method_code: datos.medioPagoCodigo || 'ZZZ',
+        amount: datos.montoAPagar,
+        ...(String(datos.formaPagoCodigo) === '2' ? { due_date: datos.fechaVencimiento || new Date().toISOString().slice(0, 10) } : {}),
+      }],
+      customer: mapearCustomer(datos.receptor),
+      items: datos.items.map((it) => mapearItem(it, datos.descuentoComercialPct, datos.retenciones)),
+    };
+    const r = await request('POST', '/v2/credit-notes/validate', nota);
+    const nc = r.data?.credit_note || r.data || {};
+    const { rechazos, avisos } = clasificarErrores(nc.errors);
+    return {
+      referenceCode: datos.referenceCode,
+      numeroDocumento: nc.number || null,
+      validado: Boolean(nc.is_validated),
+      cufe: nc.cude || nc.cufe || null,
+      urlPublica: nc.links?.public_url || null,
+      totales: {
+        totalBruto: nc.totals?.gross_amount ?? null,
+        subtotal: nc.totals?.taxable_amount ?? null,
+        totalIva: nc.totals?.tax_amount ?? null,
+        total: nc.totals?.total ?? null,
+      },
+      eventos: { rechazos, avisos },
+      respuestaCruda: r,
+    };
+  }
+
+  /** GET /v2/credit-notes/:number · reconciliación de una nota que quedó ENVIANDO. */
+  async consultarNotaCredito(numeroDocumento) {
+    if (!numeroDocumento) {
+      return { estado: 'SIN_NUMERO', detalle: 'Sin número de Factus todavía: reintente con el mismo reference_code.' };
+    }
+    const r = await request('GET', `/v2/credit-notes/${encodeURIComponent(numeroDocumento)}`);
+    const nc = r.data?.credit_note || r.data || {};
+    const { rechazos } = clasificarErrores(nc.errors);
+    return {
+      estado: rechazos.length ? 'RECHAZADO' : nc.is_validated ? 'VALIDADO' : 'ENVIANDO',
+      detalle: rechazos.map(([, v]) => v).join('; ') || undefined,
+      cufe: nc.cude || nc.cufe || null,
+      urlPublica: nc.links?.public_url || null,
+      respuestaCruda: r,
+    };
+  }
+
+  async descargarPdfNotaCredito(numeroDocumento) {
+    const r = await request('GET', `/v2/credit-notes/${encodeURIComponent(numeroDocumento)}/download-pdf`);
+    const base64 = r.data?.pdf_base_64_encoded;
+    if (!base64) throw new Error(`Factus no devolvió el PDF de ${numeroDocumento}`);
+    return { base64 };
+  }
+
+  async descargarXmlNotaCredito(numeroDocumento) {
+    const r = await request('GET', `/v2/credit-notes/${encodeURIComponent(numeroDocumento)}/download-xml`);
+    const base64 = r.data?.xml_base_64_encoded;
+    if (!base64) throw new Error(`Factus no devolvió el XML de ${numeroDocumento}`);
+    return { base64 };
+  }
+
   async emitirDocumentoSoporte() {
     throw new Error('Factus: emisión de documento soporte pendiente de su propia ficha (A4-01)');
   }

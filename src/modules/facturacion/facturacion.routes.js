@@ -9,6 +9,8 @@ import { corregirDocumento, emitirDocumento, numeroCompleto, reconciliarDocument
 import { reenviarAlCliente } from './envio.service.js';
 import { storage } from '../../services/storage.service.js';
 import { actualizarEventosEnLote, consultarEventosDocumento, marcarAceptacionTacita } from './eventos.service.js';
+import { CAUSALES_NOTA_CREDITO, crearNotaCredito, emitirNotaCredito, reconciliarNotaCredito } from './notas.service.js';
+import { pool } from '../../config/db.js';
 
 const router = Router();
 router.use(authRequired);
@@ -166,24 +168,63 @@ router.delete('/borradores/:id', OPERAR, asyncHandler(async (req, res) => {
  * todavía o no se pudo contactar: el documento queda ENVIANDO y hay que
  * reintentar con "Consultar estado" más tarde, nunca volviendo a emitir.
  */
+/** A2-01 · factura o nota crédito: los mismos botones sirven para los dos tipos. */
+async function tipoDeDocumento(id) {
+  const r = await pool.query(`SELECT tipo FROM sst.documentos_electronicos WHERE id = $1`, [id]);
+  return r.rows[0]?.tipo ?? 'FACTURA';
+}
+
 router.post('/documentos/:id/emitir', OPERAR, asyncHandler(async (req, res) => {
-  const resultado = await emitirDocumento(uuidOpcional(req.params.id, 'id'), req.user.sub);
+  const id = uuidOpcional(req.params.id, 'id');
+  const esNota = (await tipoDeDocumento(id)) === 'NOTA_CREDITO';
+  const resultado = esNota ? await emitirNotaCredito(id, req.user.sub) : await emitirDocumento(id, req.user.sub);
   if (resultado?.pendiente) {
     return res.status(202).json({ message: resultado.aviso || 'Factus no ha decidido todavía; consulte el estado en unos minutos.', data: resultado });
   }
   const mensaje = resultado.estado === 'RECHAZADO'
     ? 'La DIAN rechazó el documento. Corrija el borrador y vuelva a emitir.'
-    : `Factura validada: ${numeroCompleto(resultado.prefijo, resultado.numero) ?? ''} (CUFE ${resultado.cufe ?? '—'}).`;
+    : `${esNota ? 'Nota crédito validada' : 'Factura validada'}: ${numeroCompleto(resultado.prefijo, resultado.numero) ?? ''} (${esNota ? 'CUDE' : 'CUFE'} ${resultado.cufe ?? '—'}).`;
   res.json({ message: mensaje, data: resultado });
 }));
 
 // Reconcilia un documento que quedó ENVIANDO (timeout, corte de red, o Factus tardó en decidir).
 router.post('/documentos/:id/consultar-estado', OPERAR, asyncHandler(async (req, res) => {
-  const resultado = await reconciliarDocumento(uuidOpcional(req.params.id, 'id'), req.user.sub);
+  const id = uuidOpcional(req.params.id, 'id');
+  const resultado = (await tipoDeDocumento(id)) === 'NOTA_CREDITO'
+    ? await reconciliarNotaCredito(id, req.user.sub)
+    : await reconciliarDocumento(id, req.user.sub);
   if (resultado?.pendiente) {
     return res.status(202).json({ message: 'Sigue en proceso; inténtelo de nuevo en unos minutos.', data: resultado });
   }
   res.json({ message: resultado.estado === 'RECHAZADO' ? 'La DIAN rechazó el documento.' : 'Factura validada.', data: resultado });
+}));
+
+// ─── A2-01 · Nota crédito ────────────────────────────────────────────────────
+
+// Causales DIAN (para el selector de la pantalla).
+router.get('/notas/causales', LEER, (_req, res) => {
+  res.json({ data: Object.entries(CAUSALES_NOTA_CREDITO).map(([codigo, nombre]) => ({ codigo, nombre })) });
+});
+
+// Notas crédito por estado (varios separados por coma).
+router.get('/notas', LEER, asyncHandler(async (req, res) => {
+  const estado = req.query.estado ? String(req.query.estado) : 'BORRADOR,ENVIANDO,VALIDADO,RECHAZADO';
+  res.json({ data: await listarBorradores({ estado, tipo: 'NOTA_CREDITO' }) });
+}));
+
+/**
+ * Crea la nota crédito (en BORRADOR) sobre una factura VALIDADA. Cuerpo:
+ * { causal: '1'..'6', lineas?: [{ item_id, cantidad }], observaciones? }.
+ * Sin `lineas`, o con causal 2 (anulación), acredita la factura completa.
+ */
+router.post('/documentos/:id/nota-credito', OPERAR, asyncHandler(async (req, res) => {
+  const b = req.body || {};
+  if (b.lineas != null && !Array.isArray(b.lineas)) throw badRequest('"lineas" debe ser una lista.');
+  const lineas = (b.lineas ?? []).map((l) => ({ item_id: uuidOpcional(l?.item_id, 'item_id'), cantidad: Number(l?.cantidad) }));
+  const data = await crearNotaCredito(uuidOpcional(req.params.id, 'id'), {
+    causal: b.causal, lineas, observaciones: b.observaciones ?? null,
+  }, req.user.sub);
+  res.status(201).json({ message: 'Nota crédito creada en borrador.', data });
 }));
 
 // ─── A1-08 · Descarga del PDF y del XML ─────────────────────────────────────
