@@ -66,6 +66,9 @@ export const env = {
     user: process.env.SMTP_USER,
     pass: process.env.SMTP_PASS,
     from: process.env.EMAIL_FROM || 'JD&D Consultores <no-reply@jdd.com>',
+    // SOLO DESARROLLO: si tiene valor, TODO correo sale únicamente a esta
+    // dirección (ver `sendEmail`). En producción va vacía.
+    redirectTo: (process.env.EMAIL_REDIRECT_TO || '').trim(),
   },
 
   // Proveedor de facturación electrónica (Factus). Todo opcional: sin estas variables
