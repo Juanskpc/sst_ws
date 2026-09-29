@@ -21,6 +21,10 @@ import { aCentavos, deCentavos } from '../../utils/dinero.js';
  *    `valor_a_facturar` de la prefactura (manda sobre la tarifa).
  *  · AXA, Colmena, La Equidad y privados → la persona ELIGE las órdenes; solo se
  *    exige que sean del mismo pagador.
+ *
+ * A3-01 · Un pagador es una ARL (`arl_id`) o un cliente particular
+ * (`pagador_tercero_id`, órdenes creadas a mano). Las particulares no tienen
+ * estado ARL que esperar: se tratan como aprobadas.
  */
 
 /** Bolívar se identifica por nombre en todo el repo (no hay un indicador propio). */
@@ -42,7 +46,8 @@ const MOTIVOS = {
  * (`tipo_orden_id NULL`), y entre dos de la misma clase gana la más reciente.
  */
 const SQL_CANDIDATAS = `
-  SELECT o.id, o.codigo, o.arl_id, a.nombre AS arl_nombre, a.tercero_id,
+  SELECT o.id, o.codigo, o.arl_id, a.nombre AS arl_nombre,
+         o.pagador_tercero_id, COALESCE(a.tercero_id, o.pagador_tercero_id) AS tercero_id,
          o.numero_orden, o.codigo_cronograma, o.secuencia, o.empresa_nombre,
          o.tipo_actividad, o.tema_actividad, o.horas_asignadas, o.valor_unitario, o.valor_total,
          COALESCE((o.viaticos_detalle->>'transporte')::numeric, 0) AS transporte,
@@ -51,7 +56,7 @@ const SQL_CANDIDATAS = `
          doc.documento_id, doc.documento_estado,
          tv.valor AS tarifa_valor, tv.unidad AS tarifa_unidad
     FROM sst.ordenes_servicio o
-    JOIN sst.arls a ON a.id = o.arl_id
+    LEFT JOIN sst.arls a ON a.id = o.arl_id
     LEFT JOIN LATERAL (
       SELECT d.id AS documento_id, d.estado AS documento_estado
         FROM sst.documento_ordenes dor
@@ -64,7 +69,7 @@ const SQL_CANDIDATAS = `
     LEFT JOIN LATERAL (
       SELECT t.valor, t.unidad
         FROM sst.tarifas_venta t
-       WHERE t.pagador_tercero_id = a.tercero_id AND t.activo
+       WHERE t.pagador_tercero_id = COALESCE(a.tercero_id, o.pagador_tercero_id) AND t.activo
          AND t.vigente_desde <= CURRENT_DATE
          AND (t.tipo_orden_id = o.tipo_orden_id OR t.tipo_orden_id IS NULL)
        -- Un pagador puede tener tarifa por HORA y por UNIDAD a la vez: una orden con
@@ -78,12 +83,14 @@ const SQL_CANDIDATAS = `
      AND o.estado_cobro = 'NO FACTURADA'
      AND doc.documento_estado IS DISTINCT FROM 'VALIDADO'
      AND ($1::uuid IS NULL OR o.arl_id = $1)
+     AND ($2::uuid IS NULL OR o.pagador_tercero_id = $2)
    ORDER BY o.codigo_cronograma NULLS LAST, o.secuencia NULLS LAST, o.codigo`;
 
 /** Motivo por el que una candidata no se puede facturar aún, o `null` si sí. */
 function motivoBloqueo(o) {
   if (!o.tercero_id) return MOTIVOS.SIN_TERCERO;
-  if (o.estado_arl !== 'APROBADO') return MOTIVOS.NO_APROBADA;
+  // Una orden particular no pasa por la aprobación de ninguna ARL (A3-01).
+  if (o.arl_id && o.estado_arl !== 'APROBADO') return MOTIVOS.NO_APROBADA;
   if (o.documento_estado === 'ENVIANDO') return MOTIVOS.ENVIANDO;
   if (o.documento_id) return MOTIVOS.EN_BORRADOR;
   return null;
@@ -201,13 +208,15 @@ function grupoDePrefactura(pf, filas, ordenesPorId) {
 }
 
 /**
- * La relación completa, por pagador. `arlId` la acota a un solo pagador; `db`
- * permite correrla dentro de una transacción (los scripts de verificación).
+ * La relación completa, por pagador. `arlId` o `pagadorTerceroId` (cliente
+ * particular, A3-01) la acotan a un solo pagador; `db` permite correrla dentro
+ * de una transacción (los scripts de verificación).
  * @returns {Promise<{pagadores: object[]}>}
  */
-export async function relacionPorFacturar({ arlId = null } = {}, db = pool) {
-  const candidatas = (await db.query(SQL_CANDIDATAS, [arlId])).rows;
-  const arls = (await db.query(
+export async function relacionPorFacturar({ arlId = null, pagadorTerceroId = null } = {}, db = pool) {
+  const candidatas = (await db.query(SQL_CANDIDATAS, [arlId, pagadorTerceroId])).rows;
+  // Acotada a un particular, ninguna ARL entra en la respuesta.
+  const arls = pagadorTerceroId ? [] : (await db.query(
     `SELECT a.id, a.nombre, a.tercero_id,
             COALESCE(t.razon_social, btrim(concat_ws(' ', t.nombres, t.apellidos))) AS tercero_nombre
        FROM sst.arls a LEFT JOIN sst.terceros t ON t.id = a.tercero_id
@@ -240,6 +249,7 @@ export async function relacionPorFacturar({ arlId = null } = {}, db = pool) {
   for (const arl of arls) {
     const propias = candidatas.filter((o) => o.arl_id === arl.id);
     const base = {
+      clave: `arl:${arl.id}`, particular: false, pagador_tercero_id: null,
       arl_id: arl.id, arl_nombre: arl.nombre, tercero_id: arl.tercero_id, tercero_nombre: arl.tercero_nombre,
     };
 
@@ -272,6 +282,30 @@ export async function relacionPorFacturar({ arlId = null } = {}, db = pool) {
     }
     pagadores.push({ ...base, modo: 'PREFACTURA', grupos });
   }
+
+  // A3-01 · Clientes particulares: un pagador por tercero, y solo los que
+  // tienen algo por facturar (a diferencia de las ARL, que se listan siempre:
+  // son pocas y fijas; los particulares pueden ser muchos).
+  const particulares = arlId ? [] : [...new Set(
+    candidatas.filter((o) => !o.arl_id).map((o) => o.pagador_tercero_id),
+  )];
+  if (particulares.length) {
+    const nombres = new Map((await db.query(
+      `SELECT id, COALESCE(razon_social, btrim(concat_ws(' ', nombres, apellidos))) AS nombre
+         FROM sst.terceros WHERE id = ANY($1::uuid[])`,
+      [particulares],
+    )).rows.map((t) => [t.id, t.nombre]));
+    const porNombre = particulares.sort((a, b) => (nombres.get(a) ?? '').localeCompare(nombres.get(b) ?? '', 'es'));
+    for (const terceroId of porNombre) {
+      const lineas = candidatas.filter((o) => o.pagador_tercero_id === terceroId).map((o) => lineaDeOrden(o));
+      pagadores.push({
+        clave: `tercero:${terceroId}`, particular: true, pagador_tercero_id: terceroId,
+        arl_id: null, arl_nombre: null, tercero_id: terceroId, tercero_nombre: nombres.get(terceroId) ?? null,
+        modo: 'SELECCION',
+        grupos: [{ clave: `ordenes:tercero:${terceroId}`, tipo: 'ORDENES', lineas, n_facturables: lineas.filter((l) => l.facturable).length }],
+      });
+    }
+  }
   return { pagadores };
 }
 
@@ -279,15 +313,18 @@ export async function relacionPorFacturar({ arlId = null } = {}, db = pool) {
  * Valida una selección para crear la factura (lo usará A1-04): todas las líneas
  * elegidas deben existir, ser del mismo pagador y estar libres. No escribe nada.
  *
- * @param {{arlId: string, ordenIds?: string[], prefacturaId?: string, filaIds?: string[]}} sel
+ * @param {{arlId?: string, pagadorTerceroId?: string, ordenIds?: string[], prefacturaId?: string, filaIds?: string[]}} sel
  *   AXA/Colmena/privados: `ordenIds`. Bolívar: `prefacturaId` (+ `filaIds`
  *   opcional; sin él se toman las filas marcadas por defecto).
  */
-export async function resolverSeleccion({ arlId, ordenIds = [], prefacturaId = null, filaIds = null }, db = pool) {
-  if (!arlId) throw badRequest('Indique el pagador (arl_id).');
-  const { pagadores } = await relacionPorFacturar({ arlId }, db);
+export async function resolverSeleccion({ arlId, pagadorTerceroId = null, ordenIds = [], prefacturaId = null, filaIds = null }, db = pool) {
+  if (!arlId && !pagadorTerceroId) throw badRequest('Indique el pagador (arl_id, o pagador_tercero_id si es un cliente particular).');
+  if (arlId && pagadorTerceroId) throw badRequest('Indique un solo pagador: la ARL o el cliente particular.');
+  const { pagadores } = await relacionPorFacturar({ arlId, pagadorTerceroId }, db);
   const pagador = pagadores[0];
-  if (!pagador) throw badRequest('Ese pagador no existe.');
+  if (!pagador) {
+    throw badRequest(pagadorTerceroId ? 'Ese cliente no tiene órdenes por facturar.' : 'Ese pagador no existe.');
+  }
 
   let lineas;
   let prefactura = null;
@@ -325,6 +362,7 @@ export async function resolverSeleccion({ arlId, ordenIds = [], prefacturaId = n
   return {
     pagador: {
       arl_id: pagador.arl_id, arl_nombre: pagador.arl_nombre,
+      pagador_tercero_id: pagador.pagador_tercero_id, particular: pagador.particular,
       tercero_id: pagador.tercero_id, tercero_nombre: pagador.tercero_nombre,
     },
     prefactura,

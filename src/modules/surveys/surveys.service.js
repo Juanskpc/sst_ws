@@ -134,7 +134,7 @@ export async function enviarEncuesta(ordenId, { reenviar = false } = {}) {
             filaDato('Empresa', o.empresa_nombre),
             filaDato('Actividad', o.actividad_economica),
             filaDato('Profesional a cargo', o.profesional_nombre),
-            filaDato('ARL', o.arl_nombre),
+            filaDato(o.arl_id ? 'ARL' : 'Cliente', o.pagador_nombre ?? o.arl_nombre),
           ]),
           parrafo('Se califica tanto al profesional que asistió como al servicio de JD&D Consultores.'),
           boton('Responder la encuesta', url),

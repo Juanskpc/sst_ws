@@ -131,7 +131,7 @@ export function construirInvitaciones({
   const lugar = [orden.direccion, orden.ciudad_ejecucion].filter(Boolean).join(', ');
   const descripcion = [
     `Orden de servicio: ${orden.codigo}`,
-    `ARL: ${orden.arl_nombre || '—'}`,
+    (orden.arl_id ? `ARL: ${orden.arl_nombre || '—'}` : `Cliente: ${orden.pagador_nombre || '—'}`),
     `Empresa: ${orden.empresa_nombre || '—'}`,
     `Horas: ${horasTexto(orden.horas_asignadas)}`,
     orden.contacto_sst_nombre ? `Contacto SST: ${orden.contacto_sst_nombre} ${orden.contacto_sst_telefono || ''}`.trim() : null,

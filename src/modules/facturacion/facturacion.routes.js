@@ -32,9 +32,15 @@ const uuidOpcional = (v, nombre) => {
   return String(v);
 };
 
-// Lo que se puede facturar hoy, por pagador. ?arl_id= lo acota a uno.
+// Lo que se puede facturar hoy, por pagador. ?arl_id= (o ?pagador_tercero_id=,
+// un cliente particular de A3-01) lo acota a uno.
 router.get('/por-facturar', LEER, asyncHandler(async (req, res) => {
-  res.json({ data: await relacionPorFacturar({ arlId: uuidOpcional(req.query.arl_id, 'arl_id') }) });
+  res.json({
+    data: await relacionPorFacturar({
+      arlId: uuidOpcional(req.query.arl_id, 'arl_id'),
+      pagadorTerceroId: uuidOpcional(req.query.pagador_tercero_id, 'pagador_tercero_id'),
+    }),
+  });
 }));
 
 // Comprueba una selección antes de crear la factura: mismo pagador, todo libre.
@@ -45,6 +51,7 @@ router.post('/seleccion/validar', OPERAR, asyncHandler(async (req, res) => {
   if (b.fila_ids != null && !Array.isArray(b.fila_ids)) throw badRequest('"fila_ids" debe ser una lista.');
   const r = await resolverSeleccion({
     arlId: uuidOpcional(b.arl_id, 'arl_id'),
+    pagadorTerceroId: uuidOpcional(b.pagador_tercero_id, 'pagador_tercero_id'),
     ordenIds: (b.orden_ids ?? []).map((id) => uuidOpcional(id, 'orden_ids')),
     prefacturaId: uuidOpcional(b.prefactura_id, 'prefactura_id'),
     filaIds: b.fila_ids ? b.fila_ids.map((id) => uuidOpcional(id, 'fila_ids')) : null,
@@ -60,13 +67,14 @@ router.post('/seleccion/validar', OPERAR, asyncHandler(async (req, res) => {
  */
 router.get('/relacion.xlsx', LEER, asyncHandler(async (req, res) => {
   const arlId = uuidOpcional(req.query.arl_id, 'arl_id');
-  if (!arlId) throw badRequest('Indique el pagador (arl_id).');
+  const pagadorTerceroId = uuidOpcional(req.query.pagador_tercero_id, 'pagador_tercero_id');
+  if (!arlId && !pagadorTerceroId) throw badRequest('Indique el pagador (arl_id, o pagador_tercero_id si es un cliente particular).');
   const prefacturaId = uuidOpcional(req.query.prefactura_id, 'prefactura_id');
   const ids = req.query.orden_ids ? String(req.query.orden_ids).split(',').map((s) => uuidOpcional(s.trim(), 'orden_ids')) : null;
 
-  const { pagadores } = await relacionPorFacturar({ arlId });
+  const { pagadores } = await relacionPorFacturar({ arlId, pagadorTerceroId: arlId ? null : pagadorTerceroId });
   const pagador = pagadores[0];
-  if (!pagador) throw badRequest('Ese pagador no existe.');
+  if (!pagador) throw badRequest('Ese pagador no existe o no tiene nada por facturar.');
   const bolivar = esBolivar(pagador.arl_nombre);
   if (bolivar && !prefacturaId) throw badRequest('Bolívar se factura por prefactura: indique cuál (prefactura_id).');
 
@@ -79,7 +87,10 @@ router.get('/relacion.xlsx', LEER, asyncHandler(async (req, res) => {
   const wb = new ExcelJS.Workbook();
   wb.creator = 'JD&D IA-Core';
   wb.created = new Date();
-  const ws = wb.addWorksheet(`Relación ${pagador.arl_nombre}`.slice(0, 31));
+  // Un cliente particular (A3-01) no tiene ARL: la hoja lleva su nombre, sin los
+  // caracteres que Excel no admite en el nombre de una hoja.
+  const nombreHoja = `Relación ${pagador.arl_nombre ?? pagador.tercero_nombre ?? ''}`.replace(/[\\/?*[\]:]/g, ' ');
+  const ws = wb.addWorksheet(nombreHoja.slice(0, 31));
 
   ws.addRow([
     'Tipo de actividad', 'Cantidad de horas', 'Valor unitario por hora', 'Valor transporte', 'Total',
@@ -126,7 +137,13 @@ router.get('/relacion.xlsx', LEER, asyncHandler(async (req, res) => {
 // Listado de borradores (o, con ?estado=, de cualquier otro estado de la factura).
 router.get('/borradores', LEER, asyncHandler(async (req, res) => {
   const estado = req.query.estado ? String(req.query.estado).toUpperCase() : 'BORRADOR';
-  res.json({ data: await listarBorradores({ estado, arlId: uuidOpcional(req.query.arl_id, 'arl_id') }) });
+  res.json({
+    data: await listarBorradores({
+      estado,
+      arlId: uuidOpcional(req.query.arl_id, 'arl_id'),
+      pagadorTerceroId: uuidOpcional(req.query.pagador_tercero_id, 'pagador_tercero_id'),
+    }),
+  });
 }));
 
 // Crea el borrador desde una selección de A1-03 (misma forma que /seleccion/validar).
@@ -136,6 +153,7 @@ router.post('/borradores', OPERAR, asyncHandler(async (req, res) => {
   if (b.fila_ids != null && !Array.isArray(b.fila_ids)) throw badRequest('"fila_ids" debe ser una lista.');
   const data = await crearBorrador({
     arlId: uuidOpcional(b.arl_id, 'arl_id'),
+    pagadorTerceroId: uuidOpcional(b.pagador_tercero_id, 'pagador_tercero_id'),
     ordenIds: (b.orden_ids ?? []).map((id) => uuidOpcional(id, 'orden_ids')),
     prefacturaId: uuidOpcional(b.prefactura_id, 'prefactura_id'),
     filaIds: b.fila_ids ? b.fila_ids.map((id) => uuidOpcional(id, 'fila_ids')) : null,

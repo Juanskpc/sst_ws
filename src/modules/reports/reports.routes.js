@@ -209,7 +209,8 @@ router.get('/cobro', asyncHandler(async (req, res) => {
          FROM sst.vw_ordenes_expandidas ${whereSinEstado}
         GROUP BY 1`, paramsSinEstado),
     pool.query(
-      `SELECT arl_nombre, count(*)::int AS ordenes,
+      // A3-01 · Las órdenes particulares no tienen ARL: van juntas en su fila.
+      `SELECT COALESCE(arl_nombre, 'PARTICULAR') AS arl_nombre, count(*)::int AS ordenes,
               coalesce(sum(valor_total), 0)::numeric AS valor,
               -- Lo que falta por facturarle a cada ARL: es la cifra que la
               -- contadora persigue, y es por ARL porque se radica ARL por ARL.
@@ -217,7 +218,7 @@ router.get('/cobro', asyncHandler(async (req, res) => {
          FROM sst.vw_ordenes_expandidas ${where}
         GROUP BY 1 ORDER BY sin_facturar DESC`, params),
     pool.query(
-      `SELECT id, codigo, arl_nombre, empresa_nombre, nit_nic, tipo_actividad,
+      `SELECT id, codigo, COALESCE(arl_nombre, 'PARTICULAR') AS arl_nombre, empresa_nombre, nit_nic, tipo_actividad,
               horas_asignadas, valor_total, viaticos_valor, viaticos_tipo,
               estado_cobro::text AS estado_cobro, cobro_numero_factura, cobro_observacion,
               cobro_actualizado_en, fecha_ejecucion, profesional_nombre

@@ -87,9 +87,15 @@ const DRAFT_SELECT = `
          pfo.nombre AS os_profesional_formatos_nombre,
          -- Eje de facturación (ago-2026): columna, pastilla y filtro de Órdenes.
          o.estado_cobro::text AS os_estado_cobro,
-         o.cobro_numero_factura AS os_cobro_numero_factura
+         o.cobro_numero_factura AS os_cobro_numero_factura,
+         -- A3-01 · Orden de un cliente particular (sin ARL): quién la paga. La
+         -- vista lo enseña donde las demás llevan la ARL, y oculta lo que solo
+         -- tiene sentido con una (estado ARL, prefactura, formatos).
+         d.pagador_tercero_id,
+         COALESCE(tpag.razon_social, NULLIF(btrim(concat_ws(' ', tpag.nombres, tpag.apellidos)), '')) AS pagador_nombre
   FROM sst.borradores_extraccion d
   LEFT JOIN sst.arls a ON a.id = d.arl_id
+  LEFT JOIN sst.terceros tpag ON tpag.id = d.pagador_tercero_id
   LEFT JOIN sst.lotes_importacion b ON b.id = d.lote_importacion_id
   LEFT JOIN sst.profesionales p ON p.id = d.profesional_asignado_id
   LEFT JOIN sst.ordenes_servicio o ON o.id = d.orden_servicio_id
@@ -301,6 +307,130 @@ router.put('/:id', requireRole('admin'), asyncHandler(async (req, res) => {
   res.json({ data: await loadDraftExpanded(req.params.id) });
 }));
 
+/** Texto limpio o null: el formulario manda '' en las casillas vacías. */
+const textoOpcional = (v) => {
+  const s = String(v ?? '').trim();
+  return s || null;
+};
+
+// A3-01 · Alta manual de una orden de un cliente PARTICULAR (sin ARL).
+//
+// No hay documento que extraer: quien la crea escribe los datos en un modal de
+// Órdenes. Aun así pasa por un lote y un borrador, porque la vista Órdenes lista
+// borradores (DRAFT_SELECT) y la OS se materializa con el mismo
+// `materializarOrden` que las importadas: así nace en SIN PROGRAMAR con su
+// código, su historial y su empresa enlazada exactamente igual, y sigue el ciclo
+// normal (asignación, soportes, verificación, cuenta de cobro).
+//
+// El pagador es un tercero de Parametrización → Terceros marcado como cliente y
+// que NO es ARL: una orden de ARL se importa de su documento, nunca se escribe.
+router.post('/manual', requireRole('admin'), asyncHandler(async (req, res) => {
+  const { os, draftId } = await withTransaction((client) => crearOrdenManual(req.body || {}, req.user.sub, client));
+  res.status(201).json({
+    message: `${os.codigo} entró a Órdenes como SIN PROGRAMAR.`,
+    data: await loadDraftExpanded(draftId),
+  });
+}));
+
+/**
+ * Crea el lote, el borrador y la OS de una orden particular dentro de la
+ * transacción `client`. Exportada para el script de verificación, que la corre
+ * dentro de una transacción con ROLLBACK.
+ * @returns {Promise<{os: object, draftId: string}>}
+ */
+export async function crearOrdenManual(b, userId, client) {
+  const pagadorId = textoOpcional(b.pagador_tercero_id);
+  const tipoOrdenId = textoOpcional(b.tipo_orden_id);
+  const tipoViaticoId = textoOpcional(b.tipo_viatico_id);
+  const descripcion = textoOpcional(b.descripcion);
+  const horas = Number(b.horas_asignadas);
+  const fechaVencimiento = parseFechaCO(b.fecha_vencimiento);
+  const valorTotal = b.valor_total == null || b.valor_total === '' ? null : Number(b.valor_total);
+  const correo = textoOpcional(b.contacto_sst_correo)?.toLowerCase() ?? null;
+
+  if (!pagadorId) throw badRequest('Elija el cliente que paga la orden.');
+  if (!tipoOrdenId) throw badRequest('Elija el tipo de orden: de él sale el valor hora con el que se le paga al profesional.');
+  if (!descripcion) throw badRequest('Describa la actividad a realizar.');
+  if (!Number.isFinite(horas) || horas <= 0) throw badRequest('Las horas deben ser un número mayor que cero.');
+  // Igual que al guardar una importada: sin vencimiento la orden queda sin fecha
+  // de control y nunca aparece en Vencidas.
+  if (!fechaVencimiento) throw badRequest('Indique la fecha de vencimiento de la orden.');
+  if (valorTotal != null && (!Number.isFinite(valorTotal) || valorTotal < 0)) {
+    throw badRequest('El valor debe ser un número positivo (o dejarse vacío para usar la tarifa de venta del cliente).');
+  }
+  if (correo && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(correo)) {
+    throw badRequest('El correo del contacto no es válido.');
+  }
+
+  const pagador = (await client.query(
+    `SELECT t.id, t.es_cliente, t.es_arl, t.activo, t.numero_documento, t.dv, t.direccion, t.telefono,
+            COALESCE(t.razon_social, btrim(concat_ws(' ', t.nombres, t.apellidos))) AS nombre,
+            m.nombre AS municipio
+       FROM sst.terceros t LEFT JOIN sst.municipios m ON m.id = t.municipio_id
+      WHERE t.id = $1`,
+    [pagadorId]
+  )).rows[0];
+  if (!pagador) throw badRequest('Ese cliente no existe.');
+  if (!pagador.activo) throw badRequest(`${pagador.nombre} está inactivo en Terceros.`);
+  if (pagador.es_arl) {
+    throw badRequest('Las órdenes de una ARL se importan desde su documento; el alta manual es para clientes particulares.');
+  }
+  if (!pagador.es_cliente) {
+    throw badRequest(`${pagador.nombre} no está marcado como cliente en Terceros.`);
+  }
+  const tipo = await client.query(`SELECT id FROM sst.tipos_orden WHERE id=$1`, [tipoOrdenId]);
+  if (!tipo.rows[0]) throw badRequest('Ese tipo de orden no existe.');
+  if (tipoViaticoId) {
+    const tv = await client.query(`SELECT id FROM sst.tipos_viatico WHERE id=$1 AND activo`, [tipoViaticoId]);
+    if (!tv.rows[0]) throw badRequest('El tipo de viático no existe o fue retirado del catálogo.');
+  }
+
+  // La empresa donde se ejecuta es, por defecto, el mismo cliente que paga.
+  // Puede ser otra (un cliente que contrata para una filial o un contratista).
+  const empresaNombre = textoOpcional(b.empresa_nombre) ?? pagador.nombre;
+  const nit = textoOpcional(b.nit_nic)
+    ?? (textoOpcional(b.empresa_nombre) ? null : [pagador.numero_documento, pagador.dv].filter((x) => x != null).join('-'));
+
+  // Mismo formato que la extracción (`{ value, confidence }`): lo lee
+  // `materializarOrden` y el detalle de la orden. Confianza 100 porque lo
+  // escribió una persona, no la IA.
+  const campos = {
+    empresa_nombre: empresaNombre,
+    nit_nic: nit,
+    tipo_actividad: textoOpcional(b.tipo_actividad),
+    modalidad: textoOpcional(b.modalidad),
+    horas_asignadas: String(horas),
+    valor_total: valorTotal != null ? String(valorTotal) : null,
+    fecha_orden: new Date().toISOString().slice(0, 10),
+    fecha_vencimiento: fechaVencimiento,
+    ciudad_ejecucion: textoOpcional(b.ciudad_ejecucion) ?? (textoOpcional(b.empresa_nombre) ? null : pagador.municipio),
+    direccion: textoOpcional(b.direccion) ?? (textoOpcional(b.empresa_nombre) ? null : pagador.direccion),
+    contacto_sst_nombre: textoOpcional(b.contacto_sst_nombre),
+    contacto_sst_telefono: textoOpcional(b.contacto_sst_telefono),
+    contacto_sst_correo: correo,
+    descripcion,
+  };
+  const metadatos = Object.fromEntries(
+    Object.entries(campos).filter(([, v]) => v != null && v !== '').map(([k, v]) => [k, { value: v, confidence: 100 }])
+  );
+  metadatos.overall_confidence = 100;
+
+  const lote = await client.query(
+    `INSERT INTO sst.lotes_importacion (subido_por, nombre_archivo, estado, total_ordenes)
+     VALUES ($1, $2, 'PROCESADO', 1) RETURNING id`,
+    [userId, `Alta manual · ${pagador.nombre}`]
+  );
+  const draft = await client.query(
+    `INSERT INTO sst.borradores_extraccion
+       (lote_importacion_id, arl_id, nombre_archivo, confianza_general, metadatos_extraccion,
+        estado, tipo_orden_id, tipo_viatico_id, pagador_tercero_id)
+     VALUES ($1, NULL, NULL, 100, $2, 'PENDIENTE_REVISION', $3, $4, $5) RETURNING id`,
+    [lote.rows[0].id, metadatos, tipoOrdenId, tipoViaticoId, pagadorId]
+  );
+  const os = await materializarOrden(draft.rows[0].id, userId, client);
+  return { os, draftId: draft.rows[0].id };
+}
+
 /**
  * Clave del cerrojo con el que se reparte el código legible de la OS. Es un
  * número arbitrario: lo único que importa es que nadie más use el mismo par
@@ -359,7 +489,10 @@ export async function materializarOrden(draftId, userId, client) {
   const draft = dr.rows[0];
   if (!draft) throw notFound('Borrador no encontrado');
   if (draft.estado === 'VALIDADA') throw conflict('El borrador ya fue validado');
-  if (!draft.arl_id) throw badRequest('El borrador no tiene ARL detectada');
+  // A3-01 · La orden la paga una ARL o un cliente particular (tercero); sin
+  // ninguno de los dos no hay a quién facturarla.
+  const particular = !draft.arl_id && !!draft.pagador_tercero_id;
+  if (!draft.arl_id && !particular) throw badRequest('El borrador no tiene ARL detectada');
   // CFG-04 · Sin tipo de orden no se puede crear: es lo que decide el valor hora
   // con el que se le pagará al profesional, y descubrirlo al generar la cuenta
   // de cobro —tres pantallas más adelante— es demasiado tarde.
@@ -399,7 +532,9 @@ export async function materializarOrden(draftId, userId, client) {
 
   const tipoServicioArl = normalizarTipoActividadBolivar(val('tipo_servicio_arl'));
   const modalidadEjecucion = normalizarModalidadEjecucion(val('modalidad_ejecucion'));
-  const arl = await client.query(`SELECT nombre FROM sst.arls WHERE id=$1`, [draft.arl_id]);
+  const arl = particular
+    ? { rows: [] }
+    : await client.query(`SELECT nombre FROM sst.arls WHERE id=$1`, [draft.arl_id]);
   if (esBolivar(arl.rows[0]?.nombre) && !modalidadEjecucion) {
     throw badRequest(
       'Falta indicar si la actividad es presencial o virtual. Elíjalo en la vista previa: ' +
@@ -408,12 +543,17 @@ export async function materializarOrden(draftId, userId, client) {
   }
 
   // Identidad por ARL: Bolívar usa cronograma+secuencia; AXA/Colmena, numero_orden.
-  if (!numeroOrden && !(cron && sec)) {
+  // La orden particular no tiene documento de origen que identificar: su número
+  // es el propio código OS (abajo) y no hay dedup, porque no hay una ARL que
+  // pueda mandar la misma orden dos veces.
+  if (!particular && !numeroOrden && !(cron && sec)) {
     throw badRequest('La OS necesita numero_orden, o bien codigo_cronograma + secuencia');
   }
 
   // Dedup IMP-09 según la identidad disponible (defensa adicional al índice UNIQUE).
-  if (numeroOrden) {
+  if (particular) {
+    // Sin dedup (ver arriba).
+  } else if (numeroOrden) {
     const dup = await client.query(
       `SELECT id FROM sst.ordenes_servicio WHERE arl_id=$1 AND numero_orden=$2`,
       [draft.arl_id, numeroOrden]
@@ -456,12 +596,12 @@ export async function materializarOrden(draftId, userId, client) {
        contacto_empresa_nombre, contacto_empresa_cargo, contacto_empresa_telefono,
        contacto_sst_nombre, contacto_sst_telefono, contacto_sst_correo,
        lote_importacion_id, url_archivo_original, metadatos_extraccion, viaticos_tipo_id,
-       asesor_gestion_riesgo, estado)
+       asesor_gestion_riesgo, pagador_tercero_id, estado)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,
-             $20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,'SIN PROGRAMAR')
+             $20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,'SIN PROGRAMAR')
      RETURNING *`,
     [
-      codigo, draft.arl_id, numeroOrden, cron, sec, val('nro_afiliacion'),
+      codigo, draft.arl_id, particular ? (numeroOrden || codigo) : numeroOrden, cron, sec, val('nro_afiliacion'),
       val('nit_nic'), val('empresa_nombre'), empresaId, val('actividad_economica'),
       val('tipo_actividad'), draft.tipo_orden_id, val('modalidad'),
       tipoServicioArl, modalidadEjecucion,
@@ -481,6 +621,7 @@ export async function materializarOrden(draftId, userId, client) {
       // El AGR viene del SIPAB de Bolívar (casilla 16 del AT-031); en AXA y
       // Colmena la columna no existe y queda NULL.
       val('asesor_gestion_riesgo'),
+      particular ? draft.pagador_tercero_id : null,
     ]
   );
   const orden = ord.rows[0];
@@ -488,8 +629,8 @@ export async function materializarOrden(draftId, userId, client) {
   // Primera entrada de auditoría (EST-03): creación → SIN PROGRAMAR.
   await client.query(
     `INSERT INTO sst.historial_estados_orden (orden_id, estado_anterior, estado_nuevo, cambiado_por, motivo)
-     VALUES ($1, NULL, 'SIN PROGRAMAR', $2, 'Validación IA — creación de OS')`,
-    [orden.id, userId]
+     VALUES ($1, NULL, 'SIN PROGRAMAR', $2, $3)`,
+    [orden.id, userId, particular ? 'Alta manual — orden particular' : 'Validación IA — creación de OS']
   );
 
   await client.query(

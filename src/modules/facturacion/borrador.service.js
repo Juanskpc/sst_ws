@@ -296,16 +296,16 @@ function conTransaccion(dbClient, fn) {
 
 /**
  * Crea el borrador desde una selección de A1-03 (misma forma que
- * `resolverSeleccion`: `{ arl_id, orden_ids }` o, en Bolívar,
+ * `resolverSeleccion`: `{ arl_id | pagador_tercero_id, orden_ids }` o, en Bolívar,
  * `{ arl_id, prefactura_id, fila_ids }`). `dbClient` es solo para los scripts
  * de verificación (todo en una transacción con ROLLBACK); el resto del código
  * lo deja vacío.
  */
-export async function crearBorrador({ arlId, ordenIds, prefacturaId, filaIds, observaciones, usuarioId }, dbClient = null) {
+export async function crearBorrador({ arlId, pagadorTerceroId, ordenIds, prefacturaId, filaIds, observaciones, usuarioId }, dbClient = null) {
   return conTransaccion(dbClient, async (client) => {
     // Revalida DENTRO de la transacción: nada de fiarse de una selección hecha
     // hace rato en el navegador mientras otra persona creaba otro borrador.
-    const seleccion = await resolverSeleccion({ arlId, ordenIds, prefacturaId, filaIds }, client);
+    const seleccion = await resolverSeleccion({ arlId, pagadorTerceroId, ordenIds, prefacturaId, filaIds }, client);
     const pagador = seleccion.pagador;
 
     const [{ productoArl, productoPrivado }, condicion] = await Promise.all([
@@ -368,7 +368,7 @@ const DOCUMENTO_FROM = `
   LEFT JOIN sst.medios_pago mp ON mp.id = d.medio_pago_id
   LEFT JOIN sst.documentos_electronicos ref ON ref.id = d.documento_referencia_id`;
 
-export async function listarBorradores({ estado = 'BORRADOR', arlId, tipo = 'FACTURA' } = {}, client = pool) {
+export async function listarBorradores({ estado = 'BORRADOR', arlId, pagadorTerceroId, tipo = 'FACTURA' } = {}, client = pool) {
   // A1-08 · la pestaña «Emitidas» pide varios estados a la vez (VALIDADO,
   // RECHAZADO, ENVIANDO): se aceptan separados por coma.
   const params = [String(estado).split(',').map((e) => e.trim().toUpperCase()).filter(Boolean), tipo];
@@ -376,6 +376,10 @@ export async function listarBorradores({ estado = 'BORRADOR', arlId, tipo = 'FAC
   if (arlId) {
     params.push(arlId);
     filtroArl = ` AND EXISTS (SELECT 1 FROM sst.arls a WHERE a.tercero_id = d.tercero_id AND a.id = $3)`;
+  } else if (pagadorTerceroId) {
+    // A3-01 · Cliente particular: el tercero del documento ES el pagador.
+    params.push(pagadorTerceroId);
+    filtroArl = ` AND d.tercero_id = $3`;
   }
   const r = await client.query(
     `SELECT ${DOCUMENTO_SELECT} ${DOCUMENTO_FROM} WHERE d.tipo = $2 AND d.estado::text = ANY($1)${filtroArl}
@@ -503,7 +507,9 @@ export async function actualizarBorrador(id, body, usuarioId, dbClient = null) {
       )).rows;
       if (choques.length) throw conflict('Alguna orden del borrador ya está en otra factura (borrador, enviando o validada).');
       const otroPagador = (await client.query(
-        `SELECT o.codigo FROM sst.ordenes_servicio o JOIN sst.arls a ON a.id = o.arl_id WHERE o.id = ANY($1) AND a.tercero_id <> $2`,
+        // A3-01 · El pagador de una orden particular es su propio tercero.
+        `SELECT o.codigo FROM sst.ordenes_servicio o LEFT JOIN sst.arls a ON a.id = o.arl_id
+          WHERE o.id = ANY($1) AND COALESCE(a.tercero_id, o.pagador_tercero_id) IS DISTINCT FROM $2`,
         [ordenIds, actual.tercero_id],
       )).rows;
       if (otroPagador.length) throw badRequest(`Alguna orden no es del pagador de este borrador: ${otroPagador.map((o) => o.codigo).join(', ')}.`);

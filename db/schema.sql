@@ -318,7 +318,9 @@ CREATE INDEX IF NOT EXISTS idx_lotes_importacion_hash
 CREATE TABLE IF NOT EXISTS sst.ordenes_servicio (
   id                       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   codigo                   TEXT UNIQUE,       -- código legible tipo OS-2026-0148 (autogenerado)
-  arl_id                   UUID NOT NULL REFERENCES sst.arls(id),
+  -- NULL en las órdenes de clientes particulares (A3-01): esas las paga
+  -- `pagador_tercero_id`, que se añade al final del archivo junto a los terceros.
+  arl_id                   UUID REFERENCES sst.arls(id),
   -- Identidad por ARL: Bolívar usa (cronograma + secuencia); AXA/Colmena usan
   -- numero_orden. Por eso cronograma/secuencia son NULLABLE (ver índices abajo).
   numero_orden             TEXT,
@@ -1321,34 +1323,8 @@ END; $$ LANGUAGE plpgsql;
 -- =============================================================================
 
 -- Listado expandido de OS con nombres legibles (apoya M3 / Informes).
--- Se re-crea desde cero (no OR REPLACE) porque `o.*` cambia de columnas cuando
--- se agregan campos a ordenes_servicio, y CREATE OR REPLACE no admite reordenar.
-DROP VIEW IF EXISTS sst.vw_ordenes_expandidas;
-CREATE VIEW sst.vw_ordenes_expandidas AS
-SELECT o.*,
-       a.nombre         AS arl_nombre,
-       a.formato_origen AS arl_formato,
-       p.nombre         AS profesional_nombre,
-       p.correo         AS profesional_correo,
-       -- ASG · Quién firma los formatos cuando NO es quien ejecuta (el
-       -- profesional registrado ante la ARL). NULL en el caso normal.
-       pf.nombre        AS profesional_formatos_nombre,
-       -- CFG-04 · El NOMBRE del tipo de orden viaja resuelto: la vista de
-       -- Órdenes lo enseña en cada fila y pedir el catálogo aparte para
-       -- traducir un id sería un viaje por pantalla.
-       tp.nombre        AS tipo_orden,
-       tp.valor_hora    AS tipo_orden_valor_hora,
-       -- La categoría del viático, resuelta por el mismo motivo: el detalle de
-       -- la orden y el informe de facturación la enseñan junto a la cifra, y sin
-       -- el nombre un importe suelto no dice de qué es.
-       tv.nombre        AS viaticos_tipo,
-       tv.valor         AS viaticos_tipo_valor
-FROM sst.ordenes_servicio o
-JOIN sst.arls a               ON a.id = o.arl_id
-LEFT JOIN sst.profesionales p ON p.id = o.profesional_asignado_id
-LEFT JOIN sst.profesionales pf ON pf.id = o.profesional_formatos_id
-LEFT JOIN sst.tipos_orden tp  ON tp.id = o.tipo_orden_id
-LEFT JOIN sst.tipos_viatico tv ON tv.id = o.viaticos_tipo_id;
+-- ⚠️ Se crea AL FINAL del archivo (bloque A3-01): desde las órdenes particulares
+-- cruza con `sst.terceros`, que se define más abajo, en el bloque de la Fase A.
 
 -- RPT-01 · KPIs globales del dashboard.
 -- DROP + CREATE (y no CREATE OR REPLACE): la vista ganó `ejecutadas_mes` en medio
@@ -1585,7 +1561,9 @@ SELECT o.id                     AS orden_id,
        o.profesional_asignado_id AS profesional_id,
        p.nombre                 AS profesional_nombre,
        o.empresa_nombre,
-       a.nombre                 AS arl_nombre,
+       -- A3-01 · La orden particular no tiene ARL; la cuenta de cobro la enseña
+       -- como tal en vez de dejar la casilla vacía.
+       COALESCE(a.nombre, 'PARTICULAR') AS arl_nombre,
        o.tipo_actividad,
        o.actividad_economica,
        COALESCE(o.horas_asignadas, 0) AS horas,
@@ -1604,7 +1582,7 @@ SELECT o.id                     AS orden_id,
        to_char(COALESCE(o.fecha_ejecucion, o.fecha_programada, o.actualizado_en), 'YYYY-MM') AS periodo,
        o.soportes_aceptados_en
 FROM sst.ordenes_servicio o
-JOIN sst.arls a               ON a.id = o.arl_id
+LEFT JOIN sst.arls a          ON a.id = o.arl_id
 LEFT JOIN sst.profesionales p ON p.id = o.profesional_asignado_id
 LEFT JOIN sst.tipos_orden tp  ON tp.id = o.tipo_orden_id
 WHERE o.estado IN ('EJECUTADA','FINALIZADA') AND o.profesional_asignado_id IS NOT NULL;
@@ -1642,7 +1620,7 @@ SELECT o.id,
        o.estado,
        o.empresa_nombre,
        o.nit_nic,
-       a.nombre  AS arl_nombre,
+       COALESCE(a.nombre, 'PARTICULAR') AS arl_nombre,
        o.arl_id,
        p.nombre  AS profesional_nombre,
        o.profesional_asignado_id AS profesional_id,
@@ -1656,7 +1634,7 @@ SELECT o.id,
        CASE WHEN o.fecha_vencimiento IS NOT NULL
             THEN (o.fecha_vencimiento - CURRENT_DATE)::int END               AS dias_para_vencer
 FROM sst.ordenes_servicio o
-JOIN sst.arls a               ON a.id = o.arl_id
+LEFT JOIN sst.arls a          ON a.id = o.arl_id
 LEFT JOIN sst.profesionales p ON p.id = o.profesional_asignado_id
 WHERE o.estado NOT IN ('EJECUTADA', 'FINALIZADA', 'CANCELADA');
 
@@ -2278,3 +2256,58 @@ EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 ALTER TABLE sst.historial_cobro_orden
   ADD COLUMN IF NOT EXISTS documento_id UUID REFERENCES sst.documentos_electronicos(id) ON DELETE SET NULL;
 CREATE INDEX IF NOT EXISTS idx_historial_cobro_orden_documento ON sst.historial_cobro_orden(documento_id);
+
+-- A3-01 · Órdenes manuales para clientes particulares (sin ARL). Una orden la
+-- paga una ARL o un tercero particular, nunca los dos ni ninguno. La vista
+-- Órdenes lista borradores, así que el borrador del alta manual también
+-- guarda su pagador. Ver la migración 2026-09-29-ordenes-particulares.sql.
+ALTER TABLE sst.ordenes_servicio ALTER COLUMN arl_id DROP NOT NULL;
+ALTER TABLE sst.ordenes_servicio
+  ADD COLUMN IF NOT EXISTS pagador_tercero_id UUID REFERENCES sst.terceros(id);
+CREATE INDEX IF NOT EXISTS idx_ordenes_pagador
+  ON sst.ordenes_servicio(pagador_tercero_id) WHERE pagador_tercero_id IS NOT NULL;
+DO $$ BEGIN
+  ALTER TABLE sst.ordenes_servicio ADD CONSTRAINT chk_ordenes_un_pagador
+    CHECK ((arl_id IS NULL) <> (pagador_tercero_id IS NULL));
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+ALTER TABLE sst.borradores_extraccion
+  ADD COLUMN IF NOT EXISTS pagador_tercero_id UUID REFERENCES sst.terceros(id);
+
+-- Listado expandido de OS con nombres legibles (apoya M3 / Informes).
+-- Se re-crea desde cero (no OR REPLACE) porque `o.*` cambia de columnas cuando
+-- se agregan campos a ordenes_servicio, y CREATE OR REPLACE no admite reordenar.
+-- Vive aquí, al final, porque cruza con `sst.terceros` (A3-01).
+DROP VIEW IF EXISTS sst.vw_ordenes_expandidas;
+CREATE VIEW sst.vw_ordenes_expandidas AS
+SELECT o.*,
+       a.nombre         AS arl_nombre,
+       a.formato_origen AS arl_formato,
+       -- A3-01 · Quién paga la orden, para los textos (correos, agenda, PDF):
+       -- la ARL o, en una orden particular, el cliente. `arl_nombre` sigue NULL
+       -- en las particulares a propósito: la matriz de formatos se decide por él
+       -- y un cliente no tiene formatos de ARL.
+       COALESCE(a.nombre, tp_pag.razon_social,
+                NULLIF(btrim(concat_ws(' ', tp_pag.nombres, tp_pag.apellidos)), '')) AS pagador_nombre,
+       p.nombre         AS profesional_nombre,
+       p.correo         AS profesional_correo,
+       -- ASG · Quién firma los formatos cuando NO es quien ejecuta (el
+       -- profesional registrado ante la ARL). NULL en el caso normal.
+       pf.nombre        AS profesional_formatos_nombre,
+       -- CFG-04 · El NOMBRE del tipo de orden viaja resuelto: la vista de
+       -- Órdenes lo enseña en cada fila y pedir el catálogo aparte para
+       -- traducir un id sería un viaje por pantalla.
+       tp.nombre        AS tipo_orden,
+       tp.valor_hora    AS tipo_orden_valor_hora,
+       -- La categoría del viático, resuelta por el mismo motivo: el detalle de
+       -- la orden y el informe de facturación la enseñan junto a la cifra, y sin
+       -- el nombre un importe suelto no dice de qué es.
+       tv.nombre        AS viaticos_tipo,
+       tv.valor         AS viaticos_tipo_valor
+FROM sst.ordenes_servicio o
+LEFT JOIN sst.arls a          ON a.id = o.arl_id
+LEFT JOIN sst.terceros tp_pag ON tp_pag.id = o.pagador_tercero_id
+LEFT JOIN sst.profesionales p ON p.id = o.profesional_asignado_id
+LEFT JOIN sst.profesionales pf ON pf.id = o.profesional_formatos_id
+LEFT JOIN sst.tipos_orden tp  ON tp.id = o.tipo_orden_id
+LEFT JOIN sst.tipos_viatico tv ON tv.id = o.viaticos_tipo_id;

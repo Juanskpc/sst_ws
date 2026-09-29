@@ -53,7 +53,15 @@ async function resolveToken(token, client = pool) {
 // necesita para corregirlo.
 router.get('/support/:token', asyncHandler(async (req, res) => {
   const row = await resolveToken(req.params.token);
-  const arl = await pool.query(`SELECT nombre FROM sst.arls WHERE id=$1`, [row.arl_id]);
+  // A3-01 · En una orden particular no hay ARL: el portal enseña al cliente que
+  // la paga en esa misma casilla.
+  const arl = row.arl_id
+    ? await pool.query(`SELECT nombre FROM sst.arls WHERE id=$1`, [row.arl_id])
+    : await pool.query(
+        `SELECT COALESCE(razon_social, btrim(concat_ws(' ', nombres, apellidos))) AS nombre
+           FROM sst.terceros WHERE id=$1`,
+        [row.pagador_tercero_id]
+      );
   const files = await pool.query(
     `SELECT id, nombre_archivo, nombre_original, categoria, mime, tamano_bytes, subido_en
        FROM sst.archivos_soporte WHERE orden_id=$1 ORDER BY subido_en`,

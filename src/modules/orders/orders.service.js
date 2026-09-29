@@ -111,6 +111,11 @@ async function aliadoEstrategico(client = pool) {
  */
 export async function generateOrderDocuments(orderId, client = pool, { guardar = true } = {}) {
   const order = await getOrderExpanded(orderId, client);
+  // A3-01 · La orden de un cliente particular no lleva formatos: los que hay son
+  // de las ARL, y las plantillas genéricas (`arl_id` NULL) saldrían con la casilla
+  // "ARL" en blanco. Si JD&D define un formato propio para particulares, entra
+  // aquí (pregunta abierta en el §0 del plan de facturación).
+  if (!order.arl_id) return [];
   // ASG · El nombre que va IMPRESO es el del profesional registrado ante la ARL
   // cuando la orden lleva suplente (`profesional_formatos_id`), y el del ejecutor
   // en el caso normal. Es el único sitio donde los dos papeles se separan: el

@@ -100,7 +100,7 @@ async function resolverProfesionalDeFormatos({ ordenId, ejecutorId, elegidoId },
             (pa.vigente_hasta IS NOT NULL AND pa.vigente_hasta < CURRENT_DATE) AS vencido
        FROM sst.profesionales p
        CROSS JOIN LATERAL (SELECT o.arl_id FROM sst.ordenes_servicio o WHERE o.id = $2) ord
-       JOIN sst.arls a ON a.id = ord.arl_id
+       LEFT JOIN sst.arls a ON a.id = ord.arl_id
        LEFT JOIN sst.profesionales_arl pa
               ON pa.profesional_id = p.id AND pa.arl_id = ord.arl_id
       WHERE p.id = $1`,
@@ -108,6 +108,11 @@ async function resolverProfesionalDeFormatos({ ordenId, ejecutorId, elegidoId },
   );
   const elegido = r.rows[0];
   if (!elegido) throw badRequest('El profesional elegido para los formatos no existe.');
+  // A3-01 · La orden particular no lleva formatos de ARL (ver
+  // `generateOrderDocuments`): no hay a nombre de quién sacarlos.
+  if (!elegido.arl_nombre) {
+    throw badRequest('Esta orden es de un cliente particular y no lleva formatos de ARL: no se elige a nombre de quién salen.');
+  }
   if (elegido.estado !== 'Activo') {
     throw badRequest(`${elegido.nombre} está Inactivo y no puede figurar en los formatos.`);
   }
@@ -562,7 +567,7 @@ router.patch('/estado-arl', requireRole('admin', 'contador'), asyncHandler(async
       `SELECT o.id, o.codigo, a.nombre AS arl_nombre, o.estado::text AS estado,
               o.estado_arl::text AS estado_arl, o.estado_cobro::text AS estado_cobro,
               o.numero_prefactura
-         FROM sst.ordenes_servicio o JOIN sst.arls a ON a.id = o.arl_id
+         FROM sst.ordenes_servicio o LEFT JOIN sst.arls a ON a.id = o.arl_id
         WHERE o.id = ANY($1::uuid[]) FOR UPDATE OF o`,
       [ids]
     );
@@ -572,6 +577,11 @@ router.patch('/estado-arl', requireRole('admin', 'contador'), asyncHandler(async
 
     const cambios = [];
     for (const fila of filas.rows) {
+      // A3-01 · El estado ARL no aplica a una orden particular: nadie la aprueba
+      // en una plataforma, y la facturación la trata como aprobada.
+      if (!fila.arl_nombre) {
+        throw badRequest(`${fila.codigo} es de un cliente particular: no tiene estado ARL.`);
+      }
       const bolivar = esBolivar(fila.arl_nombre);
       const finalPrefactura = prefacturaEnviada ? prefactura : fila.numero_prefactura;
       if (prefactura && !bolivar) {
@@ -1285,7 +1295,10 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
   const varias = result.franjas.length > 1;
   const lugar = [o.direccion, o.ciudad_ejecucion].filter(Boolean).join(', ');
   const contacto = [o.contacto_sst_nombre, o.contacto_sst_telefono].filter(Boolean).join(' · ');
-  const sinFormatos = !result.docs.length;
+  // A3-01 · Una orden particular no lleva formatos A PROPÓSITO: no se anuncia
+  // que "llegarán aparte", como cuando a una ARL le faltan por cargar.
+  const particular = !o.arl_id;
+  const sinFormatos = !result.docs.length && !particular;
   // SUP · Qué tiene que devolver, dicho en el mismo correo que le manda a la
   // visita. Antes el correo hablaba de "los soportes firmados" en abstracto y la
   // lista solo aparecía al abrir el portal, ya de vuelta de la empresa.
@@ -1355,8 +1368,8 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
       text:
         `Hola ${result.profesional.nombre},\n\n` +
         (esRepro
-          ? `La OS ${o.codigo} (${o.arl_nombre}) para ${o.empresa_nombre} fue REPROGRAMADA.\n`
-          : `Se te asignó la OS ${o.codigo} (${o.arl_nombre}) para ${o.empresa_nombre}.\n`) +
+          ? `La OS ${o.codigo} (${o.pagador_nombre ?? o.arl_nombre}) para ${o.empresa_nombre} fue REPROGRAMADA.\n`
+          : `Se te asignó la OS ${o.codigo} (${o.pagador_nombre ?? o.arl_nombre}) para ${o.empresa_nombre}.\n`) +
         // Con la visita partida, una sola "fecha programada" se queda corta: lo
         // que el profesional necesita saber es cada franja.
         (varias
@@ -1369,7 +1382,7 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
         '\n' +
         // Sin plantillas activas para la ARL no hay PDFs que adjuntar (CFG-03):
         // prometer unos formatos que no van deja al profesional buscándolos.
-        (sinFormatos
+        (particular ? '' : sinFormatos
           ? `Los formatos de esta ARL todavía no están cargados en la plataforma; ` +
             `te los haremos llegar aparte.\n\n`
           : `Documentos adjuntos de ${o.arl_nombre}:\n` +
@@ -1398,7 +1411,7 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
           ),
           tablaDatos([
             filaDato('Orden', o.codigo),
-            filaDato('ARL', o.arl_nombre),
+            filaDato(o.arl_id ? 'ARL' : 'Cliente', o.pagador_nombre ?? o.arl_nombre),
             filaDato('Empresa', o.empresa_nombre),
             filaDato('Horas', horasTexto(o.horas_asignadas)),
             filaDato('Viáticos aprobados', viaticosTexto),
@@ -1412,7 +1425,7 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
             varias ? `La visita se realiza en ${result.franjas.length} franjas` : 'Fecha de la visita',
             result.franjas.length ? result.franjas.map(franjaEnTexto) : [fecha],
           ),
-          sinFormatos
+          particular ? '' : sinFormatos
             ? bloqueAviso(
                 'Los formatos de esta ARL todavía no están cargados en la plataforma. ' +
                 'Te los haremos llegar aparte.',
@@ -1420,7 +1433,7 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
             // Los documentos por su nombre, no "los formatos de la ARL": lo que
             // se lista es exactamente lo que trae ESTE correo.
             : bloqueLista(`Documentos adjuntos de ${o.arl_nombre}`, listaAdjuntos),
-          sinFormatos ? '' : parrafo(queHacerConEllos.join(' ')),
+          particular || sinFormatos ? '' : parrafo(queHacerConEllos.join(' ')),
           // ASG · El nombre impreso no es el suyo, y hay que decírselo aquí: es
           // lo primero que va a ver al abrir el PDF adjunto.
           notaSuplente ? bloqueAviso(notaSuplente) : '',
@@ -1715,7 +1728,7 @@ router.post('/:id/reject', requireRole('admin'), asyncHandler(async (req, res) =
         subject: `Soportes devueltos · ${expandida.codigo} · ${expandida.empresa_nombre || ''}`,
         text:
           `Hola ${prof.nombre},\n\n` +
-          `Revisamos los soportes de la OS ${expandida.codigo} (${expandida.arl_nombre}) ` +
+          `Revisamos los soportes de la OS ${expandida.codigo} (${expandida.pagador_nombre ?? expandida.arl_nombre}) ` +
           `para ${expandida.empresa_nombre} y hay algo que corregir:\n\n` +
           `${motivo.trim()}\n\n` +
           `Documento(s) por volver a subir: ${listaDocs}.\n` +
@@ -1741,7 +1754,7 @@ router.post('/:id/reject', requireRole('admin'), asyncHandler(async (req, res) =
             // es el dato que el profesional vuelve a mirar al abrir el correo.
             tablaDatos([
               filaDato('Orden', expandida.codigo),
-              filaDato('ARL', expandida.arl_nombre),
+              filaDato(expandida.arl_id ? 'ARL' : 'Cliente', expandida.pagador_nombre ?? expandida.arl_nombre),
               filaDato('Empresa', expandida.empresa_nombre),
               filaDato('Por volver a subir', listaDocs),
               filaDato('Estado', 'PROGRAMADA'),
