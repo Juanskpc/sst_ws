@@ -96,12 +96,20 @@ const FORMATOS = {
     tipo: 'seguimiento', nombre: 'seguimiento.pdf',
     etiqueta: 'Seguimiento de reuniones y actividades (AT-031)',
     campos: camposSeguimientoBolivar, marcas: marcasSeguimientoBolivar,
+    // Vista previa · van en "Observaciones y sugerencias", ANTES del detalle de
+    // sesiones que el sistema ya pone ahí.
+    observaciones: { campo: '42' },
+    editables: () => EDITABLES_AT031,
   },
   at028: {
     archivo: 'bolivar/asistencia.pdf', modo: 'acroform', alcance: 'sesion',
     tipo: 'asistencia', nombre: 'asistencia.pdf',
     etiqueta: 'Registro de asistencia (AT-028)',
     campos: camposAsistenciaBolivar,
+    editables: () => EDITABLES_AT028,
+    // Vista previa · el AT-028 no tiene campo de formulario para esto: se
+    // escribe sobre las rayas de "Observaciones del participante ARL".
+    observaciones: { renglones: () => RENGLONES_OBS_AT028 },
   },
   // El informe de gestión de las asistencias técnicas. ⚠️ NO es un formato en
   // blanco: es un informe REAL ya redactado, el único modelo que entregó el
@@ -122,12 +130,14 @@ const FORMATOS = {
     tipo: 'asistencia', nombre: 'asistencia.pdf',
     etiqueta: 'Registro listado de asistencia',
     casillas: () => CASILLAS_ASISTENCIA_COLPATRIA, valores: valoresAsistenciaColpatria,
+    editables: () => EDITABLES_ASISTENCIA_AXA,
   },
   fichaAxa: {
     archivo: 'colpatria/ficha-gestion.pdf', modo: 'acroform', alcance: 'orden',
     tipo: 'ficha_gestion', nombre: 'ficha-de-gestion.pdf',
     etiqueta: 'Ficha de gestión del proveedor',
     campos: camposFichaAxa,
+    editables: () => EDITABLES_FICHA_AXA,
   },
   informeAxa: {
     archivo: 'colpatria/informe-tecnico.docx', modo: 'adjunto', alcance: 'orden',
@@ -154,10 +164,15 @@ const FORMATOS = {
     tipo: 'prestacion_servicios', nombre: 'prestacion-de-servicios.pdf',
     etiqueta: 'Informe de prestación de servicios',
     casillas: () => CASILLAS_PRESTACION_COLMENA, valores: valoresPrestacionColmena,
+    editables: () => EDITABLES_PRESTACION_COLMENA,
     fechaImpresion: true,
     sobreOriginal: {
       casillas: () => CASILLAS_PRESTACION_COLMENA_ORIGINAL,
       valores: valoresPrestacionColmenaOriginal,
+      // Recuadro "OBSERVACIONES Y RECOMENDACIONES DEL PROVEEDOR Y/O DEL CLIENTE".
+      observaciones: { renglones: () => RENGLONES_OBS_SPM38 },
+      // El resto del SPM-F 38 lo escribió Colmena: solo es de Orbita el nombre.
+      editables: () => EDITABLES_SPM38,
     },
   },
   // 29-sep · La asistencia vigente es el "Registro de Ejecución de Actividades
@@ -171,12 +186,15 @@ const FORMATOS = {
     etiqueta: 'Registro de ejecución de actividades (PSP-F-006 V3)',
     casillas: () => CASILLAS_REGISTRO_EJECUCION_COLMENA, valores: valoresRegistroEjecucionColmena,
     marcas: marcasRegistroEjecucionColmena,
+    observaciones: { renglones: () => RENGLONES_OBS_REGISTRO_EJECUCION },
+    editables: () => EDITABLES_REGISTRO_EJECUCION_COLMENA,
   },
   evaluacionColmena: {
     archivo: 'colmena/evaluacion.pdf', modo: 'plano', alcance: 'sesion',
     tipo: 'evaluacion', nombre: 'evaluacion.pdf',
     etiqueta: 'Evaluación de la sesión (PSP-F-010)',
     casillas: () => CASILLAS_EVALUACION_COLMENA, valores: valoresEvaluacionColmena,
+    editables: () => EDITABLES_EVALUACION_COLMENA,
     fechaImpresion: true,
   },
   registroEjecucionColmena: {
@@ -394,7 +412,7 @@ function paginaDelWidget(doc, widget) {
  * @param marcas  Casillas de grupos de opción a marcar: `[[grupo, índice], …]`.
  *                Ver `marcarOpcion` para por qué no se seleccionan por valor.
  */
-async function rellenarAcroForm(rutaPlantilla, valores, marcas = []) {
+async function rellenarAcroForm(rutaPlantilla, valores, marcas = [], { parrafo = null } = {}) {
   const doc = await PDFDocument.load(await fs.readFile(rutaPlantilla));
   const form = doc.getForm();
   const helvetica = await doc.embedFont(StandardFonts.Helvetica);
@@ -420,6 +438,11 @@ async function rellenarAcroForm(rutaPlantilla, valores, marcas = []) {
       continue;
     }
     const { texto: ajustado, tamano } = ajustarACasilla(campo, texto, helvetica);
+    // Varias líneas (observaciones de la vista previa + detalle de sesiones) y
+    // el ajuste de un texto largo al ancho de una casilla alta (objetivo,
+    // resultados…) solo ocurren si el campo está marcado como multilínea.
+    const alto = campo.acroField.getWidgets()[0]?.getRectangle()?.height ?? 0;
+    if (ajustado.includes('\n') || alto >= ALTO_MULTILINEA) campo.enableMultiline();
     campo.setText(ajustado);
     // La apariencia se dibuja a partir de este "default appearance", y algunos
     // campos del formato traían un gris claro heredado. Se fija en negro: esto
@@ -437,6 +460,7 @@ async function rellenarAcroForm(rutaPlantilla, valores, marcas = []) {
   // página, no en el formulario, así que regenerarlas después las borraría.
   const negrita = await doc.embedFont(StandardFonts.HelveticaBold);
   for (const [grupo, indice] of marcas) marcarOpcion(doc, form, negrita, grupo, indice);
+  if (parrafo) escribirRenglones(doc.getPage(0), helvetica, parrafo.texto, parrafo.renglones);
 
   return Buffer.from(await doc.save());
 }
@@ -643,6 +667,128 @@ const CASILLAS_REGISTRO_EJECUCION_COLMENA = [
   ['nombre_profesional', 290, 98, 180],
 ];
 
+/**
+ * Vista previa · casillas del formato que se pueden revisar y corregir desde la
+ * pantalla antes de enviar (29-sep, pedido de JD&D). La vista previa llega ya
+ * llenada como siempre; aquí se declara qué se deja tocar y con qué rótulo.
+ *
+ *   campo       nombre del campo en el PDF (AcroForm) o clave de `valores` (plano)
+ *   etiqueta    rótulo impreso junto a la casilla (medido con inspeccionar-formato)
+ *   multilinea  se edita en un área de texto
+ *   fecha       'DD/MM/AA' | 'DD/MM/AAAA': se edita con selector de fecha y se
+ *               imprime en ese formato
+ *   partes      [dd, mm, aaaa]: una sola fecha repartida en tres casillas
+ *
+ * Lo que sale de la AGENDA (fecha y horario de la sesión, horas de la franja) no
+ * se ofrece: si se editara aquí, el formato diría una cosa y la agenda, el .ics
+ * y la cuenta de cobro otra. Eso se cambia reprogramando.
+ */
+const EDITABLES_AT031 = [
+  { campo: '6', etiqueta: 'Empresa' },
+  { campo: '7', etiqueta: 'Dirección' },
+  { campo: '8', etiqueta: 'NIT - Grupo' },
+  { campo: '9', etiqueta: 'Teléfono' },
+  { campo: '10', etiqueta: 'Correo electrónico' },
+  { campo: '11', etiqueta: 'Ciudad / Departamento de prestación' },
+  { campo: '4', etiqueta: 'SIPAB No. Cronograma' },
+  { campo: '5', etiqueta: 'Secuencia' },
+  { campo: '13', etiqueta: 'Plan' },
+  { campo: '16', etiqueta: 'Asesor Gestión del Riesgo' },
+  { campo: '17', etiqueta: 'Nombre aliado estratégico' },
+  { campo: '18', etiqueta: 'Código aliado estratégico' },
+  { campo: '19', etiqueta: 'Participante ARL · nombre' },
+  { campo: '20', etiqueta: 'Participante ARL · cargo' },
+  { campo: '23', etiqueta: 'Segundo participante ARL · nombre' },
+  { campo: '24', etiqueta: 'Segundo participante ARL · cargo' },
+  { campo: '21', etiqueta: 'Participante empresa · nombre' },
+  { campo: '22', etiqueta: 'Participante empresa · cargo' },
+  { campo: '25', etiqueta: 'Segundo participante empresa · nombre' },
+  { campo: '26', etiqueta: 'Segundo participante empresa · cargo' },
+  { campo: '27', etiqueta: 'Actividad a realizar', multilinea: true },
+  { campo: '28', etiqueta: 'Temas desarrollados en la actividad', multilinea: true },
+  { campo: '29', etiqueta: 'Decisiones y/o compromisos adquiridos', multilinea: true },
+  { campo: '31', etiqueta: 'Responsable(s) de los compromisos', multilinea: true },
+  { campo: '32', etiqueta: 'Fecha de los compromisos', fecha: 'DD/MM/AAAA' },
+  { campo: '43', etiqueta: 'Próxima reunión · tema' },
+  { campo: 'proxima_fecha', etiqueta: 'Próxima reunión · fecha', partes: ['44', '45', '46'] },
+  { campo: '47', etiqueta: 'Próxima reunión · hora' },
+];
+const EDITABLES_AT028 = [
+  { campo: 'Text6', etiqueta: 'Empresa' },
+  { campo: 'Text7', etiqueta: 'NIT - Grupo' },
+  { campo: 'Text1', etiqueta: 'Cronograma' },
+  { campo: 'Text2', etiqueta: 'Secuencia' },
+  { campo: 'Text8', etiqueta: 'Plan' },
+  { campo: 'Text9', etiqueta: 'Tema y/o actividad a realizar' },
+  { campo: 'Text13', etiqueta: 'Ciudad / Departamento de prestación' },
+  { campo: 'Text15', etiqueta: 'Nombre aliado estratégico' },
+  { campo: 'Text16', etiqueta: 'Participante ARL' },
+];
+const EDITABLES_FICHA_AXA = [
+  { campo: 'FECHA 2', etiqueta: 'Fecha de diligenciamiento', fecha: 'DD/MM/AA' },
+  { campo: 'nombre', etiqueta: 'Nombre del proveedor' },
+  { campo: 'nombre 2', etiqueta: 'Número de orden de servicio (OS)' },
+  { campo: 'nombre 3', etiqueta: 'Actividad técnica contratada (OS)' },
+  { campo: 'nombre 4', etiqueta: 'Objetivo/alcance de la actividad', multilinea: true },
+  { campo: 'nombre 5', etiqueta: 'Unidades contratadas (OS)' },
+  { campo: 'nombre 6', etiqueta: 'Nombre de la empresa/cliente (OS)' },
+  { campo: 'nombre 7', etiqueta: 'Ciudad y centro de trabajo' },
+  { campo: 'nombre 8', etiqueta: 'Población objeto', multilinea: true },
+  { campo: 'nombre 11', etiqueta: 'Profesionales ejecutores de la actividad', multilinea: true },
+  { campo: 'nombre 12', etiqueta: 'Licencia en SO/SST o tarjeta profesional', multilinea: true },
+  { campo: 'nombre 19', etiqueta: 'Eje técnico · actividades ejecutadas vs. tiempo', multilinea: true },
+  { campo: 'nombre 20', etiqueta: 'Resultados', multilinea: true },
+  { campo: 'nombre 21', etiqueta: 'Análisis de los resultados', multilinea: true },
+  { campo: 'nombre 22', etiqueta: 'Recomendaciones', multilinea: true },
+  { campo: 'nombre 23', etiqueta: 'Conclusiones', multilinea: true },
+];
+const EDITABLES_ASISTENCIA_AXA = [
+  { campo: 'empresa', etiqueta: 'Empresa' },
+  { campo: 'sede', etiqueta: 'Sede' },
+  { campo: 'ciudad', etiqueta: 'Ciudad' },
+  { campo: 'numero_orden', etiqueta: 'N.º de orden' },
+  { campo: 'tema', etiqueta: 'Tema' },
+  { campo: 'proveedor', etiqueta: 'Proveedor' },
+  { campo: 'expositor', etiqueta: 'Expositor' },
+];
+const EDITABLES_REGISTRO_EJECUCION_COLMENA = [
+  { campo: 'empresa', etiqueta: 'Empresa' },
+  { campo: 'ciudad', etiqueta: 'Ciudad' },
+  { campo: 'numero_orden', etiqueta: 'Nro(s) de orden(es) de servicio(s)' },
+  { campo: 'razon_social_proveedor', etiqueta: 'Razón social del proveedor' },
+  { campo: 'nombre_profesional', etiqueta: 'Nombre del profesional ejecutor' },
+];
+const EDITABLES_SPM38 = [
+  { campo: 'nombre_profesional', etiqueta: 'Nombre del profesional' },
+];
+const EDITABLES_PRESTACION_COLMENA = [
+  { campo: 'empresa', etiqueta: 'Nombre de la empresa' },
+  { campo: 'nit', etiqueta: 'NIT' },
+  { campo: 'ciudad', etiqueta: 'Ciudad de ejecución' },
+  { campo: 'numero_orden', etiqueta: 'N.º de orden de servicio' },
+  { campo: 'actividad', etiqueta: 'Actividad' },
+  { campo: 'cantidad_solicitada', etiqueta: 'Cantidad solicitada' },
+  { campo: 'razon_social_proveedor', etiqueta: 'Razón social del proveedor' },
+  { campo: 'nombre_profesional', etiqueta: 'Nombre del profesional' },
+];
+const EDITABLES_EVALUACION_COLMENA = [
+  { campo: 'empresa', etiqueta: 'Empresa' },
+  { campo: 'nit', etiqueta: 'NIT' },
+  { campo: 'ciudad', etiqueta: 'Ciudad' },
+  { campo: 'facilitador', etiqueta: 'Facilitador' },
+  { campo: 'tema', etiqueta: 'Tema' },
+];
+
+/**
+ * Vista previa · renglones donde se escriben las observaciones del administrador,
+ * `[x, línea base, ancho]`, de arriba abajo. El texto se reparte por palabras y,
+ * si no cabe, el último renglón termina en "…" (el límite de 500 caracteres de la
+ * API hace que eso sea raro).
+ */
+const RENGLONES_OBS_SPM38 = [[36, 503, 540], [36, 493, 540], [36, 483, 540], [36, 473, 540]];
+const RENGLONES_OBS_REGISTRO_EJECUCION = [[109, 132, 568], [109, 123, 568], [109, 114, 568]];
+const RENGLONES_OBS_AT028 = [[185, 99, 400], [32, 83, 555], [32, 67, 555]];
+
 /** Centro de los hexágonos de Modalidad y Tipo de actividad del PSP-F-006 V3. */
 const MARCAS_REGISTRO_EJECUCION_COLMENA = {
   modalidad: { VIRTUAL: [197.5, 477], PRESENCIAL: [249.4, 477] },
@@ -845,7 +991,7 @@ const MARGEN_FECHA_IMPRESION = 24;
  * pone el asesor a mano, tal como estaba). Solo lo piden los tres formatos de
  * Colmena; AXA, que también es `modo: 'plano'`, no lo lleva.
  */
-async function rellenarPdfPlano(plantilla, casillas, valores, { fechaImpresion = false, marcas = [] } = {}) {
+async function rellenarPdfPlano(plantilla, casillas, valores, { fechaImpresion = false, marcas = [], parrafo = null } = {}) {
   // `plantilla` es la ruta del formato en blanco o, para el SPM-F 38 de Colmena,
   // el PDF original de la orden ya leído del almacenamiento.
   const doc = await PDFDocument.load(Buffer.isBuffer(plantilla) ? plantilla : await fs.readFile(plantilla));
@@ -864,6 +1010,8 @@ async function rellenarPdfPlano(plantilla, casillas, valores, { fechaImpresion =
     const xFinal = alineacion === 'centro' ? x + (ancho - font.widthOfTextAtSize(texto, tamano)) / 2 : x;
     pagina.drawText(texto, { x: xFinal, y, size: tamano, font, color: negro });
   }
+
+  if (parrafo) escribirRenglones(pagina, font, parrafo.texto, parrafo.renglones);
 
   // Casillas de opción dibujadas (los hexágonos del PSP-F-006 V3): una "X"
   // centrada en el punto medido. No son campos de formulario, así que se dibujan.
@@ -950,7 +1098,7 @@ function tramoDe(franjas) {
 }
 
 /** Un formato ya generado, listo para adjuntarse al correo. */
-function salida(def, buffer, sufijo) {
+function salida(def, { buffer, admiteObservaciones, editables = [] }, sufijo) {
   // El sufijo solo aparece cuando de verdad hay varias sesiones: con una visita
   // normal el adjunto se llama "asistencia.pdf" a secas. Se inserta ANTES de la
   // extensión, no al final, o el archivo dejaría de abrirse ("asistencia.pdf-2").
@@ -965,6 +1113,9 @@ function salida(def, buffer, sufijo) {
     tipo: def.tipo, filename, buffer,
     etiqueta: def.etiqueta || def.nombre,
     prediligenciado: def.modo !== 'adjunto',
+    clave: def.clave,
+    admiteObservaciones,
+    editables,
   };
 }
 
@@ -977,12 +1128,21 @@ function salida(def, buffer, sufijo) {
  *
  * Devuelve `[{ tipo, filename, buffer }]`, vacío si la ARL no tiene formatos.
  */
-export async function generarFormatosArl({ orden, profesional, franjas = [], aliado, original = null }) {
+export async function generarFormatosArl({
+  orden, profesional, franjas = [], aliado, original = null, observaciones = {}, campos = {},
+}) {
   const entrega = entregaDeLaOrden(orden);
   if (!entrega.formatos.length) return [];
 
   const identidad = { ...ALIADO_POR_DEFECTO, ...(aliado || {}) };
-  const definiciones = entrega.formatos.map((clave) => FORMATOS[clave]).filter(Boolean);
+  // La clave (at031, asistenciaColmena…) viaja con cada definición: es con la
+  // que se guardan las observaciones de la vista previa y con la que la pantalla
+  // las vuelve a pedir.
+  const definiciones = entrega.formatos
+    .filter((clave) => FORMATOS[clave])
+    .map((clave) => ({ ...FORMATOS[clave], clave }));
+  const obsDe = (def) => enBlanco(observaciones?.[def.clave]);
+  const extra = (def) => ({ observacion: obsDe(def), campos: campos?.[def.clave] || {} });
 
   // Sin franjas se emite igualmente un juego, con las casillas de fecha y
   // horario en blanco: el profesional ya tiene el formato correcto en la mano.
@@ -997,7 +1157,7 @@ export async function generarFormatosArl({ orden, profesional, franjas = [], ali
 
   // 1) Los de alcance 'orden': uno solo, con el tramo completo de la visita.
   for (const def of definiciones.filter((d) => d.alcance === 'orden')) {
-    generados.push(salida(def, await construir(def, orden, profesional, tramo, identidad, original), ''));
+    generados.push(salida(def, await construir(def, orden, profesional, tramo, identidad, original, extra(def)), ''));
   }
 
   // 2) Los de alcance 'sesion': uno por franja.
@@ -1005,36 +1165,147 @@ export async function generarFormatosArl({ orden, profesional, franjas = [], ali
     const sesion = sesionDe(orden, franja);
     const sufijo = sesiones.length > 1 ? `-${i + 1}` : '';
     for (const def of definiciones.filter((d) => d.alcance === 'sesion')) {
-      generados.push(salida(def, await construir(def, orden, profesional, sesion, identidad, original), sufijo));
+      generados.push(salida(def, await construir(def, orden, profesional, sesion, identidad, original, extra(def)), sufijo));
     }
   }
   return generados;
 }
 
 /** Rellena UN formato según su modo. */
-async function construir(def, orden, profesional, sesion, aliado, original = null) {
+async function construir(def, orden, profesional, sesion, aliado, original = null, { observacion = '', campos: delUsuario = {} } = {}) {
+  // Devuelve `{ buffer, admiteObservaciones }`. Lo segundo le dice a la vista
+  // previa si ESTE archivo tiene dónde escribir las observaciones (el informe de
+  // Colmena sí sobre su original, no en la plantilla de respaldo), para no
+  // ofrecer un cuadro de texto que después no se imprime.
   if (def.sobreOriginal && await esOriginalUtilizable(original)) {
-    return rellenarPdfPlano(
-      original, def.sobreOriginal.casillas(), def.sobreOriginal.valores(orden, profesional, sesion, aliado),
-    );
+    const obs = def.sobreOriginal.observaciones;
+    const valores = def.sobreOriginal.valores(orden, profesional, sesion, aliado);
+    const editables = aplicarEditables(def.sobreOriginal.editables?.() ?? [], valores, delUsuario);
+    return {
+      buffer: await rellenarPdfPlano(
+        original, def.sobreOriginal.casillas(), valores,
+        { parrafo: obs && observacion ? { renglones: obs.renglones(), texto: observacion } : null },
+      ),
+      admiteObservaciones: !!obs,
+      editables,
+    };
   }
   const ruta = path.join(RAIZ, ...def.archivo.split('/'));
   if (def.modo === 'adjunto') {
     // Se manda tal cual: es una plantilla que el profesional redacta en Word o
     // en Excel, no un formato con casillas que se puedan prediligenciar.
-    return fs.readFile(ruta);
+    return { buffer: await fs.readFile(ruta), admiteObservaciones: false, editables: [] };
   }
+  const obs = def.observaciones;
+  const parrafo = obs?.renglones && observacion ? { renglones: obs.renglones(), texto: observacion } : null;
   if (def.modo === 'acroform') {
-    return rellenarAcroForm(
-      ruta,
-      def.campos(orden, profesional, sesion, aliado),
-      def.marcas ? def.marcas(orden) : [],
-    );
+    const campos = def.campos(orden, profesional, sesion, aliado);
+    const editables = aplicarEditables(def.editables?.() ?? [], campos, delUsuario);
+    // En un campo del formulario, lo que escribió el administrador va PRIMERO y
+    // lo que ya ponía el sistema (el detalle de sesiones del AT-031) debajo.
+    if (obs?.campo && observacion) {
+      campos[obs.campo] = [observacion, enBlanco(campos[obs.campo])].filter(Boolean).join('\n');
+    }
+    return {
+      buffer: await rellenarAcroForm(ruta, campos, def.marcas ? def.marcas(orden) : [], { parrafo }),
+      admiteObservaciones: !!obs,
+      editables,
+    };
   }
-  return rellenarPdfPlano(
-    ruta, def.casillas(), def.valores(orden, profesional, sesion, aliado),
-    { fechaImpresion: !!def.fechaImpresion, marcas: def.marcas ? def.marcas(orden) : [] },
-  );
+  const valores = def.valores(orden, profesional, sesion, aliado);
+  const editables = aplicarEditables(def.editables?.() ?? [], valores, delUsuario);
+  return {
+    buffer: await rellenarPdfPlano(
+      ruta, def.casillas(), valores,
+      { fechaImpresion: !!def.fechaImpresion, marcas: def.marcas ? def.marcas(orden) : [], parrafo },
+    ),
+    admiteObservaciones: !!obs,
+    editables,
+  };
+}
+
+/** '30/09/26' o '30/09/2026' → '2026-09-30' (vacío si no es una fecha así). */
+function isoDeImpreso(texto) {
+  const m = /^(\d{1,2})\/(\d{1,2})\/(\d{2}|\d{4})$/.exec(enBlanco(texto));
+  if (!m) return '';
+  const anio = m[3].length === 2 ? `20${m[3]}` : m[3];
+  return `${anio}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}`;
+}
+
+/** '2026-09-30' → '30/09/26' | '30/09/2026' según lo que pide la casilla. */
+function impresoDeIso(iso, formato) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso);
+  if (!m) return iso;
+  return formato === 'DD/MM/AA' ? `${m[3]}/${m[2]}/${m[1].slice(2)}` : `${m[3]}/${m[2]}/${m[1]}`;
+}
+
+/**
+ * Vista previa · aplica sobre `valores` (lo que el sistema llenó, campo → texto)
+ * lo que el administrador corrigió en la pantalla, y devuelve la lista de casillas
+ * editables con su valor para mostrarlas.
+ *
+ * Solo manda lo del usuario si trae algo: dejar una casilla vacía en la pantalla
+ * vuelve al valor del sistema en vez de borrar un dato de la orden. Las fechas
+ * viajan en ISO (lo que da el selector) y se imprimen en el formato de la casilla.
+ */
+function aplicarEditables(lista, valores, delUsuario = {}) {
+  return lista.map((e) => {
+    const sistema = e.partes
+      ? (e.partes.every((p) => enBlanco(valores[p]))
+        ? `${enBlanco(valores[e.partes[2]])}-${enBlanco(valores[e.partes[1]])}-${enBlanco(valores[e.partes[0]])}`
+        : '')
+      : e.fecha ? isoDeImpreso(valores[e.campo]) : enBlanco(valores[e.campo]);
+    const bruto = delUsuario?.[e.campo];
+    let usuario = typeof bruto === 'string'
+      ? (e.multilinea ? bruto.trim() : bruto.replace(/\s+/g, ' ').trim())
+      : '';
+    // Una fecha guardada como texto ("12/10/2026", de antes del selector) se
+    // pasa a ISO: si no, el selector la mostraría en blanco.
+    if ((e.fecha || e.partes) && usuario && !/^\d{4}-\d{2}-\d{2}$/.test(usuario)) {
+      usuario = isoDeImpreso(usuario) || usuario;
+    }
+    if (usuario) {
+      const iso = /^(\d{4})-(\d{2})-(\d{2})$/.exec(usuario);
+      if (e.partes) {
+        if (iso) [valores[e.partes[0]], valores[e.partes[1]], valores[e.partes[2]]] = [iso[3], iso[2], iso[1]];
+      } else {
+        valores[e.campo] = e.fecha ? impresoDeIso(usuario, e.fecha) : usuario;
+      }
+    }
+    return {
+      campo: e.campo,
+      etiqueta: e.etiqueta,
+      multilinea: !!e.multilinea,
+      tipo: e.fecha || e.partes ? 'fecha' : 'texto',
+      valor: usuario || sistema,
+      sistema,
+    };
+  });
+}
+
+/**
+ * Vista previa · escribe un texto libre repartido por palabras sobre renglones
+ * `[x, línea base, ancho]`. Los saltos de línea del usuario se aplanan: en un
+ * formato impreso manda el espacio de las rayas, no el formato del texto. Si no
+ * cabe, el último renglón acaba en "…", que al menos deja ver que falta algo.
+ */
+function escribirRenglones(pagina, font, texto, renglones, tamano = TAMANO_BASE) {
+  const palabras = enBlanco(texto).replace(/\s+/g, ' ').split(' ').filter(Boolean);
+  let i = 0;
+  renglones.forEach(([x, y, ancho], n) => {
+    let linea = '';
+    while (i < palabras.length) {
+      const prueba = linea ? `${linea} ${palabras[i]}` : palabras[i];
+      if (linea && font.widthOfTextAtSize(prueba, tamano) > ancho) break;
+      linea = prueba;
+      i += 1;
+    }
+    if (n === renglones.length - 1 && i < palabras.length) {
+      while (linea.length > 1 && font.widthOfTextAtSize(`${linea}…`, tamano) > ancho) linea = linea.slice(0, -1);
+      linea = `${linea}…`;
+    }
+    if (linea) pagina.drawText(linea, { x, y, size: tamano, font, color: rgb(0, 0, 0) });
+  });
 }
 
 /**

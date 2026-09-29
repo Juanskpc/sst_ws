@@ -1,3 +1,4 @@
+import { PDFDocument } from 'pdf-lib';
 import { Router } from 'express';
 import { pool, withTransaction } from '../../config/db.js';
 import { asyncHandler } from '../../utils/asyncHandler.js';
@@ -901,7 +902,127 @@ router.get('/:id/history', asyncHandler(async (req, res) => {
  * En ese caso no hay transición de estado que registrar (sigue PROGRAMADA), así
  * que la trazabilidad se escribe a mano en el historial.
  */
-router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) => {
+/**
+ * Vista previa de formatos · observaciones por formato que manda la pantalla,
+ * `{ at031: "texto", … }`. Se limpian aquí porque terminan impresas en un
+ * documento que se radica ante la ARL: claves solo alfanuméricas y hasta 500
+ * caracteres por formato. `null` = no vino nada (se conservan las guardadas).
+ */
+function observacionesDeFormatos(bruto) {
+  if (!bruto || typeof bruto !== 'object' || Array.isArray(bruto)) return null;
+  const limpias = {};
+  for (const [clave, valor] of Object.entries(bruto)) {
+    if (!/^[A-Za-z0-9]{1,40}$/.test(clave)) continue;
+    const texto = String(valor ?? '').replace(/\s+/g, ' ').trim();
+    if (texto.length > 500) {
+      throw badRequest('Las observaciones de cada formato admiten hasta 500 caracteres.');
+    }
+    if (texto) limpias[clave] = texto;
+  }
+  return limpias;
+}
+
+/**
+ * Vista previa · casillas abiertas del formato llenadas por el administrador,
+ * `{ fichaAxa: { 'nombre 4': 'texto' } }`. Mismo criterio que las observaciones:
+ * terminan impresas en un documento que se radica. Nombres de campo como los
+ * del PDF ('nombre 4', 'FECHA 2', '28'), claves de formato plano ('empresa') y
+ * 'proxima_fecha', hasta 1.000 caracteres por casilla.
+ */
+function camposDeFormatos(bruto) {
+  if (!bruto || typeof bruto !== 'object' || Array.isArray(bruto)) return null;
+  const limpios = {};
+  for (const [clave, campos] of Object.entries(bruto)) {
+    if (!/^[A-Za-z0-9]{1,40}$/.test(clave) || !campos || typeof campos !== 'object') continue;
+    for (const [campo, valor] of Object.entries(campos)) {
+      if (!/^[A-Za-z0-9 _]{1,40}$/.test(campo)) continue;
+      const texto = String(valor ?? '').trim();
+      if (texto.length > 1000) {
+        throw badRequest('Cada casilla del formato admite hasta 1.000 caracteres.');
+      }
+      if (texto) (limpios[clave] ??= {})[campo] = texto;
+    }
+  }
+  return limpios;
+}
+
+/**
+ * Transacción que SIEMPRE se deshace. Es lo que hace inofensiva la vista previa:
+ * corre la asignación completa —cambio de estado, franjas, formatos— y al final
+ * no queda nada, ni siquiera la secuencia de calendario incrementada.
+ */
+async function enTransaccionDescartable(fn) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    return await fn(client);
+  } finally {
+    await client.query('ROLLBACK').catch(() => {});
+    client.release();
+  }
+}
+
+/**
+ * La copia de la vista previa va APLANADA: sin casillas donde escribir. Lo que se
+ * teclea dentro del visor del navegador no vuelve nunca al servidor, y así se
+ * perdieron textos en la primera prueba de JD&D. Lo editable está en el panel de
+ * la pantalla. El PDF que se ENVÍA conserva sus casillas para el profesional.
+ */
+async function pdfDeSoloLectura(buffer) {
+  try {
+    const doc = await PDFDocument.load(buffer);
+    const form = doc.getForm();
+    if (!form.getFields().length) return Buffer.from(buffer);
+    form.flatten();
+    return Buffer.from(await doc.save());
+  } catch {
+    return Buffer.from(buffer);
+  }
+}
+
+/**
+ * Vista previa de los formatos que saldrán con una asignación, ANTES de enviarla
+ * (pedido de JD&D, 29-sep-2026): el administrador revisa cada PDF y puede
+ * escribir observaciones en él. Mismo cuerpo que `POST /:id/assign` más
+ * `observaciones_formatos`; no guarda nada ni manda correo.
+ */
+router.post('/:id/assign/preview', requireRole('admin'), asyncHandler(async (req, res) => {
+  const result = await enTransaccionDescartable((client) => aplicarAsignacion(req, client, { vistaPrevia: true }));
+  if (!result.completa) {
+    throw badRequest('Reparta todas las horas de la visita para ver los formatos: con media agenda no se envía nada.');
+  }
+  const formatos = [];
+  for (const d of result.docs) {
+    const esPdf = /\.pdf$/i.test(d._filename || '');
+    formatos.push({
+      clave: d._clave,
+      etiqueta: d._etiqueta || d.tipo,
+      nombre: d._filename,
+      prediligenciado: d._prediligenciado !== false,
+      admite_observaciones: !!d._admiteObservaciones,
+      editables: d._editables || [],
+      // Solo los PDF se pueden ver en el navegador; los Word/Excel se listan.
+      pdf: esPdf ? (await pdfDeSoloLectura(d._buffer)).toString('base64') : null,
+    });
+  }
+  res.json({
+    data: {
+      formatos,
+      observaciones_formatos: result.orden.observaciones_formatos || {},
+      campos_formatos: result.orden.campos_formatos || {},
+      soportes: result.entrega?.soportes ?? [],
+    },
+  });
+}));
+
+/**
+ * M5 · Todo lo que una asignación escribe en BD, dentro de la transacción que se
+ * le pase. Lo comparten la asignación real (`POST /:id/assign`, que confirma) y
+ * la VISTA PREVIA de formatos (`POST /:id/assign/preview`, que deshace): así lo
+ * que se ve antes de enviar sale de exactamente el mismo código que lo enviado,
+ * incluidos el suplente, las franjas y las observaciones.
+ */
+async function aplicarAsignacion(req, client, { vistaPrevia = false } = {}) {
   const profesionalId = req.body?.profesional_id || req.body?.professional_id;
   if (!profesionalId) throw badRequest('profesional_id es obligatorio');
 
@@ -919,172 +1040,197 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
   // que repite el valor de al lado invita a leerla como si dijera algo.
   const formatosIdBruto = String(req.body?.profesional_formatos_id ?? '').trim() || null;
 
-  const result = await withTransaction(async (client) => {
-    const prof = await client.query(`SELECT * FROM sst.profesionales WHERE id=$1`, [profesionalId]);
-    if (!prof.rows[0]) throw badRequest('Profesional no existe');
-    if (prof.rows[0].estado !== 'Activo') throw badRequest('El profesional está Inactivo');
+  const observaciones = observacionesDeFormatos(req.body?.observaciones_formatos);
+  const camposUsuario = camposDeFormatos(req.body?.campos_formatos);
 
-    // Se bloquea la fila para que dos asignaciones simultáneas no se pisen.
-    const actual = await client.query(
-      `SELECT estado::text AS estado, profesional_asignado_id, fecha_programada, horas_asignadas
-         FROM sst.ordenes_servicio WHERE id=$1 FOR UPDATE`,
+  const prof = await client.query(`SELECT * FROM sst.profesionales WHERE id=$1`, [profesionalId]);
+  if (!prof.rows[0]) throw badRequest('Profesional no existe');
+  if (prof.rows[0].estado !== 'Activo') throw badRequest('El profesional está Inactivo');
+
+  // Se bloquea la fila para que dos asignaciones simultáneas no se pisen.
+  const actual = await client.query(
+    `SELECT estado::text AS estado, profesional_asignado_id, fecha_programada, horas_asignadas
+       FROM sst.ordenes_servicio WHERE id=$1 FOR UPDATE`,
+    [req.params.id]
+  );
+  if (!actual.rows[0]) throw badRequest('OS no encontrada');
+  const estadoPrevio = actual.rows[0].estado;
+  const esReprogramacion = estadoPrevio === 'PROGRAMADA';
+  if (estadoPrevio !== 'SIN PROGRAMAR' && !esReprogramacion) {
+    throw badRequest(
+      `Una OS en estado ${estadoPrevio} no se puede asignar ni reprogramar.`
+    );
+  }
+
+  // ASG-02 · Nunca más horas de las contratadas con la ARL. La pre-cuenta (M9)
+  // valora `horas_asignadas`, así que programar de más es trabajo que no se
+  // factura; el modal ya lo impide, esto cierra la puerta por si acaso.
+  const horasOrden = actual.rows[0].horas_asignadas;
+  const objetivoMin = Math.round(Number(horasOrden ?? 0) * 60);
+  if (franjas.length && objetivoMin > 0 && minutosDeFranjas(franjas) > objetivoMin) {
+    throw badRequest(
+      `Las franjas suman ${horasTexto(minutosDeFranjas(franjas) / 60)} y la orden tiene ` +
+      `${horasTexto(horasOrden)} asignadas. Quite horas antes de guardar.`
+    );
+  }
+  // Solo se programa cuando la visita está repartida por completo.
+  const completa = cuadranLasHoras(franjas, horasOrden);
+
+  // ASG · El profesional a cuyo nombre salen los formatos. Solo tiene sentido
+  // si está REGISTRADO ante la ARL de esta orden: el punto entero de la
+  // petición es que Bolívar solo acepta radicados a nombre de los suyos, así
+  // que dejar poner a cualquiera devolvería el formato al mismo problema.
+  const formatosProf = await resolverProfesionalDeFormatos(
+    { ordenId: req.params.id, ejecutorId: profesionalId, elegidoId: formatosIdBruto }, client,
+  );
+
+  // ASG-05 · La secuencia sube en el mismo UPDATE que la fecha: si se llevara
+  // aparte, dos reprogramaciones seguidas podrían mandar el mismo SEQUENCE y
+  // el calendario del profesional ignoraría la segunda.
+  // PRE-02 · La orden se queda con el valor hora que le corresponde HOY a este
+  // profesional, congelado. Si mañana cambia el catálogo o su tarifa, lo ya
+  // asignado sigue valiendo lo mismo: una cuenta de cobro no puede moverse
+  // sola por un ajuste de precios posterior.
+  //
+  // Se recalcula en cada asignación a propósito: cambiar de profesional cambia
+  // lo que se paga, y la orden todavía no se ha ejecutado.
+  const tarifa = await valorHoraDeOrden(
+    { ordenId: req.params.id, profesional: prof.rows[0] }, client,
+  );
+
+  const guardada = await client.query(
+    `UPDATE sst.ordenes_servicio
+        SET profesional_asignado_id=$2,
+            fecha_programada=$3,
+            valor_hora_cobro=$4,
+            valor_hora_origen=$5,
+            profesional_formatos_id=$6,
+            secuencia_calendario = secuencia_calendario + 1
+      WHERE id=$1
+    RETURNING secuencia_calendario`,
+    [
+      req.params.id, profesionalId, fechaProgramada, tarifa.valorHora, tarifa.origen,
+      formatosProf?.id ?? null,
+    ]
+  );
+
+  // ASG-02 · Las franjas se reemplazan en bloque: reprogramar es volver a
+  // decidir toda la visita, y conservar las viejas dejaría horas fantasma en
+  // la agenda del profesional. Solo se tocan si el cliente mandó franjas, para
+  // no borrar las de una asignación que solo cambia de profesional.
+  let franjasPrevias = 0;
+  if (franjas.length) {
+    const antes = await client.query(
+      `DELETE FROM sst.franjas_visita WHERE orden_id=$1 RETURNING id`,
       [req.params.id]
     );
-    if (!actual.rows[0]) throw badRequest('OS no encontrada');
-    const estadoPrevio = actual.rows[0].estado;
-    const esReprogramacion = estadoPrevio === 'PROGRAMADA';
-    if (estadoPrevio !== 'SIN PROGRAMAR' && !esReprogramacion) {
-      throw badRequest(
-        `Una OS en estado ${estadoPrevio} no se puede asignar ni reprogramar.`
+    franjasPrevias = antes.rowCount;
+    for (const f of franjas) {
+      await client.query(
+        `INSERT INTO sst.franjas_visita (orden_id, fecha, hora_inicio, hora_fin, creado_por)
+         VALUES ($1,$2,$3,$4,$5)`,
+        [req.params.id, f.fecha, f.hora_inicio, f.hora_fin, req.user.sub]
       );
     }
+  }
 
-    // ASG-02 · Nunca más horas de las contratadas con la ARL. La pre-cuenta (M9)
-    // valora `horas_asignadas`, así que programar de más es trabajo que no se
-    // factura; el modal ya lo impide, esto cierra la puerta por si acaso.
-    const horasOrden = actual.rows[0].horas_asignadas;
-    const objetivoMin = Math.round(Number(horasOrden ?? 0) * 60);
-    if (franjas.length && objetivoMin > 0 && minutosDeFranjas(franjas) > objetivoMin) {
-      throw badRequest(
-        `Las franjas suman ${horasTexto(minutosDeFranjas(franjas) / 60)} y la orden tiene ` +
-        `${horasTexto(horasOrden)} asignadas. Quite horas antes de guardar.`
-      );
-    }
-    // Solo se programa cuando la visita está repartida por completo.
-    const completa = cuadranLasHoras(franjas, horasOrden);
-
-    // ASG · El profesional a cuyo nombre salen los formatos. Solo tiene sentido
-    // si está REGISTRADO ante la ARL de esta orden: el punto entero de la
-    // petición es que Bolívar solo acepta radicados a nombre de los suyos, así
-    // que dejar poner a cualquiera devolvería el formato al mismo problema.
-    const formatosProf = await resolverProfesionalDeFormatos(
-      { ordenId: req.params.id, ejecutorId: profesionalId, elegidoId: formatosIdBruto }, client,
-    );
-
-    // ASG-05 · La secuencia sube en el mismo UPDATE que la fecha: si se llevara
-    // aparte, dos reprogramaciones seguidas podrían mandar el mismo SEQUENCE y
-    // el calendario del profesional ignoraría la segunda.
-    // PRE-02 · La orden se queda con el valor hora que le corresponde HOY a este
-    // profesional, congelado. Si mañana cambia el catálogo o su tarifa, lo ya
-    // asignado sigue valiendo lo mismo: una cuenta de cobro no puede moverse
-    // sola por un ajuste de precios posterior.
-    //
-    // Se recalcula en cada asignación a propósito: cambiar de profesional cambia
-    // lo que se paga, y la orden todavía no se ha ejecutado.
-    const tarifa = await valorHoraDeOrden(
-      { ordenId: req.params.id, profesional: prof.rows[0] }, client,
-    );
-
-    const guardada = await client.query(
-      `UPDATE sst.ordenes_servicio
-          SET profesional_asignado_id=$2,
-              fecha_programada=$3,
-              valor_hora_cobro=$4,
-              valor_hora_origen=$5,
-              profesional_formatos_id=$6,
-              secuencia_calendario = secuencia_calendario + 1
-        WHERE id=$1
-      RETURNING secuencia_calendario`,
+  // EST · El estado lo decide si la visita está COMPLETA, no el hecho de haber
+  // elegido profesional: una orden de 10 h con 6 h repartidas sigue teniendo
+  // trabajo pendiente y debe seguir apareciendo entre las que hay que programar.
+  if (esReprogramacion && completa) {
+    // EST-03 · La reprogramación no cambia el estado, pero sí debe quedar en
+    // la auditoría: sin esto, mover la visita de fecha sería invisible.
+    const cambioProf = actual.rows[0].profesional_asignado_id !== profesionalId;
+    await client.query(
+      `INSERT INTO sst.historial_estados_orden (orden_id, estado_anterior, estado_nuevo, cambiado_por, motivo)
+       VALUES ($1,'PROGRAMADA','PROGRAMADA',$2,$3)`,
       [
-        req.params.id, profesionalId, fechaProgramada, tarifa.valorHora, tarifa.origen,
-        formatosProf?.id ?? null,
+        req.params.id, req.user.sub,
+        `Reprogramación: ${cambioProf ? 'cambio de profesional y ' : ''}nueva fecha ` +
+        `${fechaCO(fechaProgramada)}.`,
       ]
     );
+  } else if (esReprogramacion && !completa) {
+    // Se le quitaron horas a una visita ya programada: vuelve a la bandeja.
+    await changeStatus({
+      orderId: req.params.id, newStatus: 'SIN PROGRAMAR', userId: req.user.sub,
+      motivo: `Reprogramación incompleta: ${horasTexto(minutosDeFranjas(franjas) / 60)} de ` +
+              `${horasTexto(horasOrden)} repartidas.`,
+    }, client);
+  } else if (completa) {
+    // EST · SIN PROGRAMAR → PROGRAMADA (valida transición + auditoría).
+    await changeStatus({ orderId: req.params.id, newStatus: 'PROGRAMADA', userId: req.user.sub }, client);
+  }
+  // Caso restante (SIN PROGRAMAR + visita incompleta): se guardan profesional y
+  // franjas, y la OS se queda donde está a la espera de las horas que faltan.
 
-    // ASG-02 · Las franjas se reemplazan en bloque: reprogramar es volver a
-    // decidir toda la visita, y conservar las viejas dejaría horas fantasma en
-    // la agenda del profesional. Solo se tocan si el cliente mandó franjas, para
-    // no borrar las de una asignación que solo cambia de profesional.
-    let franjasPrevias = 0;
-    if (franjas.length) {
-      const antes = await client.query(
-        `DELETE FROM sst.franjas_visita WHERE orden_id=$1 RETURNING id`,
-        [req.params.id]
-      );
-      franjasPrevias = antes.rowCount;
-      for (const f of franjas) {
-        await client.query(
-          `INSERT INTO sst.franjas_visita (orden_id, fecha, hora_inicio, hora_fin, creado_por)
-           VALUES ($1,$2,$3,$4,$5)`,
-          [req.params.id, f.fecha, f.hora_inicio, f.hora_fin, req.user.sub]
-        );
-      }
-    }
-
-    // EST · El estado lo decide si la visita está COMPLETA, no el hecho de haber
-    // elegido profesional: una orden de 10 h con 6 h repartidas sigue teniendo
-    // trabajo pendiente y debe seguir apareciendo entre las que hay que programar.
-    if (esReprogramacion && completa) {
-      // EST-03 · La reprogramación no cambia el estado, pero sí debe quedar en
-      // la auditoría: sin esto, mover la visita de fecha sería invisible.
-      const cambioProf = actual.rows[0].profesional_asignado_id !== profesionalId;
-      await client.query(
-        `INSERT INTO sst.historial_estados_orden (orden_id, estado_anterior, estado_nuevo, cambiado_por, motivo)
-         VALUES ($1,'PROGRAMADA','PROGRAMADA',$2,$3)`,
-        [
-          req.params.id, req.user.sub,
-          `Reprogramación: ${cambioProf ? 'cambio de profesional y ' : ''}nueva fecha ` +
-          `${fechaCO(fechaProgramada)}.`,
-        ]
-      );
-    } else if (esReprogramacion && !completa) {
-      // Se le quitaron horas a una visita ya programada: vuelve a la bandeja.
-      await changeStatus({
-        orderId: req.params.id, newStatus: 'SIN PROGRAMAR', userId: req.user.sub,
-        motivo: `Reprogramación incompleta: ${horasTexto(minutosDeFranjas(franjas) / 60)} de ` +
-                `${horasTexto(horasOrden)} repartidas.`,
-      }, client);
-    } else if (completa) {
-      // EST · SIN PROGRAMAR → PROGRAMADA (valida transición + auditoría).
-      await changeStatus({ orderId: req.params.id, newStatus: 'PROGRAMADA', userId: req.user.sub }, client);
-    }
-    // Caso restante (SIN PROGRAMAR + visita incompleta): se guardan profesional y
-    // franjas, y la OS se queda donde está a la espera de las horas que faltan.
-
-    // FOR · genera formatos auto-diligenciados (al reprogramar salen con los
-    // datos nuevos). Solo si la visita está completa: un formato con media
-    // agenda impresa habría que rehacerlo, y quedaría archivado en
-    // `documentos_generados` como si fuera bueno.
-    const docs = completa ? await generateOrderDocuments(req.params.id, client) : [];
-
-    // SUP · Qué soportes tendrá que devolver, CONGELADO aquí.
-    //
-    // Sale de la misma regla que acaba de decidir los formatos, y se guarda en
-    // vez de recalcularse cada vez que el profesional abre el portal: el enlace
-    // ya va camino de su correo con una lista concreta de documentos, y cambiar
-    // una regla la semana que viene no puede alterar lo que se le pidió hoy.
-    const entrega = entregaDeLaOrden(await getOrderExpanded(req.params.id, client));
-    if (completa) {
-      await client.query(
-        `UPDATE sst.ordenes_servicio SET soportes_requeridos = $2 WHERE id = $1`,
-        [req.params.id, entrega.soportes],
-      );
-    }
-
-    // Enlace público de soportes (M6). Al reprogramar se conserva el enlace
-    // vigente: emitir uno nuevo invalidaría el que ya se le envió al profesional.
-    const vigente = await client.query(
-      `SELECT token FROM sst.enlaces_publicos WHERE orden_id=$1 AND activo ORDER BY creado_en DESC LIMIT 1`,
-      [req.params.id]
+  // FOR · genera formatos auto-diligenciados (al reprogramar salen con los
+  // datos nuevos). Solo si la visita está completa: un formato con media
+  // agenda impresa habría que rehacerlo, y quedaría archivado en
+  // `documentos_generados` como si fuera bueno.
+  // Vista previa de formatos (29-sep) · lo que el administrador escribió en la
+  // casilla de observaciones de cada formato. Se guarda en la orden ANTES de
+  // generar, que es de donde lo lee `generateOrderDocuments`. Si no viene en el
+  // cuerpo, se conservan las que ya tenía: reprogramar no las borra.
+  if (observaciones) {
+    await client.query(
+      `UPDATE sst.ordenes_servicio SET observaciones_formatos = $2 WHERE id = $1`,
+      [req.params.id, observaciones],
     );
-    let token = vigente.rows[0]?.token;
-    if (!token) {
-      token = randomToken(24);
-      await client.query(
-        `INSERT INTO sst.enlaces_publicos (orden_id, token) VALUES ($1,$2)`,
-        [req.params.id, token]
-      );
-    }
+  }
+  if (camposUsuario) {
+    await client.query(
+      `UPDATE sst.ordenes_servicio SET campos_formatos = $2 WHERE id = $1`,
+      [req.params.id, camposUsuario],
+    );
+  }
 
-    const orden = await getOrderExpanded(req.params.id, client);
-    return {
-      orden, profesional: prof.rows[0], docs, token, esReprogramacion, completa, entrega,
-      formatosProf,
-      secuenciaCalendario: guardada.rows[0].secuencia_calendario,
-      franjas: await franjasDeOrden(req.params.id, client),
-      franjasPrevias,
-    };
-  });
+  // En la vista previa se generan igual, pero sin subirlos ni registrarlos.
+  const docs = completa
+    ? await generateOrderDocuments(req.params.id, client, { guardar: !vistaPrevia })
+    : [];
+
+  // SUP · Qué soportes tendrá que devolver, CONGELADO aquí.
+  //
+  // Sale de la misma regla que acaba de decidir los formatos, y se guarda en
+  // vez de recalcularse cada vez que el profesional abre el portal: el enlace
+  // ya va camino de su correo con una lista concreta de documentos, y cambiar
+  // una regla la semana que viene no puede alterar lo que se le pidió hoy.
+  const entrega = entregaDeLaOrden(await getOrderExpanded(req.params.id, client));
+  if (completa) {
+    await client.query(
+      `UPDATE sst.ordenes_servicio SET soportes_requeridos = $2 WHERE id = $1`,
+      [req.params.id, entrega.soportes],
+    );
+  }
+
+  // Enlace público de soportes (M6). Al reprogramar se conserva el enlace
+  // vigente: emitir uno nuevo invalidaría el que ya se le envió al profesional.
+  const vigente = await client.query(
+    `SELECT token FROM sst.enlaces_publicos WHERE orden_id=$1 AND activo ORDER BY creado_en DESC LIMIT 1`,
+    [req.params.id]
+  );
+  let token = vigente.rows[0]?.token;
+  if (!token) {
+    token = randomToken(24);
+    await client.query(
+      `INSERT INTO sst.enlaces_publicos (orden_id, token) VALUES ($1,$2)`,
+      [req.params.id, token]
+    );
+  }
+
+  const orden = await getOrderExpanded(req.params.id, client);
+  return {
+    orden, profesional: prof.rows[0], docs, token, esReprogramacion, completa, entrega,
+    formatosProf,
+    secuenciaCalendario: guardada.rows[0].secuencia_calendario,
+    franjas: await franjasDeOrden(req.params.id, client),
+    franjasPrevias,
+  };
+}
+
+router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) => {
+  const result = await withTransaction((client) => aplicarAsignacion(req, client));
 
   // Visita a medio repartir: se guarda el avance, pero no se avisa a nadie. Un
   // correo con media agenda mandaría al profesional a una visita que todavía se
