@@ -60,9 +60,14 @@ async function resolverValorHora(
   // `tipo_actividad` (el título que trae la ARL, "CAP SEGURIDAD VIAL") se sigue
   // mirando después por las órdenes viejas, que es de donde salía antes.
   for (const clave of [tipoOrden, tipoActividad].filter(Boolean)) {
+    // T0-10 · Misma regla que la asignación (`valorHoraDeOrden`): por id del tipo
+    // cuando el nombre lo identifica, y por nombre NORMALIZADO (`sst.norm_texto`)
+    // para las tarifas sin tipo y para el título de las órdenes viejas.
     const r = await client.query(
       `SELECT valor_hora FROM sst.tarifas_actividad_profesional
-        WHERE profesional_id=$1 AND lower(actividad)=lower($2) AND vigente_desde <= $3::date
+        WHERE profesional_id=$1 AND vigente_desde <= $3::date
+          AND (tipo_orden_id = (SELECT id FROM sst.tipos_orden WHERE sst.norm_texto(nombre) = sst.norm_texto($2) LIMIT 1)
+               OR (tipo_orden_id IS NULL AND sst.norm_texto(actividad) = sst.norm_texto($2)))
         ORDER BY vigente_desde DESC LIMIT 1`,
       [profesionalId, clave, hasta]
     );
@@ -70,7 +75,7 @@ async function resolverValorHora(
   }
   if (tipoOrden) {
     const t = await client.query(
-      `SELECT valor_hora FROM sst.tipos_orden WHERE lower(btrim(nombre))=lower(btrim($1))`,
+      `SELECT valor_hora FROM sst.tipos_orden WHERE sst.norm_texto(nombre) = sst.norm_texto($1) LIMIT 1`,
       [tipoOrden]
     );
     if (Number(t.rows[0]?.valor_hora) > 0) {

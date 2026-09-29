@@ -37,6 +37,35 @@ const DRAFT_SELECT = `
          -- formatos y los correos. El nombre del borrador es lo que leyó la IA
          -- del documento, y tras una corrección deja de ser cierto.
          o.empresa_nombre AS os_empresa_nombre,
+         -- T0-18 · TODOS los campos que la vista Órdenes deja corregir
+         -- (CAMPOS_EDITABLES de orders.routes.js, menos los que ya viajan
+         -- aparte). El detalle se construye desde el JSON del borrador, y sin
+         -- esto una corrección hecha con PUT /orders/:id se guardaba en la OS pero
+         -- al recargar se veía el valor viejo, que es el que leyó la IA. Va en un
+         -- solo objeto para que el frontend lo superponga con una sola función
+         -- (camposDesdeOS); NULL mientras el borrador no tiene OS. El tema y el
+         -- AGR entran aquí: el tema ni existe en el borrador.
+         CASE WHEN o.id IS NULL THEN NULL ELSE jsonb_build_object(
+           'numero_orden', o.numero_orden, 'nro_afiliacion', o.nro_afiliacion,
+           'codigo_cronograma', o.codigo_cronograma, 'secuencia', o.secuencia,
+           'nit_nic', o.nit_nic, 'empresa_nombre', o.empresa_nombre,
+           'actividad_economica', o.actividad_economica, 'horas_asignadas', o.horas_asignadas,
+           'tipo_actividad', o.tipo_actividad, 'modalidad', o.modalidad,
+           'valor_unitario', o.valor_unitario, 'valor_total', o.valor_total,
+           'fecha_orden', o.fecha_orden, 'fecha_vencimiento', o.fecha_vencimiento,
+           'ciudad_ejecucion', o.ciudad_ejecucion, 'direccion', o.direccion,
+           'contacto_empresa_nombre', o.contacto_empresa_nombre,
+           'contacto_empresa_cargo', o.contacto_empresa_cargo,
+           'contacto_empresa_telefono', o.contacto_empresa_telefono,
+           'contacto_sst_nombre', o.contacto_sst_nombre,
+           'contacto_sst_telefono', o.contacto_sst_telefono,
+           'contacto_sst_correo', o.contacto_sst_correo, 'descripcion', o.descripcion,
+           'tipo_servicio_arl', o.tipo_servicio_arl, 'modalidad_ejecucion', o.modalidad_ejecucion,
+           'asesor_gestion_riesgo', o.asesor_gestion_riesgo, 'tema_actividad', o.tema_actividad
+         ) END AS os_campos,
+         -- T0-07 · Aprobación de la ARL y n.º de prefactura (Bolívar).
+         o.estado_arl::text AS os_estado_arl,
+         o.numero_prefactura AS os_numero_prefactura,
          -- CFG-04 · La categoría con la que se cobra. Manda la de la OS cuando
          -- existe: el borrador es lo que se eligió al importar, y la orden pudo
          -- corregirse después.
@@ -426,9 +455,10 @@ export async function materializarOrden(draftId, userId, client) {
        fecha_orden, fecha_vencimiento, ciudad_ejecucion, direccion, descripcion,
        contacto_empresa_nombre, contacto_empresa_cargo, contacto_empresa_telefono,
        contacto_sst_nombre, contacto_sst_telefono, contacto_sst_correo,
-       lote_importacion_id, url_archivo_original, metadatos_extraccion, viaticos_tipo_id, estado)
+       lote_importacion_id, url_archivo_original, metadatos_extraccion, viaticos_tipo_id,
+       asesor_gestion_riesgo, estado)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,
-             $20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,'SIN PROGRAMAR')
+             $20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,'SIN PROGRAMAR')
      RETURNING *`,
     [
       codigo, draft.arl_id, numeroOrden, cron, sec, val('nro_afiliacion'),
@@ -448,6 +478,9 @@ export async function materializarOrden(draftId, userId, client) {
       val('contacto_sst_nombre'), val('contacto_sst_telefono'), val('contacto_sst_correo'),
       draft.lote_importacion_id, draft.url_archivo_original, m,
       tipoViatico ? tipoViatico.id : null,
+      // El AGR viene del SIPAB de Bolívar (casilla 16 del AT-031); en AXA y
+      // Colmena la columna no existe y queda NULL.
+      val('asesor_gestion_riesgo'),
     ]
   );
   const orden = ord.rows[0];

@@ -545,6 +545,77 @@ DO $$ BEGIN
   END IF;
 END $$;
 
+-- ⭐ FOR · AGR y tema/actividad de Bolívar (revisiones del cliente, 27-sep-2026).
+--
+-- `asesor_gestion_riesgo` es el Asesor de Gestión del Riesgo de la ARL (casilla
+-- 16 del AT-031). Lo trae el SIPAB en la columna "Nombre Asesor Gestion
+-- Riesgos", que hasta ahora se descartaba, y el formato salía con la casilla en
+-- blanco. Solo lo trae Bolívar: en AXA y Colmena queda NULL. En el BORRADOR no
+-- lleva columna: viaja dentro de `metadatos_extraccion` (`CAMPOS_REVISION`),
+-- como el tipo de actividad.
+--
+-- `tema_actividad` es el texto propio del tema o actividad, más largo que el
+-- título del SIPAB, que en los AT-031 reales se escribía a mano en papel. Lo
+-- teclea quien administra la orden; sale en "Temas desarrollados" del AT-031 y en
+-- "Tema y/o actividad" del AT-028. Aplica a cualquier ARL, pero solo Bolívar
+-- lo imprime.
+--
+-- ⚠️ Trampa 69: `vw_ordenes_expandidas` es `SELECT o.*` y congela la lista de
+-- columnas al crearse. Más abajo se suelta y se recrea siempre, así que basta
+-- con que estos ALTER queden ANTES de ella.
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS asesor_gestion_riesgo TEXT;
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS tema_actividad        TEXT;
+
+-- 29-sep-2026 · Observaciones que el administrador escribe en la VISTA PREVIA de
+-- los formatos, antes de enviarlos al profesional: `{ "<formato>": "texto" }`,
+-- con la clave del formato de `formatos-arl.service.js` (at031, at028,
+-- prestacionColmena, asistenciaColmena). Se guardan en la orden y no solo en el
+-- PDF para que reprogramar o regenerar los formatos no las pierda.
+ALTER TABLE sst.ordenes_servicio
+  ADD COLUMN IF NOT EXISTS observaciones_formatos JSONB NOT NULL DEFAULT '{}'::jsonb;
+-- Y las casillas que el formato deja abiertas, llenadas en esa misma vista previa:
+-- `{ "<formato>": { "<campo del PDF>": "texto" } }`.
+ALTER TABLE sst.ordenes_servicio
+  ADD COLUMN IF NOT EXISTS campos_formatos JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+-- ⭐ T0-07 · Estado ARL + n.º de prefactura (revisiones del cliente, 27-sep-2026).
+--
+-- Eje propio, independiente del ciclo operativo y del de cobro: dice si la ARL
+-- APROBÓ en su plataforma los documentos de la orden. Esa aprobación es la
+-- condición para facturar (`PATCH /orders/cobro` rechaza FACTURADA en una orden
+-- PENDIENTE). Son DOS valores por decisión por defecto (Q-08 puede añadir más);
+-- la lista está copiada en `orders.routes.js` y en `core/models.ts`: se tocan
+-- los tres o ninguno.
+--
+-- `numero_prefactura` es el "código SIPAB" de Bolívar (160441…): una prefactura
+-- agrupa varias órdenes, así que el mismo número se repite entre ellas. Solo
+-- tiene sentido en Bolívar; las demás ARL lo dejan NULL.
+DO $$ BEGIN
+  CREATE TYPE sst.estado_arl AS ENUM ('PENDIENTE','APROBADO');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+ALTER TABLE sst.ordenes_servicio
+  ADD COLUMN IF NOT EXISTS estado_arl sst.estado_arl NOT NULL DEFAULT 'PENDIENTE';
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS numero_prefactura TEXT;
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS estado_arl_en     TIMESTAMPTZ;
+ALTER TABLE sst.ordenes_servicio
+  ADD COLUMN IF NOT EXISTS estado_arl_por UUID REFERENCES sst.usuarios(id) ON DELETE SET NULL;
+
+-- Historial del eje, en el mismo espíritu que `historial_cobro_orden`. `origen`
+-- distingue el cambio hecho a mano del que traiga la carga de la prefactura
+-- (T0-09). Se escribe también cuando solo cambia el número de prefactura.
+CREATE TABLE IF NOT EXISTS sst.historial_estado_arl (
+  id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  orden_id          UUID NOT NULL REFERENCES sst.ordenes_servicio(id) ON DELETE CASCADE,
+  estado_anterior   sst.estado_arl,
+  estado_nuevo      sst.estado_arl NOT NULL,
+  numero_prefactura TEXT,
+  usuario_id        UUID REFERENCES sst.usuarios(id) ON DELETE SET NULL,
+  origen            TEXT NOT NULL DEFAULT 'MANUAL' CHECK (origen IN ('MANUAL','PREFACTURA')),
+  creado_en         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_historial_estado_arl ON sst.historial_estado_arl(orden_id, creado_en);
+
 -- ⭐ SUP · QUÉ soportes tiene que entregar ESTA orden (ago-2026).
 --
 -- El portal pedía siempre las mismas tres casillas (acta, asistencia,
@@ -944,6 +1015,97 @@ CREATE TABLE IF NOT EXISTS sst.tarifas_actividad_profesional (
   vigente_desde  DATE NOT NULL DEFAULT CURRENT_DATE,
   creado_en      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- ⭐ T0-10 · La tarifa apunta al TIPO DE ORDEN por id (27-sep-2026).
+--
+-- Antes se casaba `lower(actividad) = lower(tipo.nombre)`: texto libre contra
+-- texto libre. "Capacitacion" (sin tilde), un doble espacio o un tipo renombrado
+-- en el catálogo no casaban nunca, y la orden caía al valor del tipo —el
+-- "estándar"— sin que nadie lo notara: la cuenta de cobro salía con el valor
+-- equivocado y parecía correcta.
+--
+-- `actividad` se conserva como texto (historial y filas sin tipo), pero la
+-- búsqueda es por `tipo_orden_id`. Las filas anteriores se enlazan por nombre
+-- normalizado; las que no casen quedan en NULL —la pantalla las marca— y siguen
+-- funcionando por el respaldo de nombre normalizado, no se pierden.
+--
+-- `sst.norm_texto` es LA ÚNICA normalización (minúsculas, sin tildes, espacios
+-- colapsados y recortados): la usan la asignación, la cuenta de cobro y este
+-- backfill, para que no vuelvan a haber tres copias que discrepen. Se escribe con
+-- `translate` y no con la extensión `unaccent`, que no está en todos los
+-- servidores.
+CREATE OR REPLACE FUNCTION sst.norm_texto(t TEXT) RETURNS TEXT
+LANGUAGE sql IMMUTABLE AS $$
+  SELECT btrim(regexp_replace(
+    translate(lower(coalesce(t, '')), 'áéíóúüñ', 'aeiouun'), '\s+', ' ', 'g'))
+$$;
+
+ALTER TABLE sst.tarifas_actividad_profesional
+  ADD COLUMN IF NOT EXISTS tipo_orden_id UUID REFERENCES sst.tipos_orden(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_tarifas_prof_tipo
+  ON sst.tarifas_actividad_profesional(profesional_id, tipo_orden_id);
+
+UPDATE sst.tarifas_actividad_profesional ta
+   SET tipo_orden_id = t.id
+  FROM sst.tipos_orden t
+ WHERE ta.tipo_orden_id IS NULL
+   AND sst.norm_texto(ta.actividad) = sst.norm_texto(t.nombre);
+
+-- ⭐ T0-09 · Prefacturas de Bolívar, cargadas con IA (27-sep-2026).
+--
+-- Bolívar emite una prefactura POR PLAN (1 PECAT, 250 PECAT PYME, 170 PLAN MIA
+-- P…) con un número propio y una fecha de corte; cada fila es una orden que le
+-- tocó a esa prefactura, identificada por `(codigo_cronograma, secuencia)` —la
+-- misma pareja que identifica la orden en `sst.ordenes_servicio` (Bolívar no usa
+-- `numero_orden`). El PDF se extrae con IA (OpenAI) y se previsualiza antes de
+-- aplicar: `sst.prefacturas` es el encabezado, `sst.prefactura_filas` el detalle.
+--
+-- `numero_prefactura` es ÚNICO: cargar el mismo PDF dos veces no duplica la
+-- prefactura (se hace `ON CONFLICT` al aplicar), y las filas tienen su propio
+-- único por `(prefactura_id, codigo_cronograma, secuencia)` por el mismo motivo.
+-- `orden_id` queda NULL en las filas que no cruzaron con ninguna OS de Orbita
+-- (la prefactura trae órdenes de OTROS proveedores además de JD&D — no todas
+-- tienen por qué existir aquí).
+CREATE TABLE IF NOT EXISTS sst.prefacturas (
+  id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  numero_prefactura TEXT NOT NULL,
+  plan_codigo       TEXT,
+  plan_descripcion  TEXT,
+  fecha_corte       DATE,
+  valor_total       NUMERIC(14,2),
+  nombre_archivo    TEXT,
+  cargada_por       UUID REFERENCES sst.usuarios(id) ON DELETE SET NULL,
+  cargada_en        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  actualizada_en    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_prefacturas_numero ON sst.prefacturas(numero_prefactura);
+
+CREATE TABLE IF NOT EXISTS sst.prefactura_filas (
+  id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  prefactura_id      UUID NOT NULL REFERENCES sst.prefacturas(id) ON DELETE CASCADE,
+  -- La orden de Orbita con la que cruzó, si existe. Se resuelve al previsualizar
+  -- y se vuelve a resolver al aplicar (por si cambió algo entre medias).
+  orden_id           UUID REFERENCES sst.ordenes_servicio(id) ON DELETE SET NULL,
+  codigo_cronograma  TEXT NOT NULL,
+  secuencia          TEXT NOT NULL,
+  nit_empresa        TEXT,
+  razon_social       TEXT,
+  actividad_programa TEXT,
+  valor_actividad    NUMERIC(14,2),
+  alimentacion       NUMERIC(14,2) NOT NULL DEFAULT 0,
+  alojamiento        NUMERIC(14,2) NOT NULL DEFAULT 0,
+  transporte         NUMERIC(14,2) NOT NULL DEFAULT 0,
+  material           NUMERIC(14,2) NOT NULL DEFAULT 0,
+  tiempo_muerto      NUMERIC(14,2) NOT NULL DEFAULT 0,
+  valor_a_facturar   NUMERIC(14,2),
+  -- Si esta fila llegó a marcar la orden como APROBADA (quedó marcada y pasó las
+  -- reglas al aplicar). Una fila sin aplicar puede volver a intentarse después.
+  aplicada           BOOLEAN NOT NULL DEFAULT FALSE,
+  creado_en          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_prefactura_filas_fila
+  ON sst.prefactura_filas(prefactura_id, codigo_cronograma, secuencia);
+CREATE INDEX IF NOT EXISTS idx_prefactura_filas_orden ON sst.prefactura_filas(orden_id);
 
 CREATE TABLE IF NOT EXISTS sst.precuentas (
   id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1376,7 +1538,8 @@ UPDATE sst.ordenes_servicio o
           FROM sst.tarifas_actividad_profesional ta
          WHERE ta.profesional_id = o2.profesional_asignado_id
            AND tp.nombre IS NOT NULL
-           AND lower(ta.actividad) = lower(tp.nombre)
+           AND (ta.tipo_orden_id = tp.id
+                OR (ta.tipo_orden_id IS NULL AND sst.norm_texto(ta.actividad) = sst.norm_texto(tp.nombre)))
          ORDER BY ta.vigente_desde DESC LIMIT 1
       ) t ON true
      WHERE o2.valor_hora_cobro IS NULL

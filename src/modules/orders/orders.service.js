@@ -3,7 +3,7 @@ import { notFound } from '../../utils/httpError.js';
 import { storage } from '../../services/storage.service.js';
 import { generateFormatoPdf } from '../../services/pdf.service.js';
 import {
-  ALIADO_POR_DEFECTO, generarFormatosArl, tieneFormatosPropios,
+  ALIADO_POR_DEFECTO, generarFormatosArl, slugArl, tieneFormatosPropios,
 } from '../../services/formatos-arl.service.js';
 
 /** Carga una OS expandida (con nombres de ARL/profesional) o lanza 404. */
@@ -57,6 +57,31 @@ export async function changeStatus({ orderId, newStatus, userId, motivo = null }
 }
 
 /** Identidad de JD&D ante las ARL, editable desde `sst.configuracion`. */
+/**
+ * El PDF con el que se importó una orden de Colmena: es su informe de
+ * prestación (SPM-F 38) y el formato sale escrito encima de él. Vive en el lote
+ * de importación, no en la orden. Solo Colmena lo usa; cualquier fallo (orden
+ * cargada a mano, archivo borrado del almacenamiento) devuelve null y el
+ * generador vuelve a la plantilla, en vez de dejar la asignación sin formatos.
+ */
+async function pdfOriginalDeColmena(orderId, arlNombre, client = pool) {
+  if (!slugArl(arlNombre).includes('colmena')) return null;
+  const r = await client.query(
+    `SELECT l.url_archivo, l.tipo_mime
+       FROM sst.ordenes_servicio o JOIN sst.lotes_importacion l ON l.id = o.lote_importacion_id
+      WHERE o.id = $1`,
+    [orderId]
+  );
+  const lote = r.rows[0];
+  if (!lote?.url_archivo || !/pdf/i.test(`${lote.tipo_mime} ${lote.url_archivo}`)) return null;
+  try {
+    return await storage.get(lote.url_archivo);
+  } catch (err) {
+    console.warn(`[formatos] no se pudo leer el PDF original de la orden ${orderId}: ${err.message}`);
+    return null;
+  }
+}
+
 async function aliadoEstrategico(client = pool) {
   const r = await client.query(`SELECT valor FROM sst.configuracion WHERE clave='aliado_estrategico'`);
   const guardado = r.rows[0]?.valor;
@@ -78,8 +103,13 @@ async function aliadoEstrategico(client = pool) {
  * Adjuntar los dos a la vez dejaría al profesional eligiendo entre dos hojas
  * parecidas sin saber cuál vale, así que en cuanto una ARL tiene formato propio
  * sus plantillas genéricas dejan de emitirse.
+ *
+ * `guardar: false` es la VISTA PREVIA de la asignación: genera los mismos PDF
+ * pero no los sube al almacenamiento ni los registra en `documentos_generados`.
+ * Las observaciones escritas en la vista previa llegan en
+ * `ordenes_servicio.observaciones_formatos` (ya actualizada en la transacción).
  */
-export async function generateOrderDocuments(orderId, client = pool) {
+export async function generateOrderDocuments(orderId, client = pool, { guardar = true } = {}) {
   const order = await getOrderExpanded(orderId, client);
   // ASG · El nombre que va IMPRESO es el del profesional registrado ante la ARL
   // cuando la orden lleva suplente (`profesional_formatos_id`), y el del ejecutor
@@ -102,12 +132,27 @@ export async function generateOrderDocuments(orderId, client = pool) {
   const propios = tieneFormatosPropios(order.arl_nombre)
     ? await generarFormatosArl({
         orden: order, profesional: professional, franjas, aliado: await aliadoEstrategico(client),
+        original: await pdfOriginalDeColmena(orderId, order.arl_nombre, client),
+        observaciones: order.observaciones_formatos || {},
+        campos: order.campos_formatos || {},
       })
     : [];
 
   const created = [];
 
   for (const formato of propios) {
+    // `_clave` y `_admiteObservaciones` son para la vista previa: con qué clave
+    // se guardan las observaciones de este formato y si tiene dónde escribirlas.
+    const extra = {
+      _buffer: formato.buffer, _filename: formato.filename,
+      _etiqueta: formato.etiqueta, _prediligenciado: formato.prediligenciado,
+      _clave: formato.clave, _admiteObservaciones: !!formato.admiteObservaciones,
+      _editables: formato.editables || [],
+    };
+    if (!guardar) {
+      created.push({ tipo: formato.tipo, ...extra });
+      continue;
+    }
     const key = await storage.put('documents', `${order.codigo || order.id}_${formato.filename}`, formato.buffer);
     const doc = await client.query(
       `INSERT INTO sst.documentos_generados (orden_id, plantilla_id, tipo, url_pdf)
@@ -116,10 +161,7 @@ export async function generateOrderDocuments(orderId, client = pool) {
     );
     // `_etiqueta` y `_prediligenciado` no van a BD: los usa el correo para
     // enumerar lo que ESTA orden lleva adjunto, con el nombre de la ARL.
-    created.push({
-      ...doc.rows[0], _buffer: formato.buffer, _filename: formato.filename,
-      _etiqueta: formato.etiqueta, _prediligenciado: formato.prediligenciado,
-    });
+    created.push({ ...doc.rows[0], ...extra });
   }
   if (created.length) return created;
 
@@ -133,16 +175,22 @@ export async function generateOrderDocuments(orderId, client = pool) {
 
   for (const template of tpls.rows) {
     const buffer = await generateFormatoPdf({ template, order, professional });
+    const extra = {
+      _buffer: buffer, _filename: `${template.tipo}.pdf`,
+      _etiqueta: template.nombre || template.tipo, _prediligenciado: true,
+      _clave: null, _admiteObservaciones: false, _editables: [],
+    };
+    if (!guardar) {
+      created.push({ tipo: template.tipo, ...extra });
+      continue;
+    }
     const key = await storage.put('documents', `${order.codigo || order.id}_${template.tipo}.pdf`, buffer);
     const doc = await client.query(
       `INSERT INTO sst.documentos_generados (orden_id, plantilla_id, tipo, url_pdf)
        VALUES ($1,$2,$3,$4) RETURNING *`,
       [orderId, template.id, template.tipo, key]
     );
-    created.push({
-      ...doc.rows[0], _buffer: buffer, _filename: `${template.tipo}.pdf`,
-      _etiqueta: template.nombre || template.tipo, _prediligenciado: true,
-    });
+    created.push({ ...doc.rows[0], ...extra });
   }
   return created;
 }
