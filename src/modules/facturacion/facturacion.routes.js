@@ -7,6 +7,7 @@ import { esBolivar, relacionPorFacturar, resolverSeleccion } from './relacion.se
 import { actualizarBorrador, crearBorrador, eliminarBorrador, listarBorradores, obtenerBorrador } from './borrador.service.js';
 import { corregirDocumento, emitirDocumento, reconciliarDocumento } from './emision.service.js';
 import { reenviarAlCliente } from './envio.service.js';
+import { storage } from '../../services/storage.service.js';
 import { actualizarEventosEnLote, consultarEventosDocumento, marcarAceptacionTacita } from './eventos.service.js';
 
 const router = Router();
@@ -183,6 +184,26 @@ router.post('/documentos/:id/consultar-estado', OPERAR, asyncHandler(async (req,
     return res.status(202).json({ message: 'Sigue en proceso; inténtelo de nuevo en unos minutos.', data: resultado });
   }
   res.json({ message: resultado.estado === 'RECHAZADO' ? 'La DIAN rechazó el documento.' : 'Factura validada.', data: resultado });
+}));
+
+// ─── A1-08 · Descarga del PDF y del XML ─────────────────────────────────────
+
+/**
+ * El PDF (representación gráfica) o el XML (el documento que valida la DIAN) de
+ * una factura ya emitida, tal como los devolvió Factus al validarla (A1-05 los
+ * guarda en el almacenamiento). Pasa por la API y no por un enlace directo al
+ * archivo porque exige sesión: es un documento con datos tributarios.
+ */
+router.get('/documentos/:id/archivo/:tipo', LEER, asyncHandler(async (req, res) => {
+  const tipo = String(req.params.tipo).toLowerCase();
+  if (!['pdf', 'xml'].includes(tipo)) throw badRequest('El archivo es "pdf" o "xml".');
+  const doc = await obtenerBorrador(uuidOpcional(req.params.id, 'id'));
+  const ruta = tipo === 'pdf' ? doc.pdf_path : doc.xml_path;
+  if (!ruta) throw badRequest(`Esta factura todavía no tiene ${tipo.toUpperCase()}: solo lo tienen las validadas por la DIAN.`);
+  const nombre = `${doc.prefijo ?? ''}${doc.numero ?? doc.reference_code}.${tipo}`;
+  res.setHeader('Content-Type', tipo === 'pdf' ? 'application/pdf' : 'application/xml');
+  res.setHeader('Content-Disposition', `inline; filename="${nombre}"`);
+  res.send(await storage.get(ruta));
 }));
 
 // ─── A1-06 · Envío al cliente ────────────────────────────────────────────────

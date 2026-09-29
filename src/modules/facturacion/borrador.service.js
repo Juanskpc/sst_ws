@@ -366,14 +366,16 @@ const DOCUMENTO_FROM = `
   LEFT JOIN sst.medios_pago mp ON mp.id = d.medio_pago_id`;
 
 export async function listarBorradores({ estado = 'BORRADOR', arlId } = {}, client = pool) {
-  const params = [estado];
+  // A1-08 · la pestaña «Emitidas» pide varios estados a la vez (VALIDADO,
+  // RECHAZADO, ENVIANDO): se aceptan separados por coma.
+  const params = [String(estado).split(',').map((e) => e.trim().toUpperCase()).filter(Boolean)];
   let filtroArl = '';
   if (arlId) {
     params.push(arlId);
     filtroArl = ` AND EXISTS (SELECT 1 FROM sst.arls a WHERE a.tercero_id = d.tercero_id AND a.id = $2)`;
   }
   const r = await client.query(
-    `SELECT ${DOCUMENTO_SELECT} ${DOCUMENTO_FROM} WHERE d.tipo = 'FACTURA' AND d.estado = $1${filtroArl}
+    `SELECT ${DOCUMENTO_SELECT} ${DOCUMENTO_FROM} WHERE d.tipo = 'FACTURA' AND d.estado::text = ANY($1)${filtroArl}
       ORDER BY d.creado_en DESC`,
     params,
   );

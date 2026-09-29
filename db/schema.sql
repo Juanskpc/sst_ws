@@ -2080,6 +2080,15 @@ INSERT INTO sst.permisos_rol (rol, vista, permitido) VALUES
   ('auditor',        'parametrizacion', TRUE),
   ('administrativo', 'parametrizacion', FALSE)
 ON CONFLICT (rol, vista) DO NOTHING;
+-- 29-sep-2026 · A1-08: la pantalla de Facturación. Es una de las "llaves" del
+-- sistema Finanzas (junto con terceros y parametrización): quien la tiene, entra
+-- a Finanzas. Mismo reparto que las otras dos.
+INSERT INTO sst.permisos_rol (rol, vista, permitido) VALUES
+  ('admin',          'facturacion', TRUE),
+  ('contador',       'facturacion', TRUE),
+  ('auditor',        'facturacion', TRUE),
+  ('administrativo', 'facturacion', FALSE)
+ON CONFLICT (rol, vista) DO NOTHING;
 
 -- A1-01 · Esquema de documentos electrónicos (migración 2026-09-27-documentos-electronicos.sql)
 -- El documento electrónico: factura, nota crédito, documento soporte, nota de
