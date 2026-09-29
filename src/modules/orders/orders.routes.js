@@ -906,7 +906,8 @@ function observacionesDeFormatos(bruto) {
  * Vista previa · casillas abiertas del formato llenadas por el administrador,
  * `{ fichaAxa: { 'nombre 4': 'texto' } }`. Mismo criterio que las observaciones:
  * terminan impresas en un documento que se radica. Nombres de campo como los
- * del PDF ('nombre 4', 'FECHA 2', '28') y hasta 1.000 caracteres por casilla.
+ * del PDF ('nombre 4', 'FECHA 2', '28'), claves de formato plano ('empresa') y
+ * 'proxima_fecha', hasta 1.000 caracteres por casilla.
  */
 function camposDeFormatos(bruto) {
   if (!bruto || typeof bruto !== 'object' || Array.isArray(bruto)) return null;
@@ -914,7 +915,7 @@ function camposDeFormatos(bruto) {
   for (const [clave, campos] of Object.entries(bruto)) {
     if (!/^[A-Za-z0-9]{1,40}$/.test(clave) || !campos || typeof campos !== 'object') continue;
     for (const [campo, valor] of Object.entries(campos)) {
-      if (!/^[A-Za-z0-9 ]{1,40}$/.test(campo)) continue;
+      if (!/^[A-Za-z0-9 _]{1,40}$/.test(campo)) continue;
       const texto = String(valor ?? '').trim();
       if (texto.length > 1000) {
         throw badRequest('Cada casilla del formato admite hasta 1.000 caracteres.');
