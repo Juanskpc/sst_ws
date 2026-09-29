@@ -134,6 +134,7 @@ export async function generateOrderDocuments(orderId, client = pool, { guardar =
         orden: order, profesional: professional, franjas, aliado: await aliadoEstrategico(client),
         original: await pdfOriginalDeColmena(orderId, order.arl_nombre, client),
         observaciones: order.observaciones_formatos || {},
+        campos: order.campos_formatos || {},
       })
     : [];
 
@@ -146,6 +147,7 @@ export async function generateOrderDocuments(orderId, client = pool, { guardar =
       _buffer: formato.buffer, _filename: formato.filename,
       _etiqueta: formato.etiqueta, _prediligenciado: formato.prediligenciado,
       _clave: formato.clave, _admiteObservaciones: !!formato.admiteObservaciones,
+      _editables: formato.editables || [],
     };
     if (!guardar) {
       created.push({ tipo: formato.tipo, ...extra });
@@ -176,7 +178,7 @@ export async function generateOrderDocuments(orderId, client = pool, { guardar =
     const extra = {
       _buffer: buffer, _filename: `${template.tipo}.pdf`,
       _etiqueta: template.nombre || template.tipo, _prediligenciado: true,
-      _clave: null, _admiteObservaciones: false,
+      _clave: null, _admiteObservaciones: false, _editables: [],
     };
     if (!guardar) {
       created.push({ tipo: template.tipo, ...extra });

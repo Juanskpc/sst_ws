@@ -573,6 +573,10 @@ ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS tema_actividad        
 -- PDF para que reprogramar o regenerar los formatos no las pierda.
 ALTER TABLE sst.ordenes_servicio
   ADD COLUMN IF NOT EXISTS observaciones_formatos JSONB NOT NULL DEFAULT '{}'::jsonb;
+-- Y las casillas que el formato deja abiertas, llenadas en esa misma vista previa:
+-- `{ "<formato>": { "<campo del PDF>": "texto" } }`.
+ALTER TABLE sst.ordenes_servicio
+  ADD COLUMN IF NOT EXISTS campos_formatos JSONB NOT NULL DEFAULT '{}'::jsonb;
 
 -- ⭐ T0-07 · Estado ARL + n.º de prefactura (revisiones del cliente, 27-sep-2026).
 --

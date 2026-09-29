@@ -99,6 +99,7 @@ const FORMATOS = {
     // Vista previa · van en "Observaciones y sugerencias", ANTES del detalle de
     // sesiones que el sistema ya pone ahí.
     observaciones: { campo: '42' },
+    editables: () => EDITABLES_AT031,
   },
   at028: {
     archivo: 'bolivar/asistencia.pdf', modo: 'acroform', alcance: 'sesion',
@@ -134,6 +135,7 @@ const FORMATOS = {
     tipo: 'ficha_gestion', nombre: 'ficha-de-gestion.pdf',
     etiqueta: 'Ficha de gestión del proveedor',
     campos: camposFichaAxa,
+    editables: () => EDITABLES_FICHA_AXA,
   },
   informeAxa: {
     archivo: 'colpatria/informe-tecnico.docx', modo: 'adjunto', alcance: 'orden',
@@ -429,9 +431,11 @@ async function rellenarAcroForm(rutaPlantilla, valores, marcas = [], { parrafo =
       continue;
     }
     const { texto: ajustado, tamano } = ajustarACasilla(campo, texto, helvetica);
-    // Varias líneas (observaciones de la vista previa + detalle de sesiones)
-    // solo se respetan si el campo está marcado como multilínea.
-    if (ajustado.includes('\n')) campo.enableMultiline();
+    // Varias líneas (observaciones de la vista previa + detalle de sesiones) y
+    // el ajuste de un texto largo al ancho de una casilla alta (objetivo,
+    // resultados…) solo ocurren si el campo está marcado como multilínea.
+    const alto = campo.acroField.getWidgets()[0]?.getRectangle()?.height ?? 0;
+    if (ajustado.includes('\n') || alto >= ALTO_MULTILINEA) campo.enableMultiline();
     campo.setText(ajustado);
     // La apariencia se dibuja a partir de este "default appearance", y algunos
     // campos del formato traían un gris claro heredado. Se fija en negro: esto
@@ -654,6 +658,43 @@ const CASILLAS_REGISTRO_EJECUCION_COLMENA = [
   ['numero_orden', 502, 489, 180],
   ['razon_social_proveedor', 105, 98, 150],
   ['nombre_profesional', 290, 98, 180],
+];
+
+/**
+ * Vista previa · casillas del formulario que el sistema deja en blanco y el
+ * administrador puede llenar antes de enviar (29-sep, pedido de JD&D: escribían
+ * dentro del PDF del visor y eso se perdía, porque el visor no devuelve nada).
+ * `campo` es el nombre del campo en el PDF; `etiqueta`, el rótulo impreso junto
+ * a él (medido con `inspeccionar-formato.mjs`). Solo se ofrecen las que el
+ * sistema no llenó: lo que sale de la orden se corrige en la orden.
+ */
+const EDITABLES_AT031 = [
+  { campo: '21', etiqueta: 'Participante empresa · nombre' },
+  { campo: '22', etiqueta: 'Participante empresa · cargo' },
+  { campo: '23', etiqueta: 'Segundo participante ARL · nombre' },
+  { campo: '24', etiqueta: 'Segundo participante ARL · cargo' },
+  { campo: '25', etiqueta: 'Segundo participante empresa · nombre' },
+  { campo: '26', etiqueta: 'Segundo participante empresa · cargo' },
+  { campo: '28', etiqueta: 'Temas desarrollados en la actividad', multilinea: true },
+  { campo: '29', etiqueta: 'Decisiones y/o compromisos adquiridos', multilinea: true },
+  { campo: '31', etiqueta: 'Responsable(s) de los compromisos', multilinea: true },
+  { campo: '32', etiqueta: 'Fecha de los compromisos' },
+  { campo: '43', etiqueta: 'Próxima reunión · tema' },
+  { campo: '44', etiqueta: 'Próxima reunión · día (DD)' },
+  { campo: '45', etiqueta: 'Próxima reunión · mes (MM)' },
+  { campo: '46', etiqueta: 'Próxima reunión · año (AAAA)' },
+  { campo: '47', etiqueta: 'Próxima reunión · hora' },
+];
+const EDITABLES_FICHA_AXA = [
+  { campo: 'FECHA 2', etiqueta: 'Fecha de diligenciamiento (DD/MM/AA)' },
+  { campo: 'nombre 4', etiqueta: 'Objetivo/alcance de la actividad', multilinea: true },
+  { campo: 'nombre 8', etiqueta: 'Población objeto', multilinea: true },
+  { campo: 'nombre 12', etiqueta: 'Licencia en SO/SST o tarjeta profesional', multilinea: true },
+  { campo: 'nombre 19', etiqueta: 'Eje técnico · actividades ejecutadas vs. tiempo', multilinea: true },
+  { campo: 'nombre 20', etiqueta: 'Resultados', multilinea: true },
+  { campo: 'nombre 21', etiqueta: 'Análisis de los resultados', multilinea: true },
+  { campo: 'nombre 22', etiqueta: 'Recomendaciones', multilinea: true },
+  { campo: 'nombre 23', etiqueta: 'Conclusiones', multilinea: true },
 ];
 
 /**
@@ -975,7 +1016,7 @@ function tramoDe(franjas) {
 }
 
 /** Un formato ya generado, listo para adjuntarse al correo. */
-function salida(def, { buffer, admiteObservaciones }, sufijo) {
+function salida(def, { buffer, admiteObservaciones, editables = [] }, sufijo) {
   // El sufijo solo aparece cuando de verdad hay varias sesiones: con una visita
   // normal el adjunto se llama "asistencia.pdf" a secas. Se inserta ANTES de la
   // extensión, no al final, o el archivo dejaría de abrirse ("asistencia.pdf-2").
@@ -992,6 +1033,7 @@ function salida(def, { buffer, admiteObservaciones }, sufijo) {
     prediligenciado: def.modo !== 'adjunto',
     clave: def.clave,
     admiteObservaciones,
+    editables,
   };
 }
 
@@ -1005,7 +1047,7 @@ function salida(def, { buffer, admiteObservaciones }, sufijo) {
  * Devuelve `[{ tipo, filename, buffer }]`, vacío si la ARL no tiene formatos.
  */
 export async function generarFormatosArl({
-  orden, profesional, franjas = [], aliado, original = null, observaciones = {},
+  orden, profesional, franjas = [], aliado, original = null, observaciones = {}, campos = {},
 }) {
   const entrega = entregaDeLaOrden(orden);
   if (!entrega.formatos.length) return [];
@@ -1018,6 +1060,7 @@ export async function generarFormatosArl({
     .filter((clave) => FORMATOS[clave])
     .map((clave) => ({ ...FORMATOS[clave], clave }));
   const obsDe = (def) => enBlanco(observaciones?.[def.clave]);
+  const extra = (def) => ({ observacion: obsDe(def), campos: campos?.[def.clave] || {} });
 
   // Sin franjas se emite igualmente un juego, con las casillas de fecha y
   // horario en blanco: el profesional ya tiene el formato correcto en la mano.
@@ -1032,7 +1075,7 @@ export async function generarFormatosArl({
 
   // 1) Los de alcance 'orden': uno solo, con el tramo completo de la visita.
   for (const def of definiciones.filter((d) => d.alcance === 'orden')) {
-    generados.push(salida(def, await construir(def, orden, profesional, tramo, identidad, original, obsDe(def)), ''));
+    generados.push(salida(def, await construir(def, orden, profesional, tramo, identidad, original, extra(def)), ''));
   }
 
   // 2) Los de alcance 'sesion': uno por franja.
@@ -1040,14 +1083,14 @@ export async function generarFormatosArl({
     const sesion = sesionDe(orden, franja);
     const sufijo = sesiones.length > 1 ? `-${i + 1}` : '';
     for (const def of definiciones.filter((d) => d.alcance === 'sesion')) {
-      generados.push(salida(def, await construir(def, orden, profesional, sesion, identidad, original, obsDe(def)), sufijo));
+      generados.push(salida(def, await construir(def, orden, profesional, sesion, identidad, original, extra(def)), sufijo));
     }
   }
   return generados;
 }
 
 /** Rellena UN formato según su modo. */
-async function construir(def, orden, profesional, sesion, aliado, original = null, observacion = '') {
+async function construir(def, orden, profesional, sesion, aliado, original = null, { observacion = '', campos: delUsuario = {} } = {}) {
   // Devuelve `{ buffer, admiteObservaciones }`. Lo segundo le dice a la vista
   // previa si ESTE archivo tiene dónde escribir las observaciones (el informe de
   // Colmena sí sobre su original, no en la plantilla de respaldo), para no
@@ -1066,12 +1109,21 @@ async function construir(def, orden, profesional, sesion, aliado, original = nul
   if (def.modo === 'adjunto') {
     // Se manda tal cual: es una plantilla que el profesional redacta en Word o
     // en Excel, no un formato con casillas que se puedan prediligenciar.
-    return { buffer: await fs.readFile(ruta), admiteObservaciones: false };
+    return { buffer: await fs.readFile(ruta), admiteObservaciones: false, editables: [] };
   }
   const obs = def.observaciones;
   const parrafo = obs?.renglones && observacion ? { renglones: obs.renglones(), texto: observacion } : null;
   if (def.modo === 'acroform') {
     const campos = def.campos(orden, profesional, sesion, aliado);
+    // Casillas abiertas: solo las que el sistema dejó en blanco. Se deciden
+    // ANTES de escribir lo del usuario, para que la lista no cambie según lo
+    // que él haya llenado.
+    const editables = (def.editables ? def.editables() : []).filter((e) => !enBlanco(campos[e.campo]));
+    for (const e of editables) {
+      const valor = String(delUsuario[e.campo] ?? '');
+      const limpio = e.multilinea ? valor.trim() : valor.replace(/\s+/g, ' ').trim();
+      if (limpio) campos[e.campo] = limpio;
+    }
     // En un campo del formulario, lo que escribió el administrador va PRIMERO y
     // lo que ya ponía el sistema (el detalle de sesiones del AT-031) debajo.
     if (obs?.campo && observacion) {
@@ -1080,6 +1132,7 @@ async function construir(def, orden, profesional, sesion, aliado, original = nul
     return {
       buffer: await rellenarAcroForm(ruta, campos, def.marcas ? def.marcas(orden) : [], { parrafo }),
       admiteObservaciones: !!obs,
+      editables,
     };
   }
   return {

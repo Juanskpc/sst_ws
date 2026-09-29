@@ -4,6 +4,8 @@
 --     observaciones de cada formato durante la vista previa de la asignación,
 --     como `{ "<formato>": "texto" }` (claves de `formatos-arl.service.js`:
 --     at031, at028, prestacionColmena, asistenciaColmena).
+--   · `campos_formatos`: las casillas que el formato deja abiertas (ficha de AXA,
+--     AT-031) llenadas en esa misma vista previa, `{ "<formato>": { "<campo>": "texto" } }`.
 --
 -- Se guarda en la orden, y no solo dentro del PDF, para que reprogramar o
 -- regenerar los formatos no las pierda y la vista previa aparezca ya rellena.
@@ -22,6 +24,11 @@ BEGIN;
 
 ALTER TABLE sst.ordenes_servicio
   ADD COLUMN IF NOT EXISTS observaciones_formatos JSONB NOT NULL DEFAULT '{}'::jsonb;
+-- Casillas que el formato deja abiertas y el administrador llena en la vista
+-- previa: `{ "<formato>": { "<campo del PDF>": "texto" } }` (p. ej. el
+-- objetivo/alcance de la ficha de AXA o los compromisos del AT-031).
+ALTER TABLE sst.ordenes_servicio
+  ADD COLUMN IF NOT EXISTS campos_formatos JSONB NOT NULL DEFAULT '{}'::jsonb;
 
 -- `vw_ordenes_expandidas` es `SELECT o.*` y Postgres congela sus columnas al
 -- crearla (trampa 69): sin recrearla, la columna nueva no llega a la vista que
@@ -55,8 +62,8 @@ LEFT JOIN sst.tipos_viatico tv ON tv.id = o.viaticos_tipo_id;
 
 COMMIT;
 
--- Comprobación posterior (tiene que salir UNA fila):
+-- Comprobación posterior (tienen que salir DOS filas):
 --
 --   SELECT column_name FROM information_schema.columns
 --    WHERE table_schema='sst' AND table_name='vw_ordenes_expandidas'
---      AND column_name = 'observaciones_formatos';
+--      AND column_name IN ('observaciones_formatos', 'campos_formatos');

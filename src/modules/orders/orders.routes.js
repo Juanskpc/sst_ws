@@ -1,3 +1,4 @@
+import { PDFDocument } from 'pdf-lib';
 import { Router } from 'express';
 import { pool, withTransaction } from '../../config/db.js';
 import { asyncHandler } from '../../utils/asyncHandler.js';
@@ -902,6 +903,29 @@ function observacionesDeFormatos(bruto) {
 }
 
 /**
+ * Vista previa · casillas abiertas del formato llenadas por el administrador,
+ * `{ fichaAxa: { 'nombre 4': 'texto' } }`. Mismo criterio que las observaciones:
+ * terminan impresas en un documento que se radica. Nombres de campo como los
+ * del PDF ('nombre 4', 'FECHA 2', '28') y hasta 1.000 caracteres por casilla.
+ */
+function camposDeFormatos(bruto) {
+  if (!bruto || typeof bruto !== 'object' || Array.isArray(bruto)) return null;
+  const limpios = {};
+  for (const [clave, campos] of Object.entries(bruto)) {
+    if (!/^[A-Za-z0-9]{1,40}$/.test(clave) || !campos || typeof campos !== 'object') continue;
+    for (const [campo, valor] of Object.entries(campos)) {
+      if (!/^[A-Za-z0-9 ]{1,40}$/.test(campo)) continue;
+      const texto = String(valor ?? '').trim();
+      if (texto.length > 1000) {
+        throw badRequest('Cada casilla del formato admite hasta 1.000 caracteres.');
+      }
+      if (texto) (limpios[clave] ??= {})[campo] = texto;
+    }
+  }
+  return limpios;
+}
+
+/**
  * Transacción que SIEMPRE se deshace. Es lo que hace inofensiva la vista previa:
  * corre la asignación completa —cambio de estado, franjas, formatos— y al final
  * no queda nada, ni siquiera la secuencia de calendario incrementada.
@@ -918,6 +942,24 @@ async function enTransaccionDescartable(fn) {
 }
 
 /**
+ * La copia de la vista previa va APLANADA: sin casillas donde escribir. Lo que se
+ * teclea dentro del visor del navegador no vuelve nunca al servidor, y así se
+ * perdieron textos en la primera prueba de JD&D. Lo editable está en el panel de
+ * la pantalla. El PDF que se ENVÍA conserva sus casillas para el profesional.
+ */
+async function pdfDeSoloLectura(buffer) {
+  try {
+    const doc = await PDFDocument.load(buffer);
+    const form = doc.getForm();
+    if (!form.getFields().length) return Buffer.from(buffer);
+    form.flatten();
+    return Buffer.from(await doc.save());
+  } catch {
+    return Buffer.from(buffer);
+  }
+}
+
+/**
  * Vista previa de los formatos que saldrán con una asignación, ANTES de enviarla
  * (pedido de JD&D, 29-sep-2026): el administrador revisa cada PDF y puede
  * escribir observaciones en él. Mismo cuerpo que `POST /:id/assign` más
@@ -928,18 +970,25 @@ router.post('/:id/assign/preview', requireRole('admin'), asyncHandler(async (req
   if (!result.completa) {
     throw badRequest('Reparta todas las horas de la visita para ver los formatos: con media agenda no se envía nada.');
   }
+  const formatos = [];
+  for (const d of result.docs) {
+    const esPdf = /\.pdf$/i.test(d._filename || '');
+    formatos.push({
+      clave: d._clave,
+      etiqueta: d._etiqueta || d.tipo,
+      nombre: d._filename,
+      prediligenciado: d._prediligenciado !== false,
+      admite_observaciones: !!d._admiteObservaciones,
+      editables: d._editables || [],
+      // Solo los PDF se pueden ver en el navegador; los Word/Excel se listan.
+      pdf: esPdf ? (await pdfDeSoloLectura(d._buffer)).toString('base64') : null,
+    });
+  }
   res.json({
     data: {
-      formatos: result.docs.map((d) => ({
-        clave: d._clave,
-        etiqueta: d._etiqueta || d.tipo,
-        nombre: d._filename,
-        prediligenciado: d._prediligenciado !== false,
-        admite_observaciones: !!d._admiteObservaciones,
-        // Solo los PDF se pueden ver en el navegador; los Word/Excel se listan.
-        pdf: /\.pdf$/i.test(d._filename || '') ? Buffer.from(d._buffer).toString('base64') : null,
-      })),
+      formatos,
       observaciones_formatos: result.orden.observaciones_formatos || {},
+      campos_formatos: result.orden.campos_formatos || {},
       soportes: result.entrega?.soportes ?? [],
     },
   });
@@ -971,6 +1020,7 @@ async function aplicarAsignacion(req, client, { vistaPrevia = false } = {}) {
   const formatosIdBruto = String(req.body?.profesional_formatos_id ?? '').trim() || null;
 
   const observaciones = observacionesDeFormatos(req.body?.observaciones_formatos);
+  const camposUsuario = camposDeFormatos(req.body?.campos_formatos);
 
   const prof = await client.query(`SELECT * FROM sst.profesionales WHERE id=$1`, [profesionalId]);
   if (!prof.rows[0]) throw badRequest('Profesional no existe');
@@ -1105,6 +1155,12 @@ async function aplicarAsignacion(req, client, { vistaPrevia = false } = {}) {
     await client.query(
       `UPDATE sst.ordenes_servicio SET observaciones_formatos = $2 WHERE id = $1`,
       [req.params.id, observaciones],
+    );
+  }
+  if (camposUsuario) {
+    await client.query(
+      `UPDATE sst.ordenes_servicio SET campos_formatos = $2 WHERE id = $1`,
+      [req.params.id, camposUsuario],
     );
   }
 
