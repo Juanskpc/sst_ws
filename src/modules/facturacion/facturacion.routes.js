@@ -1,0 +1,234 @@
+import { Router } from 'express';
+import ExcelJS from 'exceljs';
+import { asyncHandler } from '../../utils/asyncHandler.js';
+import { badRequest } from '../../utils/httpError.js';
+import { authRequired, requireRole } from '../../middleware/auth.js';
+import { esBolivar, relacionPorFacturar, resolverSeleccion } from './relacion.service.js';
+import { actualizarBorrador, crearBorrador, eliminarBorrador, listarBorradores, obtenerBorrador } from './borrador.service.js';
+import { corregirDocumento, emitirDocumento, reconciliarDocumento } from './emision.service.js';
+import { reenviarAlCliente } from './envio.service.js';
+import { actualizarEventosEnLote, consultarEventosDocumento, marcarAceptacionTacita } from './eventos.service.js';
+
+const router = Router();
+router.use(authRequired);
+
+/**
+ * A1-03 · Relación a facturar (FEL-01, FEL-02).
+ *
+ * Lectura: admin, contador y auditor. Escribir (crear el borrador, A1-04) queda
+ * para admin y contador; la vista `facturacion` de la matriz de permisos llega
+ * con la pantalla (A1-08).
+ */
+const LEER = requireRole('admin', 'contador', 'auditor');
+const OPERAR = requireRole('admin', 'contador');
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const uuidOpcional = (v, nombre) => {
+  if (v == null || v === '') return null;
+  if (!UUID.test(String(v))) throw badRequest(`"${nombre}" no es un identificador válido.`);
+  return String(v);
+};
+
+// Lo que se puede facturar hoy, por pagador. ?arl_id= lo acota a uno.
+router.get('/por-facturar', LEER, asyncHandler(async (req, res) => {
+  res.json({ data: await relacionPorFacturar({ arlId: uuidOpcional(req.query.arl_id, 'arl_id') }) });
+}));
+
+// Comprueba una selección antes de crear la factura: mismo pagador, todo libre.
+// Cuerpo: { arl_id, orden_ids? } o, en Bolívar, { arl_id, prefactura_id, fila_ids? }.
+router.post('/seleccion/validar', OPERAR, asyncHandler(async (req, res) => {
+  const b = req.body || {};
+  if (b.orden_ids != null && !Array.isArray(b.orden_ids)) throw badRequest('"orden_ids" debe ser una lista.');
+  if (b.fila_ids != null && !Array.isArray(b.fila_ids)) throw badRequest('"fila_ids" debe ser una lista.');
+  const r = await resolverSeleccion({
+    arlId: uuidOpcional(b.arl_id, 'arl_id'),
+    ordenIds: (b.orden_ids ?? []).map((id) => uuidOpcional(id, 'orden_ids')),
+    prefacturaId: uuidOpcional(b.prefactura_id, 'prefactura_id'),
+    filaIds: b.fila_ids ? b.fila_ids.map((id) => uuidOpcional(id, 'fila_ids')) : null,
+  });
+  res.json({ data: r });
+}));
+
+/**
+ * Excel de la relación para radicar, de CUALQUIER pagador (el de T0-08 era solo
+ * de Bolívar). Mismas diez columnas que la relación que JD&D arma a mano. Trae
+ * las líneas facturables: en Bolívar, las de la prefactura pedida; en los demás,
+ * las de `?orden_ids=` (separadas por coma) o, si no se manda, todas las libres.
+ */
+router.get('/relacion.xlsx', LEER, asyncHandler(async (req, res) => {
+  const arlId = uuidOpcional(req.query.arl_id, 'arl_id');
+  if (!arlId) throw badRequest('Indique el pagador (arl_id).');
+  const prefacturaId = uuidOpcional(req.query.prefactura_id, 'prefactura_id');
+  const ids = req.query.orden_ids ? String(req.query.orden_ids).split(',').map((s) => uuidOpcional(s.trim(), 'orden_ids')) : null;
+
+  const { pagadores } = await relacionPorFacturar({ arlId });
+  const pagador = pagadores[0];
+  if (!pagador) throw badRequest('Ese pagador no existe.');
+  const bolivar = esBolivar(pagador.arl_nombre);
+  if (bolivar && !prefacturaId) throw badRequest('Bolívar se factura por prefactura: indique cuál (prefactura_id).');
+
+  let grupos = pagador.grupos;
+  if (bolivar) grupos = grupos.filter((g) => g.prefactura?.id === prefacturaId);
+  const lineas = grupos.flatMap((g) => g.lineas)
+    .filter((l) => l.facturable && (ids ? ids.includes(l.orden_id) : true));
+  if (!lineas.length) throw badRequest('No hay líneas facturables para esa relación.');
+
+  const wb = new ExcelJS.Workbook();
+  wb.creator = 'JD&D IA-Core';
+  wb.created = new Date();
+  const ws = wb.addWorksheet(`Relación ${pagador.arl_nombre}`.slice(0, 31));
+
+  ws.addRow([
+    'Tipo de actividad', 'Cantidad de horas', 'Valor unitario por hora', 'Valor transporte', 'Total',
+    bolivar ? 'SIPAB No. De Cronograma' : 'Número de orden', bolivar ? 'secuencia' : '', 'Empresa',
+    'Actividad a realizar', bolivar ? 'Prefactura' : 'Estado de facturación',
+  ]);
+  const cabecera = ws.getRow(1);
+  cabecera.font = { bold: true, size: 11 };
+  cabecera.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFBFBFBF' } };
+  cabecera.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+
+  // Sin cifra (ni tarifa ni valor de la ARL) la celda queda vacía y resaltada:
+  // se completa a mano antes de radicar, nunca se inventa un valor.
+  const SIN_VALOR = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFEF3C7' } };
+  let totalGeneral = 0;
+  for (const l of lineas) {
+    const tieneValor = l.valor_referencia != null;
+    if (tieneValor) totalGeneral += l.valor_referencia;
+    const row = ws.addRow([
+      (l.tipo_actividad ?? '').toLowerCase(), l.horas ?? '', l.valor_unitario ?? '', l.transporte || 0,
+      l.valor_referencia ?? '',
+      bolivar ? l.codigo_cronograma ?? '' : l.numero_orden ?? l.codigo ?? '',
+      bolivar ? l.secuencia ?? '' : '', l.empresa_nombre ?? '',
+      l.tema_actividad || l.tipo_actividad || '',
+      bolivar ? grupos[0].prefactura.numero : '',
+    ]);
+    if (!tieneValor) row.getCell(5).fill = SIN_VALOR;
+  }
+  const filaTotal = ws.addRow(['', '', '', '', totalGeneral, '', '', '', '', '']);
+  filaTotal.getCell(5).font = { bold: true };
+
+  [20, 16, 20, 16, 14, 20, 12, 32, 40, 18].forEach((w, i) => { ws.getColumn(i + 1).width = w; });
+  ws.views = [{ state: 'frozen', ySplit: 1 }];
+
+  const buffer = await wb.xlsx.writeBuffer();
+  const sufijo = bolivar ? `prefactura-${grupos[0].prefactura.numero}` : new Date().toISOString().slice(0, 10);
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="relacion-${sufijo}.xlsx"`);
+  res.send(Buffer.from(buffer));
+}));
+
+// ─── A1-04 · Borradores de factura ──────────────────────────────────────────
+
+// Listado de borradores (o, con ?estado=, de cualquier otro estado de la factura).
+router.get('/borradores', LEER, asyncHandler(async (req, res) => {
+  const estado = req.query.estado ? String(req.query.estado).toUpperCase() : 'BORRADOR';
+  res.json({ data: await listarBorradores({ estado, arlId: uuidOpcional(req.query.arl_id, 'arl_id') }) });
+}));
+
+// Crea el borrador desde una selección de A1-03 (misma forma que /seleccion/validar).
+router.post('/borradores', OPERAR, asyncHandler(async (req, res) => {
+  const b = req.body || {};
+  if (b.orden_ids != null && !Array.isArray(b.orden_ids)) throw badRequest('"orden_ids" debe ser una lista.');
+  if (b.fila_ids != null && !Array.isArray(b.fila_ids)) throw badRequest('"fila_ids" debe ser una lista.');
+  const data = await crearBorrador({
+    arlId: uuidOpcional(b.arl_id, 'arl_id'),
+    ordenIds: (b.orden_ids ?? []).map((id) => uuidOpcional(id, 'orden_ids')),
+    prefacturaId: uuidOpcional(b.prefactura_id, 'prefactura_id'),
+    filaIds: b.fila_ids ? b.fila_ids.map((id) => uuidOpcional(id, 'fila_ids')) : null,
+    observaciones: b.observaciones ?? null,
+    usuarioId: req.user.sub,
+  });
+  res.status(201).json({ message: 'Borrador de factura creado.', data });
+}));
+
+router.get('/borradores/:id', LEER, asyncHandler(async (req, res) => {
+  res.json({ data: await obtenerBorrador(uuidOpcional(req.params.id, 'id')) });
+}));
+
+// Reemplaza líneas, descuento/retenciones, fechas y observaciones. Solo en BORRADOR.
+router.put('/borradores/:id', OPERAR, asyncHandler(async (req, res) => {
+  const data = await actualizarBorrador(uuidOpcional(req.params.id, 'id'), req.body || {}, req.user.sub);
+  res.json({ message: 'Borrador actualizado.', data });
+}));
+
+router.delete('/borradores/:id', OPERAR, asyncHandler(async (req, res) => {
+  await eliminarBorrador(uuidOpcional(req.params.id, 'id'));
+  res.json({ message: 'Borrador eliminado.' });
+}));
+
+// ─── A1-05 · Emitir y reconciliar ───────────────────────────────────────────
+
+/**
+ * Emite el documento contra Factus. Responde 200 cuando quedó VALIDADO o
+ * RECHAZADO (el `data.estado` dice cuál) y 202 cuando Factus no decidió
+ * todavía o no se pudo contactar: el documento queda ENVIANDO y hay que
+ * reintentar con "Consultar estado" más tarde, nunca volviendo a emitir.
+ */
+router.post('/documentos/:id/emitir', OPERAR, asyncHandler(async (req, res) => {
+  const resultado = await emitirDocumento(uuidOpcional(req.params.id, 'id'), req.user.sub);
+  if (resultado?.pendiente) {
+    return res.status(202).json({ message: resultado.aviso || 'Factus no ha decidido todavía; consulte el estado en unos minutos.', data: resultado });
+  }
+  const mensaje = resultado.estado === 'RECHAZADO'
+    ? 'La DIAN rechazó el documento. Corrija el borrador y vuelva a emitir.'
+    : `Factura validada: ${resultado.prefijo ?? ''}${resultado.numero ?? ''} (CUFE ${resultado.cufe ?? '—'}).`;
+  res.json({ message: mensaje, data: resultado });
+}));
+
+// Reconcilia un documento que quedó ENVIANDO (timeout, corte de red, o Factus tardó en decidir).
+router.post('/documentos/:id/consultar-estado', OPERAR, asyncHandler(async (req, res) => {
+  const resultado = await reconciliarDocumento(uuidOpcional(req.params.id, 'id'), req.user.sub);
+  if (resultado?.pendiente) {
+    return res.status(202).json({ message: 'Sigue en proceso; inténtelo de nuevo en unos minutos.', data: resultado });
+  }
+  res.json({ message: resultado.estado === 'RECHAZADO' ? 'La DIAN rechazó el documento.' : 'Factura validada.', data: resultado });
+}));
+
+// ─── A1-06 · Envío al cliente ────────────────────────────────────────────────
+
+/**
+ * "Reenviar al cliente": con el correo propio de Orbita (no el de Factus),
+ * PDF + XML adjuntos. `correo` en el cuerpo es opcional — sin él, usa el de
+ * facturación del tercero.
+ */
+router.post('/documentos/:id/reenviar', OPERAR, asyncHandler(async (req, res) => {
+  const correo = req.body?.correo ? String(req.body.correo).trim() : undefined;
+  const data = await reenviarAlCliente(uuidOpcional(req.params.id, 'id'), req.user.sub, { correo });
+  res.json({ message: `Factura reenviada a ${correo || 'el correo de facturación del tercero'}.`, data });
+}));
+
+// ─── A1-07 · Rechazos, reenvíos y eventos DIAN ──────────────────────────────
+
+// RECHAZADO → BORRADOR con un reference_code nuevo, para corregir y reemitir.
+router.post('/documentos/:id/corregir', OPERAR, asyncHandler(async (req, res) => {
+  const data = await corregirDocumento(uuidOpcional(req.params.id, 'id'), req.user.sub);
+  res.json({ message: 'El documento vuelve a BORRADOR para corregirse.', data });
+}));
+
+// "Consultar eventos" de UN documento (botón en su detalle).
+router.post('/documentos/:id/eventos/consultar', OPERAR, asyncHandler(async (req, res) => {
+  const r = await consultarEventosDocumento(uuidOpcional(req.params.id, 'id'), req.user.sub);
+  res.json({
+    message: r.nuevos ? `${r.nuevos} evento(s) nuevo(s) de la DIAN.` : 'Sin eventos nuevos.',
+    data: r,
+  });
+}));
+
+// En lote: "Actualizar eventos de las facturas de los últimos N días" (60 por defecto).
+router.post('/eventos/actualizar-lote', OPERAR, asyncHandler(async (req, res) => {
+  const dias = req.body?.dias != null ? Number(req.body.dias) : undefined;
+  const r = await actualizarEventosEnLote({ dias }, req.user.sub);
+  res.json({
+    message: `${r.revisadas} factura(s) revisada(s), ${r.nuevos} evento(s) nuevo(s)${r.fallidas.length ? `, ${r.fallidas.length} con error` : ''}.`,
+    data: r,
+  });
+}));
+
+// Apunte interno (nunca llama a Factus: ver eventos.service.js) de aceptación tácita.
+router.post('/documentos/:id/aceptacion-tacita', OPERAR, asyncHandler(async (req, res) => {
+  const r = await marcarAceptacionTacita(uuidOpcional(req.params.id, 'id'), req.user.sub);
+  res.json({ message: 'Factura marcada como aceptada tácitamente (apunte interno de Orbita).', data: r });
+}));
+
+export default router;

@@ -68,6 +68,18 @@ export const env = {
     from: process.env.EMAIL_FROM || 'JD&D Consultores <no-reply@jdd.com>',
   },
 
+  // Proveedor de facturación electrónica (Factus). Todo opcional: sin estas variables
+  // Orbita arranca igual y solo el módulo de facturación responde 503. La URL de
+  // pruebas es https://api-sandbox.factus.com.co; los scripts de humo y siembra se
+  // niegan a correr contra cualquier otra.
+  factus: {
+    url: (process.env.FACTUS_URL || '').replace(/\/+$/, ''),
+    clientId: process.env.FACTUS_CLIENT_ID || '',
+    clientSecret: process.env.FACTUS_CLIENT_SECRET || '',
+    username: process.env.FACTUS_USERNAME || '',
+    password: process.env.FACTUS_PASSWORD || '',
+  },
+
   // Gemini NO es el motor principal de extracción (ese es OpenAI). Esta config
   // solo alimenta los componentes auxiliares PENDIENTES DE MIGRACIÓN a OpenAI:
   // clasificación de ARL, resumen ejecutivo y búsqueda en lenguaje natural

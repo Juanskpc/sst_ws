@@ -13,6 +13,9 @@ import surveysRoutes from '../modules/surveys/surveys.routes.js';
 import billingRoutes from '../modules/billing/billing.routes.js';
 import permissionsRoutes from '../modules/permissions/permissions.routes.js';
 import companiesRoutes from '../modules/companies/companies.routes.js';
+import tercerosRoutes from '../modules/terceros/terceros.routes.js';
+import parametrosRoutes from '../modules/parametros/parametros.routes.js';
+import facturacionRoutes from '../modules/facturacion/facturacion.routes.js';
 
 const router = Router();
 
@@ -28,6 +31,12 @@ router.use('/auth', authRoutes);
 router.use('/professionals', professionalsRoutes);
 // CFG-02
 router.use('/empresas', companiesRoutes);
+// Fase A · A0-05 · terceros (a quién se factura o se paga)
+router.use('/terceros', tercerosRoutes);
+// Fase A · A0-04/08/09 · catálogos DIAN, ficha del emisor y resoluciones de numeración
+router.use('/parametros', parametrosRoutes);
+// Fase A · A1-03 · relación a facturar, agrupación por pagador (y luego borradores y emisión)
+router.use('/facturacion', facturacionRoutes);
 // M2
 router.use('/imports', importsRoutes);
 router.use('/drafts', draftsRoutes);

@@ -3,6 +3,7 @@ import { pool } from '../../config/db.js';
 import { asyncHandler } from '../../utils/asyncHandler.js';
 import { authRequired } from '../../middleware/auth.js';
 import { notFound } from '../../utils/httpError.js';
+import { revisarVencimientosDiario } from '../parametros/alertas.service.js';
 
 const router = Router();
 router.use(authRequired);
@@ -26,6 +27,9 @@ function recorte(estado) {
 
 // M11 · Campanita: notificaciones del usuario autenticado.
 router.get('/', asyncHandler(async (req, res) => {
+  // Fase A · No hay cron: abrir la campanita dispara (una vez al día) la revisión de
+  // resoluciones de numeración y paquete del proveedor por vencer. No espera ni falla.
+  revisarVencimientosDiario().catch(() => {});
   const r = await pool.query(
     `SELECT * FROM sst.notificaciones
       WHERE usuario_id=$1 ${recorte(req.query.estado)}

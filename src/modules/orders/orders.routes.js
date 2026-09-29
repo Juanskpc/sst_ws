@@ -404,9 +404,17 @@ router.patch('/cobro', requireRole('admin', 'contador'), asyncHandler(async (req
   }
 
   const resultado = await withTransaction(async (client) => {
+    // A1-05 · `tiene_factura_orbita` dice si la última factura VALIDADA de la
+    // orden es un documento electrónico emitido por Orbita (no un marcado
+    // manual de Siigo): desmarcarla aquí borraría el rastro de una factura que
+    // sí existe y que la DIAN ya validó — eso se corrige con una nota crédito
+    // (A2-01), nunca con este PATCH.
     const filas = await client.query(
-      `SELECT id, codigo, estado::text AS estado, estado_cobro::text AS estado_cobro
-         FROM sst.ordenes_servicio WHERE id = ANY($1::uuid[]) FOR UPDATE`,
+      `SELECT o.id, o.codigo, o.estado::text AS estado, o.estado_cobro::text AS estado_cobro,
+              EXISTS (
+                SELECT 1 FROM sst.documento_ordenes dor WHERE dor.orden_id = o.id AND dor.documento_validado_id IS NOT NULL
+              ) AS tiene_factura_orbita
+         FROM sst.ordenes_servicio o WHERE o.id = ANY($1::uuid[]) FOR UPDATE`,
       [ids]
     );
     const encontradas = new Set(filas.rows.map((f) => f.id));
@@ -414,10 +422,15 @@ router.patch('/cobro', requireRole('admin', 'contador'), asyncHandler(async (req
 
     const aptas = filas.rows.filter((f) => f.estado === 'FINALIZADA');
     const sinCerrar = filas.rows.filter((f) => f.estado !== 'FINALIZADA');
+    const bloqueadasPorFacturaElectronica = aptas.filter(
+      (f) => estado === 'NO FACTURADA' && f.estado_cobro === 'FACTURADA' && f.tiene_factura_orbita,
+    );
     // Las que ya estaban en ese estado se saltan en silencio: volver a marcar lo
     // mismo no es un error, pero escribir otra fila de historial idéntica
-    // llenaría la auditoría de ruido y taparía el cambio de verdad.
-    const cambian = aptas.filter((f) => f.estado_cobro !== estado);
+    // llenaría la auditoría de ruido y taparía el cambio de verdad. Las
+    // bloqueadas por tener una factura de Orbita tampoco cambian aquí.
+    const bloqueadasIds = new Set(bloqueadasPorFacturaElectronica.map((f) => f.id));
+    const cambian = aptas.filter((f) => f.estado_cobro !== estado && !bloqueadasIds.has(f.id));
 
     for (const fila of cambian) {
       await client.query(
@@ -440,8 +453,9 @@ router.patch('/cobro', requireRole('admin', 'contador'), asyncHandler(async (req
     }
     return {
       actualizadas: cambian.map((f) => f.id),
-      sin_cambio: aptas.filter((f) => f.estado_cobro === estado).map((f) => f.codigo),
+      sin_cambio: aptas.filter((f) => f.estado_cobro === estado && !bloqueadasIds.has(f.id)).map((f) => f.codigo),
       no_finalizadas: sinCerrar.map((f) => f.codigo),
+      bloqueadas_por_factura_electronica: bloqueadasPorFacturaElectronica.map((f) => f.codigo),
       inexistentes,
     };
   });
@@ -455,6 +469,12 @@ router.patch('/cobro', requireRole('admin', 'contador'), asyncHandler(async (req
     partes.push(
       `Quedaron fuera ${resultado.no_finalizadas.join(', ')}: el estado de cobro solo se mueve ` +
       'sobre órdenes FINALIZADAS.'
+    );
+  }
+  if (resultado.bloqueadas_por_factura_electronica.length) {
+    partes.push(
+      `No se desmarcaron ${resultado.bloqueadas_por_factura_electronica.join(', ')}: su factura es un documento ` +
+      'de Orbita ya validado por la DIAN. Para corregirla, emita una nota crédito.'
     );
   }
   res.json({ message: partes.join(' '), estado, ...resultado });

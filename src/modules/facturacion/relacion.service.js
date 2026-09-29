@@ -1,0 +1,334 @@
+import { pool } from '../../config/db.js';
+import { badRequest } from '../../utils/httpError.js';
+import { aCentavos, deCentavos } from '../../utils/dinero.js';
+
+/**
+ * A1-03 (FEL-01, FEL-02) · Relación a facturar y agrupación por pagador.
+ *
+ * Responde a "¿qué puedo facturar hoy, y agrupado cómo?" sin escribir nada: el
+ * borrador de factura lo crea A1-04 a partir de la selección que este módulo
+ * valida (`resolverSeleccion`).
+ *
+ * Una orden es CANDIDATA cuando está FINALIZADA, en NO FACTURADA (lo que ya se
+ * facturó por fuera —Siigo, durante la transición— no vuelve a salir) y sin una
+ * factura VALIDADO vigente. Además es FACTURABLE solo si la ARL la aprobó en su
+ * plataforma (T0-07) y no está ya en un borrador. Las candidatas que no son
+ * facturables se listan igual, con el motivo: la contadora necesita ver qué le
+ * falta a cada una, no que desaparezcan.
+ *
+ * Agrupación (supuesto de Q-15, sin confirmar con JD&D):
+ *  · Bolívar → una factura POR PREFACTURA; el precio de cada línea es el
+ *    `valor_a_facturar` de la prefactura (manda sobre la tarifa).
+ *  · AXA, Colmena, La Equidad y privados → la persona ELIGE las órdenes; solo se
+ *    exige que sean del mismo pagador.
+ */
+
+/** Bolívar se identifica por nombre en todo el repo (no hay un indicador propio). */
+export const esBolivar = (nombreArl) => /bol[ií]var/i.test(nombreArl ?? '');
+
+const MOTIVOS = {
+  SIN_TERCERO: 'La ARL no tiene un tercero enlazado (Parametrización → Terceros).',
+  NO_APROBADA: 'La ARL todavía no aprueba esta orden (estado ARL: Pendiente).',
+  EN_BORRADOR: 'Ya está en un borrador de factura.',
+  ENVIANDO: 'Su factura se está enviando a la DIAN.',
+  SIN_PREFACTURA: 'Bolívar se factura por prefactura: cargue el PDF de la prefactura de esta orden.',
+  OTRA_PREFACTURA: 'La orden quedó aprobada con otra prefactura.',
+  SIN_ORDEN: 'No cruza con ninguna orden de Orbita (puede ser de otro proveedor de Bolívar).',
+};
+
+/**
+ * Órdenes candidatas, con la factura que ya las cubre (si la hay) y la tarifa de
+ * venta vigente del pagador. La tarifa por tipo de orden gana a la general
+ * (`tipo_orden_id NULL`), y entre dos de la misma clase gana la más reciente.
+ */
+const SQL_CANDIDATAS = `
+  SELECT o.id, o.codigo, o.arl_id, a.nombre AS arl_nombre, a.tercero_id,
+         o.numero_orden, o.codigo_cronograma, o.secuencia, o.empresa_nombre,
+         o.tipo_actividad, o.tema_actividad, o.horas_asignadas, o.valor_unitario, o.valor_total,
+         COALESCE((o.viaticos_detalle->>'transporte')::numeric, 0) AS transporte,
+         o.estado_arl::text AS estado_arl, o.numero_prefactura,
+         to_char(COALESCE(o.fecha_ejecucion, o.fecha_programada, o.actualizado_en), 'YYYY-MM-DD') AS fecha_ejecucion,
+         doc.documento_id, doc.documento_estado,
+         tv.valor AS tarifa_valor, tv.unidad AS tarifa_unidad
+    FROM sst.ordenes_servicio o
+    JOIN sst.arls a ON a.id = o.arl_id
+    LEFT JOIN LATERAL (
+      SELECT d.id AS documento_id, d.estado AS documento_estado
+        FROM sst.documento_ordenes dor
+        JOIN sst.documentos_electronicos d ON d.id = dor.documento_id
+       WHERE dor.orden_id = o.id AND d.tipo = 'FACTURA'
+         AND d.estado IN ('BORRADOR', 'ENVIANDO', 'VALIDADO')
+       ORDER BY (d.estado = 'VALIDADO') DESC, d.creado_en DESC
+       LIMIT 1
+    ) doc ON true
+    LEFT JOIN LATERAL (
+      SELECT t.valor, t.unidad
+        FROM sst.tarifas_venta t
+       WHERE t.pagador_tercero_id = a.tercero_id AND t.activo
+         AND t.vigente_desde <= CURRENT_DATE
+         AND (t.tipo_orden_id = o.tipo_orden_id OR t.tipo_orden_id IS NULL)
+       -- Un pagador puede tener tarifa por HORA y por UNIDAD a la vez: una orden con
+       -- horas se cobra por hora, y una sin ellas, por unidad.
+       ORDER BY (t.tipo_orden_id IS NOT NULL) DESC,
+                (t.unidad = CASE WHEN COALESCE(o.horas_asignadas, 0) > 0 THEN 'HORA' ELSE 'UNIDAD' END) DESC,
+                t.vigente_desde DESC
+       LIMIT 1
+    ) tv ON true
+   WHERE o.estado = 'FINALIZADA'
+     AND o.estado_cobro = 'NO FACTURADA'
+     AND doc.documento_estado IS DISTINCT FROM 'VALIDADO'
+     AND ($1::uuid IS NULL OR o.arl_id = $1)
+   ORDER BY o.codigo_cronograma NULLS LAST, o.secuencia NULLS LAST, o.codigo`;
+
+/** Motivo por el que una candidata no se puede facturar aún, o `null` si sí. */
+function motivoBloqueo(o) {
+  if (!o.tercero_id) return MOTIVOS.SIN_TERCERO;
+  if (o.estado_arl !== 'APROBADO') return MOTIVOS.NO_APROBADA;
+  if (o.documento_estado === 'ENVIANDO') return MOTIVOS.ENVIANDO;
+  if (o.documento_id) return MOTIVOS.EN_BORRADOR;
+  return null;
+}
+
+/**
+ * Valor de referencia de una orden que NO viene de prefactura. El orden de
+ * confianza es: tarifa de venta del pagador (A0-06, lo pactado con él) → valor
+ * que trajo el documento de la ARL → nada. Nunca se inventa un "estándar": sin
+ * cifra la línea queda en blanco y el borrador (A1-04) obliga a completarla.
+ */
+function valorReferencia(o) {
+  const horas = Number(o.horas_asignadas) || 0;
+  if (o.tarifa_valor != null) {
+    const centavos = o.tarifa_unidad === 'UNIDAD' ? aCentavos(o.tarifa_valor) : aCentavos(horas * Number(o.tarifa_valor));
+    return { valor: Number(deCentavos(centavos)), origen: 'TARIFA' };
+  }
+  if (o.valor_total != null && Number(o.valor_total) > 0) return { valor: Number(o.valor_total), origen: 'ORDEN' };
+  return { valor: null, origen: null };
+}
+
+function lineaDeOrden(o, extra = {}) {
+  const motivo = extra.motivo ?? motivoBloqueo(o);
+  const { valor, origen } = extra.valor !== undefined ? extra : valorReferencia(o);
+  return {
+    clave: extra.fila_id ? `fila:${extra.fila_id}` : `orden:${o.id}`,
+    orden_id: o.id,
+    fila_id: extra.fila_id ?? null,
+    codigo: o.codigo,
+    numero_orden: o.numero_orden,
+    codigo_cronograma: o.codigo_cronograma,
+    secuencia: o.secuencia,
+    empresa_nombre: o.empresa_nombre,
+    tipo_actividad: o.tipo_actividad,
+    tema_actividad: o.tema_actividad,
+    horas: o.horas_asignadas != null ? Number(o.horas_asignadas) : null,
+    valor_unitario: o.tarifa_unidad === 'HORA' && o.tarifa_valor != null ? Number(o.tarifa_valor)
+      : o.valor_unitario != null ? Number(o.valor_unitario) : null,
+    transporte: Number(extra.transporte ?? o.transporte) || 0,
+    fecha_ejecucion: o.fecha_ejecucion,
+    valor_referencia: valor,
+    origen_valor: origen,
+    facturable: motivo == null,
+    motivo,
+    marcada_por_defecto: motivo == null && (extra.marcada ?? false),
+    documento_id: o.documento_id,
+    documento_estado: o.documento_estado,
+  };
+}
+
+const total = (lineas) => Number(deCentavos(lineas.reduce((s, l) => s + aCentavos(l.valor_referencia ?? 0), 0)));
+
+/**
+ * Prefactura de Bolívar → grupo con una línea por fila. Las filas cuya orden ya
+ * quedó facturada (o validada) se cuentan aparte y no se listan: una prefactura
+ * a medias sigue siendo facturable por lo que le falta.
+ */
+function grupoDePrefactura(pf, filas, ordenesPorId) {
+  const lineas = [];
+  let yaFacturadas = 0;
+  for (const f of filas) {
+    if (f.orden_id && !ordenesPorId.has(f.orden_id)) {
+      // La orden existe pero no es candidata: o ya se facturó, o aún no está FINALIZADA.
+      yaFacturadas += f.orden_finalizada_facturada ? 1 : 0;
+      if (f.orden_finalizada_facturada) continue;
+      lineas.push({
+        clave: `fila:${f.id}`, orden_id: f.orden_id, fila_id: f.id, codigo: f.orden_codigo,
+        numero_orden: null, codigo_cronograma: f.codigo_cronograma, secuencia: f.secuencia,
+        empresa_nombre: f.razon_social, tipo_actividad: f.actividad_programa, tema_actividad: null,
+        horas: null, valor_unitario: null, transporte: Number(f.transporte) || 0, fecha_ejecucion: null,
+        valor_referencia: f.valor_a_facturar != null ? Number(f.valor_a_facturar) : null, origen_valor: 'PREFACTURA',
+        facturable: false, motivo: 'La orden todavía no está finalizada.', marcada_por_defecto: false,
+        documento_id: null, documento_estado: null,
+      });
+      continue;
+    }
+
+    const valor = f.valor_a_facturar != null ? Number(f.valor_a_facturar) : null;
+    if (!f.orden_id) {
+      // Bolívar paga lo que dice su prefactura, aunque Orbita no conozca la orden;
+      // pero puede ser de OTRO proveedor, así que no se marca sola.
+      lineas.push({
+        clave: `fila:${f.id}`, orden_id: null, fila_id: f.id, codigo: null, numero_orden: null,
+        codigo_cronograma: f.codigo_cronograma, secuencia: f.secuencia, empresa_nombre: f.razon_social,
+        tipo_actividad: f.actividad_programa, tema_actividad: null, horas: null, valor_unitario: null,
+        transporte: Number(f.transporte) || 0, fecha_ejecucion: null,
+        valor_referencia: valor, origen_valor: 'PREFACTURA',
+        facturable: true, motivo: null, aviso: MOTIVOS.SIN_ORDEN, marcada_por_defecto: false,
+        documento_id: null, documento_estado: null,
+      });
+      continue;
+    }
+
+    const o = ordenesPorId.get(f.orden_id);
+    const motivo = o.numero_prefactura && o.numero_prefactura !== pf.numero_prefactura
+      ? MOTIVOS.OTRA_PREFACTURA
+      : motivoBloqueo(o);
+    lineas.push(lineaDeOrden(o, {
+      fila_id: f.id, valor, origen: 'PREFACTURA', motivo, transporte: f.transporte, marcada: true,
+    }));
+  }
+  const facturables = lineas.filter((l) => l.facturable && l.marcada_por_defecto);
+  return {
+    clave: `prefactura:${pf.id}`,
+    tipo: 'PREFACTURA',
+    prefactura: {
+      id: pf.id, numero: pf.numero_prefactura, fecha_corte: pf.fecha_corte,
+      valor_total: pf.valor_total != null ? Number(pf.valor_total) : null,
+    },
+    ya_facturadas: yaFacturadas,
+    lineas,
+    n_facturables: lineas.filter((l) => l.facturable).length,
+    total_marcadas: total(facturables),
+  };
+}
+
+/**
+ * La relación completa, por pagador. `arlId` la acota a un solo pagador; `db`
+ * permite correrla dentro de una transacción (los scripts de verificación).
+ * @returns {Promise<{pagadores: object[]}>}
+ */
+export async function relacionPorFacturar({ arlId = null } = {}, db = pool) {
+  const candidatas = (await db.query(SQL_CANDIDATAS, [arlId])).rows;
+  const arls = (await db.query(
+    `SELECT a.id, a.nombre, a.tercero_id,
+            COALESCE(t.razon_social, btrim(concat_ws(' ', t.nombres, t.apellidos))) AS tercero_nombre
+       FROM sst.arls a LEFT JOIN sst.terceros t ON t.id = a.tercero_id
+      WHERE ($1::uuid IS NULL OR a.id = $1)
+      ORDER BY a.nombre`,
+    [arlId],
+  )).rows;
+
+  // Filas de prefactura de Bolívar que aún tienen algo por facturar. La orden
+  // ligada puede ser candidata o no; `orden_finalizada_facturada` distingue las
+  // que ya están facturadas de las que simplemente aún no se finalizan.
+  const filas = (await db.query(
+    `SELECT pf.id AS prefactura_id, f.id, f.orden_id, f.codigo_cronograma, f.secuencia, f.razon_social,
+            f.actividad_programa, f.transporte, f.valor_a_facturar, o.codigo AS orden_codigo,
+            (o.id IS NOT NULL AND (o.estado_cobro = 'FACTURADA' OR EXISTS (
+               SELECT 1 FROM sst.documento_ordenes dor
+                WHERE dor.orden_id = o.id AND dor.documento_validado_id IS NOT NULL))) AS orden_finalizada_facturada
+       FROM sst.prefactura_filas f
+       JOIN sst.prefacturas pf ON pf.id = f.prefactura_id
+       LEFT JOIN sst.ordenes_servicio o ON o.id = f.orden_id
+      ORDER BY pf.fecha_corte DESC NULLS LAST, pf.numero_prefactura DESC, f.codigo_cronograma, f.secuencia`,
+  )).rows;
+  const prefacturas = (await db.query(
+    `SELECT id, numero_prefactura, fecha_corte, valor_total FROM sst.prefacturas`,
+  )).rows;
+
+  const ordenesPorId = new Map(candidatas.map((o) => [o.id, o]));
+  const pagadores = [];
+
+  for (const arl of arls) {
+    const propias = candidatas.filter((o) => o.arl_id === arl.id);
+    const base = {
+      arl_id: arl.id, arl_nombre: arl.nombre, tercero_id: arl.tercero_id, tercero_nombre: arl.tercero_nombre,
+    };
+
+    if (!esBolivar(arl.nombre)) {
+      const lineas = propias.map((o) => lineaDeOrden(o));
+      pagadores.push({
+        ...base, modo: 'SELECCION',
+        grupos: lineas.length
+          ? [{ clave: `ordenes:${arl.id}`, tipo: 'ORDENES', lineas, n_facturables: lineas.filter((l) => l.facturable).length }]
+          : [],
+      });
+      continue;
+    }
+
+    const grupos = [];
+    const enPrefactura = new Set();
+    for (const pf of prefacturas) {
+      const susFilas = filas.filter((f) => f.prefactura_id === pf.id);
+      const grupo = grupoDePrefactura(pf, susFilas, ordenesPorId);
+      susFilas.forEach((f) => f.orden_id && enPrefactura.add(f.orden_id));
+      if (grupo.lineas.length) grupos.push(grupo);
+    }
+    // Candidatas de Bolívar que ninguna prefactura cargada cubre: informativas,
+    // no se pueden facturar hasta cargar la prefactura (Q-15).
+    const sueltas = propias
+      .filter((o) => !enPrefactura.has(o.id))
+      .map((o) => lineaDeOrden(o, { motivo: motivoBloqueo(o) ?? MOTIVOS.SIN_PREFACTURA }));
+    if (sueltas.length) {
+      grupos.push({ clave: `sin-prefactura:${arl.id}`, tipo: 'ORDENES', sin_prefactura: true, lineas: sueltas, n_facturables: 0 });
+    }
+    pagadores.push({ ...base, modo: 'PREFACTURA', grupos });
+  }
+  return { pagadores };
+}
+
+/**
+ * Valida una selección para crear la factura (lo usará A1-04): todas las líneas
+ * elegidas deben existir, ser del mismo pagador y estar libres. No escribe nada.
+ *
+ * @param {{arlId: string, ordenIds?: string[], prefacturaId?: string, filaIds?: string[]}} sel
+ *   AXA/Colmena/privados: `ordenIds`. Bolívar: `prefacturaId` (+ `filaIds`
+ *   opcional; sin él se toman las filas marcadas por defecto).
+ */
+export async function resolverSeleccion({ arlId, ordenIds = [], prefacturaId = null, filaIds = null }, db = pool) {
+  if (!arlId) throw badRequest('Indique el pagador (arl_id).');
+  const { pagadores } = await relacionPorFacturar({ arlId }, db);
+  const pagador = pagadores[0];
+  if (!pagador) throw badRequest('Ese pagador no existe.');
+
+  let lineas;
+  let prefactura = null;
+  if (pagador.modo === 'PREFACTURA') {
+    if (!prefacturaId) throw badRequest('Bolívar se factura por prefactura: indique cuál (prefactura_id).');
+    const grupo = pagador.grupos.find((g) => g.prefactura?.id === prefacturaId);
+    if (!grupo) throw badRequest('Esa prefactura no existe o ya no tiene nada por facturar.');
+    prefactura = grupo.prefactura;
+    const elegidas = filaIds ? new Set(filaIds) : null;
+    lineas = grupo.lineas.filter((l) => (elegidas ? elegidas.has(l.fila_id) : l.marcada_por_defecto));
+    if (elegidas) {
+      const faltan = [...elegidas].filter((id) => !grupo.lineas.some((l) => l.fila_id === id));
+      if (faltan.length) throw badRequest('Alguna fila elegida no pertenece a esa prefactura.');
+    }
+  } else {
+    if (prefacturaId) throw badRequest('Solo Bolívar se factura por prefactura.');
+    if (!ordenIds.length) throw badRequest('Elija al menos una orden.');
+    const todas = pagador.grupos.flatMap((g) => g.lineas);
+    lineas = ordenIds.map((id) => {
+      const l = todas.find((x) => x.orden_id === id);
+      if (!l) throw badRequest('Alguna orden elegida no es del pagador o ya no está por facturar.');
+      return l;
+    });
+  }
+
+  if (!lineas.length) throw badRequest('No hay nada que facturar en la selección.');
+  const bloqueadas = lineas.filter((l) => !l.facturable);
+  if (bloqueadas.length) {
+    throw badRequest(
+      `${bloqueadas.length === 1 ? 'Una orden no se puede' : `${bloqueadas.length} órdenes no se pueden`} facturar todavía: `
+      + bloqueadas.map((l) => `${l.codigo ?? `${l.codigo_cronograma}/${l.secuencia}`} (${l.motivo})`).join('; '),
+      { bloqueadas: bloqueadas.map((l) => ({ clave: l.clave, motivo: l.motivo })) },
+    );
+  }
+  return {
+    pagador: {
+      arl_id: pagador.arl_id, arl_nombre: pagador.arl_nombre,
+      tercero_id: pagador.tercero_id, tercero_nombre: pagador.tercero_nombre,
+    },
+    prefactura,
+    lineas,
+    total: total(lineas),
+  };
+}
