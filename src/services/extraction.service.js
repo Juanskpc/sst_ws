@@ -78,7 +78,9 @@ const SIPAB_HEADERS = {
   'profesional': null,
   'nombre profesional': '@profesional_arl', // profesional que sugiere la ARL (casi siempre vacío)
   'asesor gestion riesgos crono': null,
-  'nombre asesor gestion riesgos': null,
+  // El AGR de Bolívar: va a la casilla 16 del AT-031, que hasta sep-2026 salía en
+  // blanco. La columna de arriba (`… crono`) es su código numérico, sin uso.
+  'nombre asesor gestion riesgos': 'asesor_gestion_riesgo',
   'director sectorial': null,
   'nombre director sectorial': null,
   'observaciones': 'descripcion',           // el detalle real: tema, contacto y requisitos

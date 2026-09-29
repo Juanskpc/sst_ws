@@ -87,8 +87,12 @@ export function slugArl(nombre) {
  */
 const FORMATOS = {
   // --- Bolívar · PDF con formulario ---
+  // T0-13 · alcance 'orden': Bolívar pidió UN solo AT-031 por orden, aunque la
+  // visita se reparta en varios días (el AT-028 de asistencia sí va uno por
+  // sesión, y sigue en 'sesion' más abajo). `camposSeguimientoBolivar` recibe
+  // por eso el TRAMO de la visita entera (`tramoDe`), no una sesión suelta.
   at031: {
-    archivo: 'bolivar/seguimiento.pdf', modo: 'acroform', alcance: 'sesion',
+    archivo: 'bolivar/seguimiento.pdf', modo: 'acroform', alcance: 'orden',
     tipo: 'seguimiento', nombre: 'seguimiento.pdf',
     etiqueta: 'Seguimiento de reuniones y actividades (AT-031)',
     campos: camposSeguimientoBolivar, marcas: marcasSeguimientoBolivar,
@@ -132,23 +136,31 @@ const FORMATOS = {
   },
 
   // --- Colmena ---
+  // T0-11 · `fechaImpresion: true` estampa "Fecha de impresión: DD/MM/AAAA" en
+  // el margen inferior derecho (7 pt, sin tapar nada): es la fecha en que se
+  // GENERA el documento, no la de la visita, que sigue en blanco a propósito
+  // (supuesto por defecto de la ficha; ninguna de las celdas DD/MM/AAAA impresas
+  // se toca). Solo los tres formatos de Colmena la llevan.
   prestacionColmena: {
     archivo: 'colmena/prestacion-servicios.pdf', modo: 'plano', alcance: 'sesion',
     tipo: 'prestacion_servicios', nombre: 'prestacion-de-servicios.pdf',
     etiqueta: 'Informe de prestación de servicios (PSP-F-007)',
     casillas: () => CASILLAS_PRESTACION_COLMENA, valores: valoresPrestacionColmena,
+    fechaImpresion: true,
   },
   asistenciaColmena: {
     archivo: 'colmena/asistencia.pdf', modo: 'plano', alcance: 'sesion',
     tipo: 'asistencia', nombre: 'asistencia.pdf',
     etiqueta: 'Registro de asistencia (PSP-F-006)',
     casillas: () => CASILLAS_ASISTENCIA_COLMENA, valores: valoresAsistenciaColmena,
+    fechaImpresion: true,
   },
   evaluacionColmena: {
     archivo: 'colmena/evaluacion.pdf', modo: 'plano', alcance: 'sesion',
     tipo: 'evaluacion', nombre: 'evaluacion.pdf',
     etiqueta: 'Evaluación de la sesión (PSP-F-010)',
     casillas: () => CASILLAS_EVALUACION_COLMENA, valores: valoresEvaluacionColmena,
+    fechaImpresion: true,
   },
   registroEjecucionColmena: {
     archivo: 'colmena/registro-ejecucion.xls', modo: 'adjunto', alcance: 'orden',
@@ -423,7 +435,8 @@ function camposAsistenciaBolivar(orden, profesional, sesion, aliado) {
     Text6: orden.empresa_nombre,             // Empresa
     Text7: orden.nit_nic,                    // NIT - Grupo
     Text8: aliado.plan_bolivar,              // Plan
-    Text9: temaDeLaOrden(orden),             // Tema y/o Actividad a realizar
+    // El tema escrito a mano (T0-05) gana; sin él, el título del SIPAB como siempre.
+    Text9: enBlanco(orden.tema_actividad) || temaDeLaOrden(orden), // Tema y/o Actividad a realizar
     Text11: sesion.horaInicio,               // Horario · De
     Text12: sesion.horaFin,                  // Horario · Hasta
     Text13: orden.ciudad_ejecucion,          // Ciudad / Departamento de prestación
@@ -433,13 +446,20 @@ function camposAsistenciaBolivar(orden, profesional, sesion, aliado) {
   };
 }
 
-/** Seguimiento de Reuniones y Actividades · Forma AT-031. */
-function camposSeguimientoBolivar(orden, profesional, sesion, aliado) {
+/**
+ * Seguimiento de Reuniones y Actividades · Forma AT-031.
+ *
+ * T0-13 · Recibe el TRAMO de la visita entera (`tramoDe`), no una sesión: es un
+ * solo documento aunque haya varios días. `tramo.dia/mes/anio` y
+ * `tramo.horaInicio` son los de la PRIMERA sesión; `tramo.horaFin`, los de la
+ * ÚLTIMA (supuesto por defecto de la ficha, Q-06).
+ */
+function camposSeguimientoBolivar(orden, profesional, tramo, aliado) {
   const contacto = contactoEmpresa(orden);
   return {
-    Text1: sesion.dia,                       // Fecha de prestación · DD
-    Text2: sesion.mes,                       // MM
-    3: sesion.anio,                          // AAAA
+    Text1: tramo.dia,                        // Fecha de prestación · DD
+    Text2: tramo.mes,                        // MM
+    3: tramo.anio,                           // AAAA
     4: orden.codigo_cronograma,              // SIPAB No. Cronograma
     5: orden.secuencia,                      // Secuencia
     6: orden.empresa_nombre,                 // Empresa
@@ -449,9 +469,9 @@ function camposSeguimientoBolivar(orden, profesional, sesion, aliado) {
     10: orden.contacto_sst_correo,           // Correo Electrónico
     11: orden.ciudad_ejecucion,              // Ciudad / Departamento de prestación
     13: aliado.plan_bolivar,                 // PLAN
-    // 16 (Asesor Gestión del Riesgo) lo pone Bolívar, no nosotros.
-    14: sesion.horaInicio,                   // Hora Inicio
-    15: sesion.horaFin,                      // Hora Salida
+    14: tramo.horaInicio,                    // Hora Inicio (de la primera sesión)
+    15: tramo.horaFin,                       // Hora Salida (de la última sesión)
+    16: orden.asesor_gestion_riesgo,         // Asesor Gestión del Riesgo (del SIPAB)
     17: aliado.nombre,                       // Nombre Aliado Estratégico
     18: aliado.codigo_bolivar,               // Código Aliado Estratégico
     19: profesional?.nombre,                 // Participantes ARL · Nombres
@@ -459,8 +479,16 @@ function camposSeguimientoBolivar(orden, profesional, sesion, aliado) {
     21: contacto.nombre,                     // Participantes Empresa · Nombres
     22: contacto.cargo,                      // Participantes Empresa · Cargo
     27: temaDeLaOrden(orden),                // Actividad a realizar
-    // 28 (Temas desarrollados), 29/31/32 (compromisos), 42 (observaciones) y
-    // 43-47 (próxima reunión) son de la sesión: los diligencia el profesional.
+    // Temas desarrollados: solo si alguien escribió el tema a mano (T0-05). Sin él
+    // queda en blanco, como antes: repetir aquí el título de arriba no aporta nada.
+    28: enBlanco(orden.tema_actividad) || undefined,
+    // T0-13 · Con un solo documento para varios días, "Fecha de prestación" y el
+    // horario ya no alcanzan a contar la historia completa: aquí va el detalle
+    // sesión a sesión ("Sesiones: 19/08 8:00-10:00; 20/08 8:00-10:00"), y solo
+    // cuando de verdad hay más de un día — con uno solo repetirlo no aporta.
+    42: enBlanco(tramo.observaciones) || undefined,
+    // 29/31/32 (compromisos) y 43-47 (próxima reunión) son de la sesión: los
+    // diligencia el profesional.
   };
 }
 
@@ -531,12 +559,15 @@ const CASILLAS_PRESTACION_COLMENA = [
   ['empresa', 185, 934, 620],
   ['nit', 95, 905, 270],
   ['ciudad', 560, 905, 245],
-  // Fila de datos de "Descripción del servicio solicitado". Solo se rellenan
-  // las dos columnas que la orden conoce: la actividad y las unidades
-  // contratadas. Línea de intervención, programa y componentes son la
-  // clasificación interna de Colmena, y "ejecutada" solo se sabe al terminar.
+  // Fila de datos de "Descripción del servicio solicitado". Se rellenan la
+  // actividad y las dos columnas de cantidad: "Solicitada" son las horas
+  // TOTALES de la orden (lo que pide el documento) y "Ejecutada" las de ESTA
+  // sesión (T0-12) — en una orden de 8 h repartida en dos franjas de 4, cada
+  // PSP-F-007 sale con 8 solicitadas y 4 ejecutadas. Línea de intervención,
+  // programa y componentes son la clasificación interna de Colmena.
   ['actividad', 406, 822, 158],
   ['cantidad_solicitada', 572, 822, 84],
+  ['cantidad_ejecutada', 684, 822, 84],
   // Sobre las rayas del bloque de firma.
   ['razon_social_proveedor', 75, 403, 445],
   ['nombre_profesional', 75, 360, 445],
@@ -641,6 +672,9 @@ function valoresPrestacionColmena(orden, profesional, sesion, aliado) {
     ciudad: orden.ciudad_ejecucion,
     actividad: temaDeLaOrden(orden),
     cantidad_solicitada: horasTexto(orden.horas_asignadas),
+    // T0-12 · Las horas de ESTA sesión, no las de la orden: es la misma regla
+    // que ya usan el AT-028 de Bolívar y el registro de AXA (`sesion.horas`).
+    cantidad_ejecutada: sesion.horas,
     razon_social_proveedor: aliado.nombre,
     nombre_profesional: profesional?.nombre,
   };
@@ -690,7 +724,31 @@ function camposFichaAxa(orden, profesional, tramo, aliado) {
  * invada la columna vecina o se salga de la raya; solo si ni al mínimo entra se
  * recorta con puntos suspensivos, que al menos se ve que falta algo.
  */
-async function rellenarPdfPlano(rutaPlantilla, casillas, valores) {
+/**
+ * T0-11 · Tamaño y margen de la "Fecha de impresión" que llevan los tres PDF de
+ * Colmena. 7 pt porque es una anotación de trazabilidad, no un dato del
+ * formato: tiene que leerse sin competir con lo que sí hay que diligenciar. El
+ * margen se midió con `inspeccionar-formato.mjs` contra los tres PDF: el más
+ * bajo de los tres tiene su último texto en y≈52 (el código "PSP-F-… V…" del
+ * pie), así que y=20 queda libre en los tres sin tapar nada.
+ */
+const TAMANO_FECHA_IMPRESION = 7;
+const MARGEN_FECHA_IMPRESION = 24;
+
+/**
+ * Escribe los valores sobre un formato sin formulario.
+ *
+ * La letra se encoge hasta caber en su casilla en vez de dejar que el texto
+ * invada la columna vecina o se salga de la raya; solo si ni al mínimo entra se
+ * recorta con puntos suspensivos, que al menos se ve que falta algo.
+ *
+ * `fechaImpresion: true` añade, en el margen inferior derecho, "Fecha de
+ * impresión: DD/MM/AAAA" con la fecha de HOY (T0-11): es la fecha en que se
+ * generó el documento, no la de la visita, que sigue en blanco en el PDF (la
+ * pone el asesor a mano, tal como estaba). Solo lo piden los tres formatos de
+ * Colmena; AXA, que también es `modo: 'plano'`, no lo lleva.
+ */
+async function rellenarPdfPlano(rutaPlantilla, casillas, valores, { fechaImpresion = false } = {}) {
   const doc = await PDFDocument.load(await fs.readFile(rutaPlantilla));
   const pagina = doc.getPage(0);
   const font = await doc.embedFont(StandardFonts.Helvetica);
@@ -706,6 +764,22 @@ async function rellenarPdfPlano(rutaPlantilla, casillas, valores) {
     }
     pagina.drawText(texto, { x, y, size: tamano, font, color: negro });
   }
+
+  if (fechaImpresion) {
+    const hoy = new Date();
+    const dd = String(hoy.getDate()).padStart(2, '0');
+    const mm = String(hoy.getMonth() + 1).padStart(2, '0');
+    const texto = `Fecha de impresión: ${dd}/${mm}/${hoy.getFullYear()}`;
+    const ancho = font.widthOfTextAtSize(texto, TAMANO_FECHA_IMPRESION);
+    pagina.drawText(texto, {
+      x: pagina.getWidth() - MARGEN_FECHA_IMPRESION - ancho,
+      y: MARGEN_FECHA_IMPRESION - 4,
+      size: TAMANO_FECHA_IMPRESION,
+      font,
+      color: negro,
+    });
+  }
+
   return Buffer.from(await doc.save());
 }
 
@@ -718,14 +792,51 @@ async function rellenarPdfPlano(rutaPlantilla, casillas, valores) {
  * informe o una ficha técnica cubre toda la actividad, así que lo que necesita
  * es la fecha en que empieza y la fecha en que termina, no el horario de una
  * franja suelta.
+ *
+ * T0-13 · El AT-031 de Bolívar (único por orden desde esta tanda) necesita
+ * además el desglose día/mes/año y el horario de la PRIMERA y la ÚLTIMA sesión
+ * —no solo la fecha—, y el detalle sesión a sesión cuando la visita cruza más
+ * de un día. Se calcula aquí y no en `sesionDe()` porque es del TRAMO completo,
+ * no de una franja suelta; los demás formatos de alcance 'orden' (AXA) siguen
+ * usando solo `fechaInicio`/`fechaFin`, que no cambiaron.
  */
 function tramoDe(franjas) {
-  const fechas = franjas.map((f) => enBlanco(f?.fecha)).filter(Boolean).sort();
+  // Por fecha+hora real, no por el orden en que se cargaron las franjas: "la
+  // primera sesión" y "la última" son las del calendario, no las de la lista.
+  const ordenadas = franjas
+    .filter((f) => enBlanco(f?.fecha))
+    .slice()
+    .sort((a, b) => `${a.fecha}T${enBlanco(a.hora_inicio) || '00:00'}`
+      .localeCompare(`${b.fecha}T${enBlanco(b.hora_inicio) || '00:00'}`));
   const corta = (iso) => {
     const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso || '');
     return m ? `${m[3]}/${m[2]}/${m[1]}` : '';
   };
-  return { fechaInicio: corta(fechas[0]), fechaFin: corta(fechas[fechas.length - 1]) };
+  const primera = ordenadas[0] ?? null;
+  const ultima = ordenadas[ordenadas.length - 1] ?? null;
+  const isoPrimera = primera ? /^(\d{4})-(\d{2})-(\d{2})/.exec(primera.fecha) : null;
+
+  // Sin cero a la izquierda en la hora ("8:00", no "08:00"): así se ve el
+  // ejemplo de la ficha, y ahorra espacio en una casilla que ya lleva varias
+  // sesiones seguidas.
+  const horaCorta = (hhmm) => String(hhmm ?? '').replace(/^0(\d:)/, '$1');
+  const dias = [...new Set(ordenadas.map((f) => f.fecha))];
+  const observaciones = dias.length > 1
+    ? `Sesiones: ${ordenadas
+        .map((f) => `${corta(f.fecha).slice(0, 5)} ${horaCorta(f.hora_inicio)}-${horaCorta(f.hora_fin)}`)
+        .join('; ')}`
+    : '';
+
+  return {
+    fechaInicio: corta(primera?.fecha),
+    fechaFin: corta(ultima?.fecha),
+    dia: isoPrimera ? isoPrimera[3] : '',
+    mes: isoPrimera ? isoPrimera[2] : '',
+    anio: isoPrimera ? isoPrimera[1] : '',
+    horaInicio: primera?.hora_inicio ? horaAmPm(primera.hora_inicio) : '',
+    horaFin: ultima?.hora_fin ? horaAmPm(ultima.hora_fin) : '',
+    observaciones,
+  };
 }
 
 /** Un formato ya generado, listo para adjuntarse al correo. */
@@ -805,5 +916,8 @@ async function construir(def, orden, profesional, sesion, aliado) {
       def.marcas ? def.marcas(orden) : [],
     );
   }
-  return rellenarPdfPlano(ruta, def.casillas(), def.valores(orden, profesional, sesion, aliado));
+  return rellenarPdfPlano(
+    ruta, def.casillas(), def.valores(orden, profesional, sesion, aliado),
+    { fechaImpresion: !!def.fechaImpresion },
+  );
 }
