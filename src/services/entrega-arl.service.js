@@ -305,10 +305,17 @@ const REGLAS = [
   },
 
   // --- Colmena -------------------------------------------------------------
+  // 27-sep-2026 (revisiones del cliente, R3): la capacitación ya no lleva el
+  // registro de ejecución (.xls) ni la plantilla de presentaciones (.pptx). El
+  // cliente pidió "que no se vayan los formatos en Excel ni el instructivo";
+  // "instructivo" no es un archivo con ese nombre y se entendió como la
+  // plantilla (supuesto Q-03, por confirmar). Las definiciones siguen en
+  // `formatos-arl.service.js` por si otra regla las vuelve a necesitar, y
+  // ninguna de las dos volvía por el portal (`DEVUELVE` = null), así que las
+  // casillas de soportes no cambian.
   {
     arl: 'colmena', tipo: TIPOS_ACTIVIDAD.CAPACITACION,
-    formatos: ['prestacionColmena', 'asistenciaColmena', 'registroEjecucionColmena',
-               'evaluacionColmena', 'plantillaColmena'],
+    formatos: ['prestacionColmena', 'asistenciaColmena', 'evaluacionColmena'],
     extras: ['evidencias'],
   },
   {

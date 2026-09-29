@@ -20,7 +20,7 @@ import {
   casillasDeOrden, esCategoriaValida, etiquetaCategoria, listaEtiquetas, normalizarCategoria,
 } from '../../services/soportes.service.js';
 import {
-  normalizarModalidadEjecucion, normalizarTipoActividadBolivar,
+  esBolivar, normalizarModalidadEjecucion, normalizarTipoActividadBolivar,
 } from '../../utils/bolivar.js';
 import { avisoDeEntrega, entregaDeLaOrden } from '../../services/entrega-arl.service.js';
 
@@ -49,12 +49,18 @@ async function valorHoraDeOrden({ ordenId, profesional }, client) {
   );
   const tipo = r.rows[0];
 
-  if (tipo?.nombre) {
+  if (tipo?.id) {
+    // T0-10 · Por ID del tipo. El respaldo por nombre NORMALIZADO es solo para las
+    // tarifas que no se pudieron enlazar (`tipo_orden_id` NULL): antes se casaba
+    // texto contra texto con `lower()` y "Capacitacion" sin tilde nunca coincidía
+    // con "Capacitación", así que la orden caía al valor del tipo sin avisar.
     const propia = await client.query(
       `SELECT valor_hora FROM sst.tarifas_actividad_profesional
-        WHERE profesional_id=$1 AND lower(actividad)=lower($2) AND vigente_desde <= CURRENT_DATE
+        WHERE profesional_id=$1 AND vigente_desde <= CURRENT_DATE
+          AND (tipo_orden_id = $2
+               OR (tipo_orden_id IS NULL AND sst.norm_texto(actividad) = sst.norm_texto($3)))
         ORDER BY vigente_desde DESC LIMIT 1`,
-      [profesional.id, tipo.nombre]
+      [profesional.id, tipo.id, tipo.nombre]
     );
     if (propia.rows[0]) {
       return { valorHora: Number(propia.rows[0].valor_hora), origen: 'tarifa' };
@@ -247,7 +253,7 @@ function franjasEnTexto(franjas) {
 // M3 · Listado filtrable (EST-05): estado, arl_id, profesional_id, q.
 router.get('/', asyncHandler(async (req, res) => {
   const estado = req.query.estado || req.query.status;
-  const { arl_id, profesional_id, q, estado_cobro } = req.query;
+  const { arl_id, profesional_id, q, estado_cobro, estado_arl } = req.query;
   const clauses = [];
   const params = [];
   if (estado) { params.push(estado); clauses.push(`estado = $${params.length}::sst.estado_orden`); }
@@ -257,6 +263,12 @@ router.get('/', asyncHandler(async (req, res) => {
   if (estado_cobro) {
     params.push(estado_cobro);
     clauses.push(`estado_cobro = $${params.length}::sst.estado_cobro`);
+  }
+  // T0-07 · La aprobación de la ARL, el otro eje que decide si una orden se puede
+  // facturar. Junto a `estado_cobro` responde "qué está listo para facturar".
+  if (estado_arl) {
+    params.push(estado_arl);
+    clauses.push(`estado_arl = $${params.length}::sst.estado_arl`);
   }
   if (arl_id) { params.push(arl_id); clauses.push(`arl_id = $${params.length}`); }
   if (profesional_id) { params.push(profesional_id); clauses.push(`profesional_asignado_id = $${params.length}`); }
@@ -410,7 +422,8 @@ router.patch('/cobro', requireRole('admin', 'contador'), asyncHandler(async (req
     // sí existe y que la DIAN ya validó — eso se corrige con una nota crédito
     // (A2-01), nunca con este PATCH.
     const filas = await client.query(
-      `SELECT o.id, o.codigo, o.estado::text AS estado, o.estado_cobro::text AS estado_cobro,
+      `SELECT o.id, o.codigo, o.arl_id, o.estado::text AS estado, o.estado_cobro::text AS estado_cobro,
+              o.estado_arl::text AS estado_arl,
               EXISTS (
                 SELECT 1 FROM sst.documento_ordenes dor WHERE dor.orden_id = o.id AND dor.documento_validado_id IS NOT NULL
               ) AS tiene_factura_orbita
@@ -431,6 +444,23 @@ router.patch('/cobro', requireRole('admin', 'contador'), asyncHandler(async (req
     // bloqueadas por tener una factura de Orbita tampoco cambian aquí.
     const bloqueadasIds = new Set(bloqueadasPorFacturaElectronica.map((f) => f.id));
     const cambian = aptas.filter((f) => f.estado_cobro !== estado && !bloqueadasIds.has(f.id));
+
+    // T0-07 · Facturar exige que la ARL haya APROBADO la orden. Se corta ANTES de
+    // tocar nada —y no se deja fuera en silencio como las sin cerrar— porque una
+    // factura emitida sobre una orden que la ARL no aprobó es la que después
+    // rechazan. Las órdenes sin ARL (A3-01, privados) no tienen esta regla.
+    if (estado === 'FACTURADA') {
+      const sinAprobar = cambian.filter((f) => f.arl_id && f.estado_arl !== 'APROBADO');
+      if (sinAprobar.length) {
+        throw badRequest(
+          sinAprobar.length === 1
+            ? 'La ARL todavía no aprueba esta orden (estado ARL: Pendiente). ' +
+              `Apruébela primero para poder facturar ${sinAprobar[0].codigo}.`
+            : 'La ARL todavía no aprueba estas órdenes (estado ARL: Pendiente): ' +
+              `${sinAprobar.map((f) => f.codigo).join(', ')}. Apruébelas primero para poder facturarlas.`,
+        );
+      }
+    }
 
     for (const fila of cambian) {
       await client.query(
@@ -480,6 +510,123 @@ router.patch('/cobro', requireRole('admin', 'contador'), asyncHandler(async (req
   res.json({ message: partes.join(' '), estado, ...resultado });
 }));
 
+// ---------------------------------------------------------------------------
+// T0-07 · Estado ARL: ¿la ARL aprobó los documentos de la orden?
+//
+// Tercer eje de la orden, junto al ciclo operativo y al de cobro, con su propio
+// enum y su propio historial. Es la condición para facturar (ver `/cobro`).
+// ---------------------------------------------------------------------------
+
+/**
+ * El eje entero; el primero es el valor por defecto de toda orden. Copiado en el
+ * enum `sst.estado_arl` de `schema.sql` y en `ESTADOS_ARL` de `core/models.ts`:
+ * si Q-08 añade un valor hay que tocar los tres.
+ */
+const ESTADOS_ARL = ['PENDIENTE', 'APROBADO'];
+
+/**
+ * Cambio del estado ARL y/o del n.º de prefactura (admin y contador), a imagen de
+ * `PATCH /orders/cobro`. Declarado ANTES de `/:id` por la misma razón que él.
+ *
+ * Es TODO O NADA —a diferencia de `/cobro`, que deja fuera las que no cumplen—:
+ * la interfaz lo llama desde el "Guardar" de una orden, y ahí lo único útil es
+ * un error que diga qué falta, no un 200 que dejó la orden sin cambiar.
+ *
+ * Reglas (T0-07):
+ *  1. APROBADO solo sobre órdenes FINALIZADAS: antes no hay soportes aceptados
+ *     que la ARL pueda aprobar.
+ *  2. En Bolívar, APROBADO exige n.º de prefactura (solo dígitos).
+ *  3. El n.º de prefactura solo existe en Bolívar.
+ *  4. Una orden ya FACTURADA no vuelve a PENDIENTE: dejaría una factura emitida
+ *     sobre una orden que la ARL "no aprobó".
+ *
+ * `numero_prefactura` omitido = se conserva el que hay; vacío = se borra. Una
+ * prefactura agrupa varias órdenes, así que el mismo número va a todas las ids.
+ */
+router.patch('/estado-arl', requireRole('admin', 'contador'), asyncHandler(async (req, res) => {
+  const ids = Array.isArray(req.body?.ids) ? req.body.ids.map((x) => String(x ?? '').trim()).filter(Boolean) : [];
+  const estado = String(req.body?.estado ?? '').trim().toUpperCase();
+  if (!ids.length) throw badRequest('Seleccione al menos una orden.');
+  if (!ESTADOS_ARL.includes(estado)) {
+    throw badRequest(`El estado ARL debe ser uno de: ${ESTADOS_ARL.join(', ')}.`);
+  }
+  const prefacturaEnviada = req.body?.numero_prefactura !== undefined;
+  const prefactura = String(req.body?.numero_prefactura ?? '').trim() || null;
+  if (prefactura && !/^\d{1,12}$/.test(prefactura)) {
+    throw badRequest('El n.º de prefactura solo admite dígitos (los de Bolívar tienen 6).');
+  }
+
+  const resultado = await withTransaction(async (client) => {
+    const filas = await client.query(
+      `SELECT o.id, o.codigo, a.nombre AS arl_nombre, o.estado::text AS estado,
+              o.estado_arl::text AS estado_arl, o.estado_cobro::text AS estado_cobro,
+              o.numero_prefactura
+         FROM sst.ordenes_servicio o JOIN sst.arls a ON a.id = o.arl_id
+        WHERE o.id = ANY($1::uuid[]) FOR UPDATE OF o`,
+      [ids]
+    );
+    if (filas.rows.length !== new Set(ids).size) {
+      throw badRequest('Alguna de las órdenes ya no existe. Recargue la lista.');
+    }
+
+    const cambios = [];
+    for (const fila of filas.rows) {
+      const bolivar = esBolivar(fila.arl_nombre);
+      const finalPrefactura = prefacturaEnviada ? prefactura : fila.numero_prefactura;
+      if (prefactura && !bolivar) {
+        throw badRequest(`${fila.codigo}: el n.º de prefactura solo aplica a Bolívar.`);
+      }
+      if (estado === 'APROBADO') {
+        if (fila.estado !== 'FINALIZADA') {
+          throw badRequest(
+            `${fila.codigo} está ${fila.estado}: la ARL solo aprueba órdenes FINALIZADAS, que ya tienen los soportes aceptados.`,
+          );
+        }
+        if (bolivar && !finalPrefactura) {
+          throw badRequest(`Indique el n.º de prefactura de ${fila.codigo}: en Bolívar es obligatorio para marcarla APROBADO.`);
+        }
+      }
+      if (estado === 'PENDIENTE' && fila.estado_arl === 'APROBADO' && fila.estado_cobro === 'FACTURADA') {
+        throw badRequest(`${fila.codigo} ya está FACTURADA: no puede volver a PENDIENTE en la ARL.`);
+      }
+
+      const cambiaEstado = fila.estado_arl !== estado;
+      const cambiaPrefactura = (fila.numero_prefactura ?? null) !== (finalPrefactura ?? null);
+      // Repetir lo mismo no es un error, pero tampoco deja rastro: otra fila de
+      // historial idéntica taparía el cambio de verdad.
+      if (!cambiaEstado && !cambiaPrefactura) continue;
+
+      await client.query(
+        `UPDATE sst.ordenes_servicio
+            SET estado_arl = $2::sst.estado_arl,
+                numero_prefactura = $3,
+                estado_arl_en = CASE WHEN $4::boolean THEN now() ELSE estado_arl_en END,
+                estado_arl_por = CASE WHEN $4::boolean THEN $5::uuid ELSE estado_arl_por END,
+                actualizado_en = now()
+          WHERE id = $1`,
+        [fila.id, estado, finalPrefactura, cambiaEstado, req.user.sub]
+      );
+      await client.query(
+        `INSERT INTO sst.historial_estado_arl
+           (orden_id, estado_anterior, estado_nuevo, numero_prefactura, usuario_id, origen)
+         VALUES ($1,$2::sst.estado_arl,$3::sst.estado_arl,$4,$5,'MANUAL')`,
+        [fila.id, fila.estado_arl, estado, finalPrefactura, req.user.sub]
+      );
+      cambios.push(fila.codigo);
+    }
+    return { actualizadas: cambios, sin_cambio: filas.rows.length - cambios.length };
+  });
+
+  const n = resultado.actualizadas.length;
+  res.json({
+    message: n
+      ? `${n} orden${n === 1 ? '' : 'es'} actualizada${n === 1 ? '' : 's'}: estado ARL ${estado}.`
+      : 'Sin cambios: la orden ya estaba así.',
+    estado,
+    ...resultado,
+  });
+}));
+
 /** Historial del eje de cobro de UNA orden: quién la movió, cuándo y por qué. */
 router.get('/:id/cobro', asyncHandler(async (req, res) => {
   const r = await pool.query(
@@ -496,7 +643,7 @@ router.get('/:id/cobro', asyncHandler(async (req, res) => {
 // Detalle completo: OS + historial + documentos + soportes + enlace público.
 router.get('/:id', asyncHandler(async (req, res) => {
   const orden = await getOrderExpanded(req.params.id);
-  const [historial, docs, soportes, enlace, franjas, historialCobro] = await Promise.all([
+  const [historial, docs, soportes, enlace, franjas, historialCobro, historialArl] = await Promise.all([
     pool.query(
       `SELECT h.*, u.nombre AS cambiado_por_nombre FROM sst.historial_estados_orden h
        LEFT JOIN sst.usuarios u ON u.id = h.cambiado_por
@@ -512,12 +659,18 @@ router.get('/:id', asyncHandler(async (req, res) => {
       `SELECT h.*, u.nombre AS cambiado_por_nombre FROM sst.historial_cobro_orden h
        LEFT JOIN sst.usuarios u ON u.id = h.cambiado_por
        WHERE h.orden_id=$1 ORDER BY h.cambiado_en`, [req.params.id]),
+    // T0-07 · Tercera línea de tiempo: la aprobación de la ARL.
+    pool.query(
+      `SELECT h.*, u.nombre AS usuario_nombre FROM sst.historial_estado_arl h
+       LEFT JOIN sst.usuarios u ON u.id = h.usuario_id
+       WHERE h.orden_id=$1 ORDER BY h.creado_en`, [req.params.id]),
   ]);
   res.json({
     data: {
       ...orden,
       historial: historial.rows,
       historial_cobro: historialCobro.rows,
+      historial_estado_arl: historialArl.rows,
       documentos: docs.rows,
       soportes: soportes.rows,
       franjas,
@@ -579,6 +732,18 @@ const CAMPOS_EDITABLES = {
   // el mismo desplazamiento, que es justo lo que el catálogo viene a evitar.
   viaticos_tipo_id: (v) => (String(v ?? '').trim() || null),
   viaticos_observacion: String,
+  // FOR · Asesor de Gestión del Riesgo de la ARL (casilla 16 del AT-031). Lo trae
+  // el SIPAB, pero se puede corregir a mano porque el .xls llega con la Ñ dañada.
+  asesor_gestion_riesgo: String,
+  // FOR · Tema/actividad propio (T0-05): sale en "Temas desarrollados" del AT-031
+  // y en "Tema y/o actividad" del AT-028. Tope de 300 caracteres porque es el
+  // largo que cabe en la casilla del formato; se rechaza en vez de recortar en
+  // silencio, que dejaría una frase cortada en un documento que se radica.
+  tema_actividad: (v) => {
+    const s = String(v ?? '').trim();
+    if (s.length > 300) throw badRequest('El tema o actividad admite máximo 300 caracteres.');
+    return s || null;
+  },
 };
 
 /** Texto del formulario → lo que va a la columna ('' se guarda como NULL). */
@@ -608,6 +773,7 @@ router.put('/:id', requireRole('admin'), asyncHandler(async (req, res) => {
   const campos = Object.keys(CAMPOS_EDITABLES).filter((c) => c in body);
   if (!campos.length) throw badRequest('No se envió ningún campo editable de la orden');
 
+  const avisos = [];
   const orden = await withTransaction(async (client) => {
     const actual = (await client.query(
       `SELECT * FROM sst.ordenes_servicio WHERE id=$1 FOR UPDATE`, [req.params.id]
@@ -666,10 +832,48 @@ router.put('/:id', requireRole('admin'), asyncHandler(async (req, res) => {
       `UPDATE sst.ordenes_servicio SET ${sets.join(', ')}, actualizado_en = now() WHERE id = $1`,
       [req.params.id, ...columnas.map((c) => valores[c])]
     );
+
+    // T0-16 · Cambiar el tipo de orden RECALCULA el valor hora con el que se paga.
+    // El valor se congela al asignar el profesional, así que sin esto el cambio de
+    // tipo dejaba el valor del tipo anterior en la orden y la cuenta de cobro
+    // salía con una cifra que nadie eligió. Solo si ya hay profesional asignado
+    // (antes no hay valor congelado que corregir: se calcula al asignar).
+    const cambiaTipo = 'tipo_orden_id' in valores
+      && (valores.tipo_orden_id ?? null) !== (actual.tipo_orden_id ?? null);
+    if (cambiaTipo && actual.profesional_asignado_id) {
+      // "Cuenta generada" = una cuenta ya creada que incluye la orden y no fue
+      // rechazada (estados de `sst.precuentas`: generada | aceptada | rechazada;
+      // no existe "borrador"). Una rechazada se REHACE con los valores de hoy, así
+      // que su orden todavía puede corregirse. En una generada o aceptada el
+      // profesional ya vio —o aceptó— esa cifra y no se le reescribe por debajo.
+      const enCuenta = (await client.query(
+        `SELECT pc.periodo, pc.estado
+           FROM sst.precuenta_items pi
+           JOIN sst.precuentas pc ON pc.id = pi.precuenta_id
+          WHERE pi.orden_id = $1 AND pc.estado IN ('generada','aceptada')
+          ORDER BY pc.creado_en DESC LIMIT 1`,
+        [req.params.id]
+      )).rows[0];
+      if (enCuenta) {
+        avisos.push(
+          `La orden ya está en la cuenta de cobro ${enCuenta.estado} de ${enCuenta.periodo}: ` +
+          'el valor hora no cambió con el nuevo tipo.',
+        );
+      } else {
+        const prof = (await client.query(
+          `SELECT * FROM sst.profesionales WHERE id=$1`, [actual.profesional_asignado_id]
+        )).rows[0];
+        const tarifa = await valorHoraDeOrden({ ordenId: req.params.id, profesional: prof }, client);
+        await client.query(
+          `UPDATE sst.ordenes_servicio SET valor_hora_cobro=$2, valor_hora_origen=$3 WHERE id=$1`,
+          [req.params.id, tarifa.valorHora, tarifa.origen]
+        );
+      }
+    }
     return actual;
   });
 
-  res.json({ data: await getOrderExpanded(orden.id) });
+  res.json({ data: await getOrderExpanded(orden.id), avisos });
 }));
 
 /**

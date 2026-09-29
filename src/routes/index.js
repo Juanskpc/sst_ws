@@ -13,6 +13,7 @@ import surveysRoutes from '../modules/surveys/surveys.routes.js';
 import billingRoutes from '../modules/billing/billing.routes.js';
 import permissionsRoutes from '../modules/permissions/permissions.routes.js';
 import companiesRoutes from '../modules/companies/companies.routes.js';
+import prefacturasRoutes from '../modules/prefacturas/prefacturas.routes.js';
 import tercerosRoutes from '../modules/terceros/terceros.routes.js';
 import parametrosRoutes from '../modules/parametros/parametros.routes.js';
 import facturacionRoutes from '../modules/facturacion/facturacion.routes.js';
@@ -52,6 +53,7 @@ router.use('/precuentas', billingRoutes);
 router.use('/notifications', notificationsRoutes);
 // M10
 router.use('/reports', reportsRoutes);
+router.use('/prefacturas', prefacturasRoutes);
 // Roles y permisos (Configuración) — matriz de acceso por vista, exclusivo admin
 router.use('/permisos', permissionsRoutes);
 // Catálogos + Configuración (montado en '/', va al final por su comodín)

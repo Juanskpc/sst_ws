@@ -7,6 +7,7 @@ import { badRequest, notFound } from '../../utils/httpError.js';
 import { getOrderExpanded } from '../orders/orders.service.js';
 import { executiveSummary, interpretSearch } from '../../services/gemini.service.js';
 import { avisarCorteDeCobro } from '../billing/billing.service.js';
+import { etiquetaTipoActividadBolivar } from '../../utils/bolivar.js';
 
 const router = Router();
 router.use(authRequired);
@@ -244,6 +245,113 @@ router.get('/cobro', asyncHandler(async (req, res) => {
       ordenes: filas.rows,
     },
   });
+}));
+
+/**
+ * T0-08 · "Bolívar: qué debo facturar" — la relación de órdenes en el MISMO
+ * formato que `RELACION ORDENES ARL BOLIVAR-…xlsx` que ya arma JD&D a mano
+ * (§3.6 del plan): mismas diez columnas, en el mismo orden, con una fila de
+ * total al final. Es la hoja que se radica junto a la prefactura.
+ *
+ * Filtro: ARL Bolívar, FINALIZADA, NO FACTURADA (lo ya facturado no vuelve a
+ * aparecer aquí) y la fecha de ejecución dentro del rango. Por defecto el rango
+ * es el ÚLTIMO CORTE DE BOLÍVAR: del 16 del mes anterior al 15 del actual —el
+ * nombre del archivo de ejemplo ("...-15 DE SEPTIEMBRE...") es ese corte—, pero
+ * se puede pedir cualquier otro con `?desde=&hasta=`.
+ */
+router.get('/relacion-bolivar', asyncHandler(async (req, res) => {
+  const hoy = new Date();
+  // Corte por defecto: si hoy es 20-sep, el corte vigente va del 16-ago al
+  // 15-sep (el que ya se puede radicar); del 1 al 15, el corte es el del propio
+  // mes (16 del mes anterior sigue siendo el mes anterior).
+  const anclaHasta = new Date(hoy.getFullYear(), hoy.getMonth(), 15);
+  const hastaPorDefecto = hoy.getDate() > 15 ? new Date(hoy.getFullYear(), hoy.getMonth() + 1, 15) : anclaHasta;
+  const desdePorDefecto = new Date(hastaPorDefecto.getFullYear(), hastaPorDefecto.getMonth() - 1, 16);
+  const aIso = (d) => d.toISOString().slice(0, 10);
+
+  const desde = /^\d{4}-\d{2}-\d{2}$/.test(req.query.desde) ? req.query.desde : aIso(desdePorDefecto);
+  const hasta = /^\d{4}-\d{2}-\d{2}$/.test(req.query.hasta) ? req.query.hasta : aIso(hastaPorDefecto);
+  if (desde > hasta) throw badRequest('"desde" no puede ser posterior a "hasta".');
+
+  const filas = (await pool.query(
+    `SELECT o.tipo_servicio_arl, o.tipo_actividad, o.descripcion,
+            o.horas_asignadas, o.valor_unitario,
+            COALESCE((o.viaticos_detalle->>'transporte')::numeric, 0) AS valor_transporte,
+            o.codigo_cronograma, o.secuencia, o.empresa_nombre, o.numero_prefactura
+       FROM sst.ordenes_servicio o
+       JOIN sst.arls a ON a.id = o.arl_id
+      WHERE a.nombre ILIKE '%bol%var%'
+        AND o.estado = 'FINALIZADA'
+        AND o.estado_cobro = 'NO FACTURADA'
+        AND COALESCE(o.fecha_ejecucion::date, o.fecha_programada::date, o.actualizado_en::date)
+            BETWEEN $1::date AND $2::date
+      ORDER BY o.codigo_cronograma, o.secuencia`,
+    [desde, hasta]
+  )).rows;
+
+  const wb = new ExcelJS.Workbook();
+  wb.creator = 'JD&D IA-Core';
+  wb.created = new Date();
+  const ws = wb.addWorksheet('Relación Bolívar');
+
+  const headers = [
+    'Tipo de actividad', 'Cantidad de horas', 'Valor unitario por hora', 'Valor transporte',
+    'Total', 'SIPAB No. De Cronograma', 'secuencia', 'Empresa', 'Actividad a realizar',
+    'Estado de facturación',
+  ];
+  ws.addRow(headers);
+  const cabecera = ws.getRow(1);
+  cabecera.font = { bold: true, size: 11 };
+  cabecera.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFBFBFBF' } };
+  cabecera.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+
+  // Sin tarifa de venta (A0-06) todavía: el valor hora es el que trajo la orden
+  // (`valor_unitario`, del documento de la ARL) y NADA MÁS. Inventar un
+  // "estándar" —como el 71.457 del ejemplo, que es la tarifa vieja de Siigo—
+  // dejaría una factura con un valor que nadie pactó. Sin él, la celda (y el
+  // Total, que depende de ella) quedan vacías y resaltadas para completarlas a
+  // mano antes de radicar.
+  const SIN_TARIFA = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFEF3C7' } };
+  let totalGeneral = 0;
+  for (const f of filas) {
+    const horas = Number(f.horas_asignadas) || 0;
+    const transporte = Number(f.valor_transporte) || 0;
+    const tieneValor = f.valor_unitario != null && Number(f.valor_unitario) > 0;
+    const valorUnitario = tieneValor ? Number(f.valor_unitario) : null;
+    const total = tieneValor ? Math.round(horas * valorUnitario + transporte) : null;
+    if (total != null) totalGeneral += total;
+
+    const tipo = etiquetaTipoActividadBolivar(f.tipo_servicio_arl)?.toLowerCase()
+      ?? (f.tipo_actividad || f.descripcion || '').toLowerCase();
+    const row = ws.addRow([
+      tipo, horas, valorUnitario ?? '', transporte, total ?? '',
+      f.codigo_cronograma || '', f.secuencia || '', f.empresa_nombre || '',
+      f.tipo_actividad || f.descripcion || '', f.numero_prefactura || '',
+    ]);
+    if (!tieneValor) {
+      row.getCell(3).fill = SIN_TARIFA;
+      row.getCell(5).fill = SIN_TARIFA;
+    }
+  }
+  const filaTotal = ws.addRow(['', '', '', '', totalGeneral, '', '', '', '', '']);
+  filaTotal.getCell(5).font = { bold: true };
+
+  ws.getColumn(1).width = 20;
+  ws.getColumn(2).width = 16;
+  ws.getColumn(3).width = 20;
+  ws.getColumn(4).width = 16;
+  ws.getColumn(5).width = 14;
+  ws.getColumn(6).width = 20;
+  ws.getColumn(7).width = 12;
+  ws.getColumn(8).width = 32;
+  ws.getColumn(9).width = 40;
+  ws.getColumn(10).width = 18;
+  ws.views = [{ state: 'frozen', ySplit: 1 }];
+
+  const buffer = await wb.xlsx.writeBuffer();
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="relacion-bolivar-${hasta}.xlsx"`);
+  res.send(Buffer.from(buffer));
 }));
 
 /**

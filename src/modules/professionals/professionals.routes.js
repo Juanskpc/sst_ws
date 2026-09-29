@@ -468,11 +468,17 @@ router.delete('/:id/ocupaciones/:slotId', requireRole('admin'), asyncHandler(asy
  * y ver el histórico es lo que permite entender un monto ya facturado.
  */
 router.get('/:id/tarifas', asyncHandler(async (req, res) => {
+  // T0-10 · Con el tipo del catálogo ya resuelto. `tipo_orden_id` NULL = tarifa
+  // huérfana (su texto no casó con ningún tipo): la pantalla la marca para
+  // corregirla a mano. El nombre que se enseña es el ACTUAL del tipo, no el texto
+  // con el que se escribió la tarifa.
   const r = await pool.query(
-    `SELECT id, profesional_id, actividad, valor_hora, vigente_desde, creado_en
-       FROM sst.tarifas_actividad_profesional
-      WHERE profesional_id=$1
-      ORDER BY actividad, vigente_desde DESC`,
+    `SELECT ta.id, ta.profesional_id, ta.actividad, ta.valor_hora, ta.vigente_desde, ta.creado_en,
+            ta.tipo_orden_id, t.nombre AS tipo_orden
+       FROM sst.tarifas_actividad_profesional ta
+       LEFT JOIN sst.tipos_orden t ON t.id = ta.tipo_orden_id
+      WHERE ta.profesional_id=$1
+      ORDER BY COALESCE(t.nombre, ta.actividad), ta.vigente_desde DESC`,
     [req.params.id]
   );
   res.json({ data: r.rows });
@@ -484,19 +490,37 @@ router.get('/:id/tarifas', asyncHandler(async (req, res) => {
  * actividad + misma fecha sí sobrescribe (es corregir un error de digitación).
  */
 router.post('/:id/tarifas', requireRole('admin'), asyncHandler(async (req, res) => {
-  const { actividad, valor_hora: valorHora, vigente_desde: vigenteDesde } = req.body || {};
-  const nombre = (actividad || '').trim();
-  if (!nombre) throw badRequest('La actividad es obligatoria');
+  const {
+    tipo_orden_id: tipoOrdenId, actividad, valor_hora: valorHora, vigente_desde: vigenteDesde,
+  } = req.body || {};
   const valor = Number(valorHora);
   if (!Number.isFinite(valor) || valor <= 0) throw badRequest('El valor hora debe ser un número mayor que cero');
 
+  // T0-10 · La tarifa se liga a un TIPO DEL CATÁLOGO, no a un texto: escrita a
+  // mano, "Capacitacion" sin tilde no casaba con "Capacitación" y la orden caía
+  // al valor estándar sin avisar. Por compatibilidad se sigue aceptando
+  // `actividad`, pero solo si su nombre normalizado identifica un tipo.
+  let tipo = null;
+  if (tipoOrdenId && !/^[0-9a-f-]{36}$/i.test(String(tipoOrdenId))) {
+    throw badRequest('El tipo de orden no es válido.');
+  }
+  if (tipoOrdenId) {
+    tipo = (await pool.query(`SELECT id, nombre FROM sst.tipos_orden WHERE id=$1`, [tipoOrdenId])).rows[0];
+  } else if ((actividad || '').trim()) {
+    tipo = (await pool.query(
+      `SELECT id, nombre FROM sst.tipos_orden WHERE sst.norm_texto(nombre) = sst.norm_texto($1) LIMIT 1`,
+      [actividad]
+    )).rows[0];
+  }
+  if (!tipo) throw badRequest('Elija el tipo de orden del catálogo al que aplica la tarifa.');
+
   const r = await pool.query(
-    `INSERT INTO sst.tarifas_actividad_profesional (profesional_id, actividad, valor_hora, vigente_desde)
-     VALUES ($1,$2,$3, COALESCE($4::date, CURRENT_DATE))
-     RETURNING id, profesional_id, actividad, valor_hora, vigente_desde, creado_en`,
-    [req.params.id, nombre, valor, vigenteDesde || null]
+    `INSERT INTO sst.tarifas_actividad_profesional (profesional_id, actividad, valor_hora, vigente_desde, tipo_orden_id)
+     VALUES ($1,$2,$3, COALESCE($4::date, CURRENT_DATE), $5)
+     RETURNING id, profesional_id, actividad, valor_hora, vigente_desde, creado_en, tipo_orden_id`,
+    [req.params.id, tipo.nombre, valor, vigenteDesde || null, tipo.id]
   );
-  res.status(201).json({ data: r.rows[0] });
+  res.status(201).json({ data: { ...r.rows[0], tipo_orden: tipo.nombre } });
 }));
 
 router.delete('/:id/tarifas/:tarifaId', requireRole('admin'), asyncHandler(async (req, res) => {
