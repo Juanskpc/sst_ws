@@ -18,6 +18,7 @@ import tercerosRoutes from '../modules/terceros/terceros.routes.js';
 import parametrosRoutes from '../modules/parametros/parametros.routes.js';
 import facturacionRoutes from '../modules/facturacion/facturacion.routes.js';
 import contabilidadRoutes from '../modules/contabilidad/contabilidad.routes.js';
+import carteraRoutes from '../modules/cartera/cartera.routes.js';
 
 const router = Router();
 
@@ -40,6 +41,7 @@ router.use('/parametros', parametrosRoutes);
 // Fase A · A1-03 · relación a facturar, agrupación por pagador (y luego borradores y emisión)
 router.use('/facturacion', facturacionRoutes);
 router.use('/contabilidad', contabilidadRoutes);
+router.use('/cartera', carteraRoutes);
 // M2
 router.use('/imports', importsRoutes);
 router.use('/drafts', draftsRoutes);

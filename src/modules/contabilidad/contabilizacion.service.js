@@ -3,6 +3,7 @@ import { badRequest, conflict, notFound } from '../../utils/httpError.js';
 import { aCentavos, deCentavos } from '../../utils/dinero.js';
 import { crearComprobante, obtenerComprobante } from './comprobantes.service.js';
 import { resolvedorDeCuentas } from './reglas.service.js';
+import { abrirCarteraDeFactura, aplicarNotaCredito, sincronizarCartera } from '../cartera/cartera.service.js';
 
 /**
  * B2-01 (CNT-13, FEL-18) · Contabilización automática de facturas y notas crédito.
@@ -186,6 +187,15 @@ export async function contabilizarEn(client, documentoId, usuarioId = null) {
     `UPDATE sst.documentos_electronicos SET comprobante_id = $2, contabilizacion_error = NULL WHERE id = $1`,
     [documentoId, comp.id],
   );
+  // B3-01 · En la misma transacción que el asiento: la factura abre su cuenta por
+  // cobrar (por lo que cargó a clientes) y la nota crédito baja la de su factura.
+  // Así la cartera y el libro nunca quedan desfasados.
+  if (d.tipo === 'FACTURA') {
+    const cxc = a.lineas[0]?.debito ? a.lineas[0].cuenta_id : null; // FV_CXC es siempre la primera línea
+    if (cxc) await abrirCarteraDeFactura(client, documentoId, cxc);
+  } else if (d.tipo === 'NOTA_CREDITO') {
+    await aplicarNotaCredito(client, documentoId);
+  }
   return comp;
 }
 
@@ -236,9 +246,11 @@ export async function listarPendientes(db = pool) {
 export async function contabilizarPendientes(usuarioId = null) {
   const pendientes = await listarPendientes();
   const resultados = [];
+  // Lo contabilizado antes de que existiera la cartera (B3-01) también la abre.
+  const cartera = await sincronizarCartera().catch((e) => ({ error: e.message }));
   for (const p of pendientes) {
     const r = await intentarContabilizar(p.id, usuarioId);
     resultados.push({ documento: p.numero_completo, ...r });
   }
-  return { procesados: resultados.length, contabilizados: resultados.filter((r) => r.ok).length, resultados };
+  return { procesados: resultados.length, contabilizados: resultados.filter((r) => r.ok).length, resultados, cartera };
 }

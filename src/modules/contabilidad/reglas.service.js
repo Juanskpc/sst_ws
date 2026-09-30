@@ -43,6 +43,11 @@ const CUENTAS_SIIGO = {
   NC_RETEIVA: '13551701', NC_DESCUENTO: '53053501',
 };
 
+/** Cuentas "Rete Ica N" del auxiliar de Siigo, por tarifa en porcentaje (5 ‰ = 0,5 %). */
+const RETEICA_POR_TARIFA = {
+  '0.400': '13551813', '0.500': '13551819', '0.600': '13551820', '0.690': '13551811', '0.800': '13551807',
+};
+
 const SELECT = `
   r.id, r.concepto, r.cuenta_id, c.codigo AS cuenta_codigo, c.nombre AS cuenta_nombre,
   c.acepta_movimiento AS cuenta_acepta_movimiento, c.activa AS cuenta_activa,
@@ -120,7 +125,31 @@ export async function sembrarReglasSiigo(usuarioId = null, db = null) {
       );
       if (r.rows[0]) creadas.push(concepto);
     }
-    return { creadas, sin_cuenta: sinCuenta };
+    // B3-01 · La cuenta de cada retención de VENTA que aún no la tenga, como en el
+    // auxiliar de Siigo: la ReteICA va a la "Rete Ica N" de su tarifa (5 ‰ →
+    // 13551819, 6 ‰ → 13551820…) y la retefuente y la ReteIVA que retiene el cliente,
+    // a las mismas cuentas de anticipo que usa la factura.
+    const cuentaDeRetencion = (r) => {
+      if (r.tipo === 'RETEFUENTE') return CUENTAS_SIIGO.FV_RETEFUENTE;
+      if (r.tipo === 'RETEIVA') return CUENTAS_SIIGO.FV_RETEIVA;
+      if (r.tipo === 'AUTORRETENCION') return CUENTAS_SIIGO.FV_AUTORRET_DB;
+      if (r.tipo === 'RETEICA') return RETEICA_POR_TARIFA[Number(r.tarifa).toFixed(3)] ?? null;
+      return null;
+    };
+    const sinCuentaRet = (await client.query(
+      `SELECT id, codigo, tipo, tarifa FROM sst.retenciones WHERE aplica_a = 'VENTA' AND cuenta_id IS NULL`,
+    )).rows;
+    const retencionesConCuenta = [];
+    for (const r of sinCuentaRet) {
+      const codigo = cuentaDeRetencion(r);
+      const cuenta = codigo && (await client.query(
+        `SELECT id FROM sst.cuentas_contables WHERE codigo = $1 AND acepta_movimiento AND activa`, [codigo],
+      )).rows[0];
+      if (!cuenta) continue;
+      await client.query(`UPDATE sst.retenciones SET cuenta_id = $2 WHERE id = $1`, [r.id, cuenta.id]);
+      retencionesConCuenta.push(`${r.codigo} → ${codigo}`);
+    }
+    return { creadas, sin_cuenta: sinCuenta, retenciones: retencionesConCuenta };
   });
 }
 

@@ -40,8 +40,10 @@ export async function guardarUvt(b = {}) {
 
 export async function listarRetenciones({ soloActivas = false } = {}) {
   const r = await pool.query(
-    `SELECT id, codigo, nombre, tipo, tarifa, base_minima_uvt, aplica_a, factus_tributo_id, activa
-       FROM sst.retenciones ${soloActivas ? 'WHERE activa' : ''} ORDER BY tipo, codigo`,
+    `SELECT r.id, r.codigo, r.nombre, r.tipo, r.tarifa, r.base_minima_uvt, r.aplica_a, r.factus_tributo_id, r.activa,
+            r.cuenta_id, cc.codigo AS cuenta_codigo, cc.nombre AS cuenta_nombre
+       FROM sst.retenciones r LEFT JOIN sst.cuentas_contables cc ON cc.id = r.cuenta_id
+      ${soloActivas ? 'WHERE r.activa' : ''} ORDER BY r.tipo, r.codigo`,
   );
   return r.rows;
 }
@@ -74,12 +76,25 @@ function validarRetencion(b = {}) {
     );
   }
 
-  return { codigo, nombre, tipo, tarifa, base_minima_uvt: baseMinima, aplica_a: aplicaA, factus_tributo_id: factusTributoId };
+  // B3-01 · Cuenta contable donde va lo retenido (p. ej. la ReteICA que practica el
+  // cliente al pagar). `undefined` = no se toca al editar; vacío = sin cuenta.
+  const cuentaId = b.cuenta_id === undefined ? undefined : (String(b.cuenta_id || '').trim() || null);
+
+  return { codigo, nombre, tipo, tarifa, base_minima_uvt: baseMinima, aplica_a: aplicaA, factus_tributo_id: factusTributoId, cuenta_id: cuentaId };
+}
+
+async function validarCuentaRetencion(cuentaId) {
+  if (!cuentaId) return;
+  const c = (await pool.query(`SELECT codigo, acepta_movimiento, activa FROM sst.cuentas_contables WHERE id = $1`, [cuentaId])).rows[0];
+  if (!c) throw badRequest('Esa cuenta contable no existe.');
+  if (!c.acepta_movimiento || !c.activa) throw badRequest(`La cuenta ${c.codigo} no recibe movimiento (o está inactiva): elija una auxiliar.`);
 }
 
 async function cargarRetencion(id) {
   const r = await pool.query(
-    `SELECT id, codigo, nombre, tipo, tarifa, base_minima_uvt, aplica_a, factus_tributo_id, activa FROM sst.retenciones WHERE id = $1`,
+    `SELECT r.id, r.codigo, r.nombre, r.tipo, r.tarifa, r.base_minima_uvt, r.aplica_a, r.factus_tributo_id, r.activa,
+            r.cuenta_id, cc.codigo AS cuenta_codigo, cc.nombre AS cuenta_nombre
+       FROM sst.retenciones r LEFT JOIN sst.cuentas_contables cc ON cc.id = r.cuenta_id WHERE r.id = $1`,
     [id],
   );
   return r.rows[0] ?? null;
@@ -87,24 +102,27 @@ async function cargarRetencion(id) {
 
 export async function crearRetencion(b) {
   const c = validarRetencion(b);
+  await validarCuentaRetencion(c.cuenta_id);
   const dup = await pool.query(`SELECT id FROM sst.retenciones WHERE codigo = $1`, [c.codigo]);
   if (dup.rows[0]) throw conflict(`Ya existe una retención con el código ${c.codigo}.`);
   const r = await pool.query(
-    `INSERT INTO sst.retenciones (codigo, nombre, tipo, tarifa, base_minima_uvt, aplica_a, factus_tributo_id)
-     VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
-    [c.codigo, c.nombre, c.tipo, c.tarifa, c.base_minima_uvt, c.aplica_a, c.factus_tributo_id],
+    `INSERT INTO sst.retenciones (codigo, nombre, tipo, tarifa, base_minima_uvt, aplica_a, factus_tributo_id, cuenta_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
+    [c.codigo, c.nombre, c.tipo, c.tarifa, c.base_minima_uvt, c.aplica_a, c.factus_tributo_id, c.cuenta_id ?? null],
   );
   return cargarRetencion(r.rows[0].id);
 }
 
 export async function actualizarRetencion(id, b) {
   const c = validarRetencion(b);
+  await validarCuentaRetencion(c.cuenta_id);
   const dup = await pool.query(`SELECT id FROM sst.retenciones WHERE codigo = $1 AND id <> $2`, [c.codigo, id]);
   if (dup.rows[0]) throw conflict(`Ya existe una retención con el código ${c.codigo}.`);
   const r = await pool.query(
-    `UPDATE sst.retenciones SET codigo=$2, nombre=$3, tipo=$4, tarifa=$5, base_minima_uvt=$6, aplica_a=$7, factus_tributo_id=$8
+    `UPDATE sst.retenciones SET codigo=$2, nombre=$3, tipo=$4, tarifa=$5, base_minima_uvt=$6, aplica_a=$7, factus_tributo_id=$8,
+            cuenta_id = CASE WHEN $9 THEN $10::uuid ELSE cuenta_id END
       WHERE id = $1 RETURNING id`,
-    [id, c.codigo, c.nombre, c.tipo, c.tarifa, c.base_minima_uvt, c.aplica_a, c.factus_tributo_id],
+    [id, c.codigo, c.nombre, c.tipo, c.tarifa, c.base_minima_uvt, c.aplica_a, c.factus_tributo_id, c.cuenta_id !== undefined, c.cuenta_id ?? null],
   );
   if (!r.rows[0]) throw notFound('Retención no encontrada');
   return cargarRetencion(id);
