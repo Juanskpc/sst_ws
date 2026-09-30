@@ -17,6 +17,7 @@ import prefacturasRoutes from '../modules/prefacturas/prefacturas.routes.js';
 import tercerosRoutes from '../modules/terceros/terceros.routes.js';
 import parametrosRoutes from '../modules/parametros/parametros.routes.js';
 import facturacionRoutes from '../modules/facturacion/facturacion.routes.js';
+import contabilidadRoutes from '../modules/contabilidad/contabilidad.routes.js';
 
 const router = Router();
 
@@ -38,6 +39,7 @@ router.use('/terceros', tercerosRoutes);
 router.use('/parametros', parametrosRoutes);
 // Fase A · A1-03 · relación a facturar, agrupación por pagador (y luego borradores y emisión)
 router.use('/facturacion', facturacionRoutes);
+router.use('/contabilidad', contabilidadRoutes);
 // M2
 router.use('/imports', importsRoutes);
 router.use('/drafts', draftsRoutes);
