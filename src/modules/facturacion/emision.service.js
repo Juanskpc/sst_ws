@@ -292,6 +292,42 @@ export async function registrarSinDecision(documentoId, codigo, descripcion, usu
   );
 }
 
+/**
+ * Qué hacer cuando la llamada de emisión falla con una excepción. Hay dos casos
+ * que antes se trataban igual, y no lo son:
+ *  · El proveedor CONTESTÓ que el documento no pasa su validación (HTTP 400/422,
+ *    p. ej. "la suma de los detalles de pago no es igual al total"). No se creó
+ *    nada y reintentar manda lo mismo: el documento pasa a RECHAZADO con el motivo,
+ *    y desde ahí se corrige (A1-07).
+ *  · No hubo respuesta (red, timeout, 5xx, 409 "en proceso"): puede que el
+ *    documento sí haya entrado, así que queda ENVIANDO y se reconcilia con el
+ *    MISMO reference_code.
+ * Devuelve `true` si lo dejó RECHAZADO.
+ */
+export async function registrarFallaDeEnvio(documentoId, e, usuarioId) {
+  if (e?.status === 400 || e?.status === 422) {
+    const mensajes = mensajesDeValidacion(e.detalle);
+    await finalizarRechazado(
+      documentoId,
+      mensajes.length ? mensajes : [e.message || 'El documento no pasó la validación.'],
+      { status: e.status, detalle: e.detalle ?? null },
+      usuarioId,
+    );
+    return true;
+  }
+  await registrarSinDecision(documentoId, 'ERROR_RED', `No hubo respuesta del servicio de facturación electrónica: ${e?.message ?? 'sin detalle'}`.slice(0, 2000), usuarioId);
+  return false;
+}
+
+/** `{ campo: ['msg', …] }`, `['msg']` o `'msg'` → lista plana de textos. */
+function mensajesDeValidacion(detalle) {
+  if (detalle == null) return [];
+  if (typeof detalle === 'string') return [detalle];
+  if (Array.isArray(detalle)) return detalle.flatMap(mensajesDeValidacion);
+  if (typeof detalle === 'object') return Object.values(detalle).flatMap(mensajesDeValidacion);
+  return [String(detalle)];
+}
+
 /** Aplica el resultado de `intentarEmision`/`consultarEstado`: valida→guarda, rechaza→guarda, ni uno ni otro→deja en ENVIANDO. */
 async function resolverResultado(documentoId, resultado, usuarioId) {
   if (resultado.eventos?.rechazos?.length) {
@@ -304,7 +340,7 @@ async function resolverResultado(documentoId, resultado, usuarioId) {
   }
   await registrarSinDecision(
     documentoId, 'SIN_DECISION',
-    'Factus todavía no valida ni rechaza (la DIAN va lenta). Use "Consultar estado" en unos minutos.',
+    'Todavía no se valida ni se rechaza (la DIAN va lenta). Use «Consultar estado» en unos minutos.',
     usuarioId,
   );
   return { pendiente: true, estado: 'ENVIANDO' };
@@ -325,7 +361,7 @@ export async function emitirDocumento(documentoId, usuarioId) {
     await verificarOrdenesLibres(client, documentoId, d.items);
     await client.query(`UPDATE sst.documentos_electronicos SET estado = 'ENVIANDO', actualizado_por = $2 WHERE id = $1`, [documentoId, usuarioId]);
     await client.query(
-      `INSERT INTO sst.documento_eventos (documento_id, codigo, descripcion, usuario_id) VALUES ($1, 'ENVIANDO', 'Enviada a Factus.', $2)`,
+      `INSERT INTO sst.documento_eventos (documento_id, codigo, descripcion, usuario_id) VALUES ($1, 'ENVIANDO', 'Enviada a la DIAN.', $2)`,
       [documentoId, usuarioId],
     );
     return d;
@@ -335,8 +371,8 @@ export async function emitirDocumento(documentoId, usuarioId) {
   try {
     resultado = await intentarEmision(datos);
   } catch (e) {
-    await registrarSinDecision(documentoId, 'ERROR_RED', `No se pudo contactar al proveedor: ${e.message}`.slice(0, 2000), usuarioId);
-    return { pendiente: true, estado: 'ENVIANDO', aviso: 'No se pudo contactar a Factus; el documento quedó en ENVIANDO. Use "Consultar estado" en unos minutos.' };
+    if (await registrarFallaDeEnvio(documentoId, e, usuarioId)) return obtenerBorrador(documentoId);
+    return { pendiente: true, estado: 'ENVIANDO', aviso: 'No hubo respuesta del servicio de facturación electrónica; el documento quedó en ENVIANDO. Use «Consultar estado» en unos minutos.' };
   }
   const resuelto = await resolverResultado(documentoId, resultado, usuarioId);
   return resuelto.pendiente ? resuelto : obtenerBorrador(documentoId);
@@ -358,7 +394,7 @@ export async function reconciliarDocumento(documentoId, usuarioId) {
     try {
       resultado = await intentarEmision(datos);
     } catch (e) {
-      await registrarSinDecision(documentoId, 'ERROR_RED', `No se pudo contactar al proveedor: ${e.message}`.slice(0, 2000), usuarioId);
+      if (await registrarFallaDeEnvio(documentoId, e, usuarioId)) return obtenerBorrador(documentoId);
       return { pendiente: true, estado: 'ENVIANDO' };
     }
     const resuelto = await resolverResultado(documentoId, resultado, usuarioId);
@@ -377,7 +413,7 @@ export async function reconciliarDocumento(documentoId, usuarioId) {
     await finalizarRechazado(documentoId, [estado.detalle || 'Rechazada por la DIAN.'], estado.respuestaCruda, usuarioId);
     return obtenerBorrador(documentoId);
   }
-  await registrarSinDecision(documentoId, 'CONSULTA_ESTADO', 'Sigue en proceso en Factus.', usuarioId);
+  await registrarSinDecision(documentoId, 'CONSULTA_ESTADO', 'Sigue en proceso ante la DIAN.', usuarioId);
   return { pendiente: true, estado: 'ENVIANDO' };
 }
 

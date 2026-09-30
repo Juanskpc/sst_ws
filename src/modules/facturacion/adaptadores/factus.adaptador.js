@@ -191,7 +191,7 @@ export class FactusAdaptador extends PuertoFacturacionElectronica {
    */
   async consultarEstado(numeroDocumento) {
     if (!numeroDocumento) {
-      return { estado: 'SIN_NUMERO', detalle: 'Sin número de Factus todavía: reintente la emisión con el mismo reference_code, no cree uno nuevo.' };
+      return { estado: 'SIN_NUMERO', detalle: 'Todavía sin número asignado: reintente la emisión con la misma referencia, no cree una nueva.' };
     }
     const r = await request('GET', `/v2/bills/${encodeURIComponent(numeroDocumento)}`);
     const bill = r.data || {};
@@ -251,7 +251,7 @@ export class FactusAdaptador extends PuertoFacturacionElectronica {
   async descargarPdf(numeroDocumento) {
     const r = await request('GET', `/v2/bills/${encodeURIComponent(numeroDocumento)}/download-pdf`);
     const base64 = r.data?.pdf_base_64_encoded;
-    if (!base64) throw new Error(`Factus no devolvió el PDF de ${numeroDocumento}`);
+    if (!base64) throw new Error(`El proveedor tecnológico no devolvió el PDF de ${numeroDocumento}`);
     return { base64 };
   }
 
@@ -260,7 +260,7 @@ export class FactusAdaptador extends PuertoFacturacionElectronica {
   async descargarXml(numeroDocumento) {
     const r = await request('GET', `/v2/bills/${encodeURIComponent(numeroDocumento)}/download-xml`);
     const base64 = r.data?.xml_base_64_encoded;
-    if (!base64) throw new Error(`Factus no devolvió el XML de ${numeroDocumento}`);
+    if (!base64) throw new Error(`El proveedor tecnológico no devolvió el XML de ${numeroDocumento}`);
     return { base64 };
   }
 
@@ -315,7 +315,7 @@ export class FactusAdaptador extends PuertoFacturacionElectronica {
   /** GET /v2/credit-notes/:number · reconciliación de una nota que quedó ENVIANDO. */
   async consultarNotaCredito(numeroDocumento) {
     if (!numeroDocumento) {
-      return { estado: 'SIN_NUMERO', detalle: 'Sin número de Factus todavía: reintente con el mismo reference_code.' };
+      return { estado: 'SIN_NUMERO', detalle: 'Todavía sin número asignado: reintente con la misma referencia.' };
     }
     const r = await request('GET', `/v2/credit-notes/${encodeURIComponent(numeroDocumento)}`);
     const nc = r.data?.credit_note || r.data || {};
@@ -332,22 +332,22 @@ export class FactusAdaptador extends PuertoFacturacionElectronica {
   async descargarPdfNotaCredito(numeroDocumento) {
     const r = await request('GET', `/v2/credit-notes/${encodeURIComponent(numeroDocumento)}/download-pdf`);
     const base64 = r.data?.pdf_base_64_encoded;
-    if (!base64) throw new Error(`Factus no devolvió el PDF de ${numeroDocumento}`);
+    if (!base64) throw new Error(`El proveedor tecnológico no devolvió el PDF de ${numeroDocumento}`);
     return { base64 };
   }
 
   async descargarXmlNotaCredito(numeroDocumento) {
     const r = await request('GET', `/v2/credit-notes/${encodeURIComponent(numeroDocumento)}/download-xml`);
     const base64 = r.data?.xml_base_64_encoded;
-    if (!base64) throw new Error(`Factus no devolvió el XML de ${numeroDocumento}`);
+    if (!base64) throw new Error(`El proveedor tecnológico no devolvió el XML de ${numeroDocumento}`);
     return { base64 };
   }
 
   async emitirDocumentoSoporte() {
-    throw new Error('Factus: emisión de documento soporte pendiente de su propia ficha (A4-01)');
+    throw new Error('La emisión de documento soporte todavía no está disponible.');
   }
 
   async emitirNominaElectronica() {
-    throw new Error('Factus: emisión de nómina electrónica pendiente de credenciales y de decidir si entra en el alcance (D-8, §8.E)');
+    throw new Error('La emisión de nómina electrónica todavía no está disponible.');
   }
 }

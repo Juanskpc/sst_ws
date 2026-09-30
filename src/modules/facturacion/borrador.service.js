@@ -90,8 +90,16 @@ function descripcionPorDefecto(l, vars) {
 function cantidadYValorUnitario(l) {
   if (l.origen_valor === 'PREFACTURA') return { cantidad: 1, valorUnitario: Number(l.valor_referencia) };
   const cantidad = l.horas && Number(l.horas) > 0 ? Number(l.horas) : 1;
-  const valorUnitario = l.valor_unitario != null ? Number(l.valor_unitario) : Number(l.valor_referencia) / cantidad;
-  return { cantidad, valorUnitario };
+  if (l.valor_unitario != null) return { cantidad, valorUnitario: Number(l.valor_unitario) };
+  // Un total fijo (el valor escrito en la orden) repartido en horas solo se
+  // factura por horas si el valor hora sale exacto al centavo: $350.000 en 3 h
+  // daría 3 × 116.666,67 = 350.000,01, y el proveedor rechaza la factura porque
+  // la suma de líneas ya no cuadra con el pago. En ese caso va como 1 unidad por
+  // el total, igual que un paquete de prefactura.
+  const total = aCentavos(l.valor_referencia);
+  const unitario = Math.round(total / cantidad);
+  if (Math.round(unitario * cantidad) !== total) return { cantidad: 1, valorUnitario: Number(l.valor_referencia) };
+  return { cantidad, valorUnitario: Number(deCentavos(unitario)) };
 }
 
 function construirItemDesdeLinea(l, { productoArl, productoPrivado, formatoDescripcion }) {
@@ -488,7 +496,9 @@ export async function actualizarBorrador(id, body, usuarioId, dbClient = null) {
         codigo: producto?.codigo ?? raw.codigo ?? null,
         descripcion,
         cantidad,
-        valor_unitario: valorUnitario,
+        // Al centavo ANTES de calcular: es lo que se guarda y lo que se envía, y
+        // el total tiene que salir de ese mismo número (ver cantidadYValorUnitario).
+        valor_unitario: Number(deCentavos(aCentavos(valorUnitario))),
         iva_pct: producto?.tratamiento_iva === 'GRAVADO' ? Number(producto.tarifa_iva) : Number(raw.iva_pct) || 0,
       };
     });

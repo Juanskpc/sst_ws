@@ -33,7 +33,7 @@ async function cargarDocumentoConNumero(id) {
     [id],
   )).rows[0];
   if (!doc) throw notFound('Esa factura no existe.');
-  if (!doc.numero) throw badRequest('Esta factura todavía no tiene número de Factus (no está VALIDADA).');
+  if (!doc.numero) throw badRequest('Esta factura todavía no tiene número (no está VALIDADA).');
   return doc;
 }
 

@@ -69,8 +69,8 @@ function validarRetencion(b = {}) {
   if (factusTributoId !== null && factusTributoId !== permitido) {
     throw badRequest(
       permitido
-        ? `Una retención ${tipo} solo puede ir con el código de tributo "${permitido}" de Factus (o vacío, para no enviarla en el XML).`
-        : `Factus no modela ${tipo} en el XML (se practica al pagar): factus_tributo_id debe quedar vacío.`,
+        ? `Una retención ${tipo} solo puede ir con el código de tributo "${permitido}" del proveedor tecnológico (o vacío, para no enviarla en el XML).`
+        : `La ${tipo} no va en el XML de la factura (se practica al pagar): el código de tributo debe quedar vacío.`,
     );
   }
 

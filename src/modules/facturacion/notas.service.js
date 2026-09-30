@@ -8,7 +8,7 @@ import { calcularDocumento } from './calculo.js';
 import { obtenerBorrador } from './borrador.service.js';
 import {
   cargarDocumentoParaEmitir, construirReceptor, finalizarRechazado, numeroCompleto,
-  registrarSinDecision, validarParaEmitir,
+  registrarFallaDeEnvio, registrarSinDecision, validarParaEmitir,
 } from './emision.service.js';
 
 /**
@@ -205,7 +205,7 @@ export async function crearNotaCredito(facturaId, { causal, lineas, observacione
   return {
     ...detalle,
     advertencia: creada.aceptada
-      ? 'La factura ya tiene un evento de aceptación: Factus podría rechazar la nota crédito (pendiente de confirmar con ellos).'
+      ? 'La factura ya tiene un evento de aceptación: la nota crédito podría ser rechazada.'
       : null,
   };
 }
@@ -345,7 +345,7 @@ async function resolverResultadoNota(notaId, resultado, usuarioId) {
     await finalizarNotaValidada(notaId, resultado, usuarioId);
     return { pendiente: false, estado: 'VALIDADO' };
   }
-  await registrarSinDecision(notaId, 'SIN_DECISION', 'Factus todavía no valida ni rechaza. Use "Consultar estado" en unos minutos.', usuarioId);
+  await registrarSinDecision(notaId, 'SIN_DECISION', 'Todavía no se valida ni se rechaza. Use «Consultar estado» en unos minutos.', usuarioId);
   return { pendiente: true, estado: 'ENVIANDO' };
 }
 
@@ -357,7 +357,7 @@ export async function emitirNotaCredito(notaId, usuarioId) {
     const numero = await numeroDeFacturaReferida(d.doc, client);
     await client.query(`UPDATE sst.documentos_electronicos SET estado = 'ENVIANDO', actualizado_por = $2 WHERE id = $1`, [notaId, usuarioId]);
     await client.query(
-      `INSERT INTO sst.documento_eventos (documento_id, codigo, descripcion, usuario_id) VALUES ($1, 'ENVIANDO', 'Enviada a Factus.', $2)`,
+      `INSERT INTO sst.documento_eventos (documento_id, codigo, descripcion, usuario_id) VALUES ($1, 'ENVIANDO', 'Enviada a la DIAN.', $2)`,
       [notaId, usuarioId],
     );
     return { datos: d, numeroFactura: numero };
@@ -367,8 +367,8 @@ export async function emitirNotaCredito(notaId, usuarioId) {
   try {
     resultado = await intentarEmisionNota(datos, numeroFactura);
   } catch (e) {
-    await registrarSinDecision(notaId, 'ERROR_RED', `No se pudo contactar al proveedor: ${e.message}`.slice(0, 2000), usuarioId);
-    return { pendiente: true, estado: 'ENVIANDO', aviso: 'No se pudo contactar a Factus; la nota quedó en ENVIANDO. Use "Consultar estado" en unos minutos.' };
+    if (await registrarFallaDeEnvio(notaId, e, usuarioId)) return obtenerBorrador(notaId);
+    return { pendiente: true, estado: 'ENVIANDO', aviso: 'No hubo respuesta del servicio de facturación electrónica; la nota quedó en ENVIANDO. Use «Consultar estado» en unos minutos.' };
   }
   const resuelto = await resolverResultadoNota(notaId, resultado, usuarioId);
   return resuelto.pendiente ? resuelto : obtenerBorrador(notaId);
@@ -384,7 +384,7 @@ export async function reconciliarNotaCredito(notaId, usuarioId) {
     try {
       resultado = await intentarEmisionNota(datos, numeroFactura);
     } catch (e) {
-      await registrarSinDecision(notaId, 'ERROR_RED', `No se pudo contactar al proveedor: ${e.message}`.slice(0, 2000), usuarioId);
+      if (await registrarFallaDeEnvio(notaId, e, usuarioId)) return obtenerBorrador(notaId);
       return { pendiente: true, estado: 'ENVIANDO' };
     }
     const resuelto = await resolverResultadoNota(notaId, resultado, usuarioId);
@@ -402,6 +402,6 @@ export async function reconciliarNotaCredito(notaId, usuarioId) {
     await finalizarRechazado(notaId, [estado.detalle || 'Rechazada por la DIAN.'], estado.respuestaCruda, usuarioId);
     return obtenerBorrador(notaId);
   }
-  await registrarSinDecision(notaId, 'CONSULTA_ESTADO', 'Sigue en proceso en Factus.', usuarioId);
+  await registrarSinDecision(notaId, 'CONSULTA_ESTADO', 'Sigue en proceso ante la DIAN.', usuarioId);
   return { pendiente: true, estado: 'ENVIANDO' };
 }

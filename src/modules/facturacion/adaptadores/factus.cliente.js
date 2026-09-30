@@ -102,8 +102,8 @@ async function llamar(url, opciones) {
     throw new FactusError({
       status: 0,
       mensaje: agotado
-        ? 'Factus no respondió a tiempo. Consulte el estado antes de reintentar.'
-        : 'No se pudo conectar con Factus.',
+        ? 'El proveedor tecnológico no respondió a tiempo. Consulte el estado antes de reintentar.'
+        : 'No se pudo conectar con el proveedor tecnológico.',
       detalle: { causa: err?.cause?.code || err?.message },
     });
   }
@@ -114,7 +114,7 @@ function errorDeRespuesta(status, cuerpo) {
   const detalle = cuerpo?.data?.errors ?? cuerpo?.errors ?? cuerpo;
   return new FactusError({
     status,
-    mensaje: cuerpo?.message || cuerpo?.error_description || cuerpo?.error || `Factus respondió HTTP ${status}`,
+    mensaje: cuerpo?.message || cuerpo?.error_description || cuerpo?.error || `El proveedor tecnológico respondió HTTP ${status}`,
     detalle,
   });
 }
@@ -134,7 +134,7 @@ async function pedirToken(cuerpo) {
     // El cuerpo de un fallo de OAuth no trae secretos, pero no lo reenviamos entero.
     throw new FactusError({
       status: r.status,
-      mensaje: `Factus rechazó la autenticación: ${datos?.message || datos?.error_description || datos?.error || `HTTP ${r.status}`}`,
+      mensaje: `El proveedor tecnológico rechazó la autenticación: ${datos?.message || datos?.error_description || datos?.error || `HTTP ${r.status}`}`,
       detalle: { error: datos?.error },
     });
   }
@@ -234,5 +234,5 @@ export async function request(metodo, ruta, cuerpo, opciones = {}) {
     return datos;
   }
   // Inalcanzable: el segundo intento siempre retorna o lanza.
-  throw new FactusError({ status: 401, mensaje: 'Factus rechazó el token renovado' });
+  throw new FactusError({ status: 401, mensaje: 'El proveedor tecnológico rechazó la sesión renovada' });
 }

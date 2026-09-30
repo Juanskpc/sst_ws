@@ -197,7 +197,7 @@ router.post('/documentos/:id/emitir', OPERAR, asyncHandler(async (req, res) => {
   const esNota = (await tipoDeDocumento(id)) === 'NOTA_CREDITO';
   const resultado = esNota ? await emitirNotaCredito(id, req.user.sub) : await emitirDocumento(id, req.user.sub);
   if (resultado?.pendiente) {
-    return res.status(202).json({ message: resultado.aviso || 'Factus no ha decidido todavía; consulte el estado en unos minutos.', data: resultado });
+    return res.status(202).json({ message: resultado.aviso || 'La DIAN no ha decidido todavía; consulte el estado en unos minutos.', data: resultado });
   }
   const mensaje = resultado.estado === 'RECHAZADO'
     ? 'La DIAN rechazó el documento. Corrija el borrador y vuelva a emitir.'
