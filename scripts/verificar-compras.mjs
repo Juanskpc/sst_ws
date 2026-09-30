@@ -18,6 +18,10 @@ const igual = (obtenido, esperado, texto) => {
 };
 const ordenar = (ls) => [...ls].sort((a, b) => (a[0] + a[1] + a[2]).localeCompare(b[0] + b[1] + b[2]));
 
+// Contra lo que ya había: jdd_dev tiene compras y egresos de prueba propios.
+const cuentaResiduos = async () => (await pool.query(`SELECT (SELECT count(*) FROM sst.compras)::int + (SELECT count(*) FROM sst.egresos)::int
+                                          + (SELECT count(*) FROM sst.terceros WHERE numero_documento = '900999201')::int AS n`)).rows[0].n;
+const antes = await cuentaResiduos();
 const client = await pool.connect();
 let n = 0;
 const rechaza = async (fn, fragmento, texto) => {
@@ -118,8 +122,7 @@ try {
 } finally {
   await client.query('ROLLBACK');
   client.release();
-  const restos = (await pool.query(`SELECT (SELECT count(*) FROM sst.compras)::int + (SELECT count(*) FROM sst.egresos)::int
-                                          + (SELECT count(*) FROM sst.terceros WHERE numero_documento = '900999201')::int AS n`)).rows[0].n;
+  const restos = (await cuentaResiduos()) - antes;
   console.log(`\nResiduos tras el ROLLBACK: ${restos}`);
   if (restos) fallos++;
   await pool.end();

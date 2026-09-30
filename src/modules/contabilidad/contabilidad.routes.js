@@ -11,6 +11,8 @@ import {
   listarComprobantes, listarPeriodos, listarTiposComprobante, obtenerComprobante, reabrirPeriodo,
 } from './comprobantes.service.js';
 import { eliminarRegla, guardarRegla, listarReglas, sembrarReglasSiigo } from './reglas.service.js';
+import { cerrarAnio, vistaPreviaCierre } from './cierre.service.js';
+import { actualizarCentro, cambiarActivoCentro, crearCentro, listarCentros } from './centros.service.js';
 import { contabilizarDocumento, contabilizarPendientes, listarPendientes, vistaPreviaAsiento } from './contabilizacion.service.js';
 
 const router = Router();
@@ -157,6 +159,39 @@ router.get('/documentos/:id/asiento', LEER, asyncHandler(async (req, res) => {
 
 router.post('/documentos/:id/contabilizar', OPERAR, asyncHandler(async (req, res) => {
   res.json({ data: await contabilizarDocumento(req.params.id, req.user.sub) });
+}));
+
+// ─── B8-01 · Centros de costo (CNT-09) ───────────────────────────────────────
+
+router.get('/centros-costo', LEER, asyncHandler(async (req, res) => {
+  const data = await listarCentros({ soloActivos: req.query.activos === 'true' });
+  res.json({ data, total: data.length });
+}));
+
+router.post('/centros-costo', OPERAR, asyncHandler(async (req, res) => {
+  res.status(201).json({ data: await crearCentro(req.body) });
+}));
+
+router.put('/centros-costo/:id', OPERAR, asyncHandler(async (req, res) => {
+  res.json({ data: await actualizarCentro(req.params.id, req.body) });
+}));
+
+// No hay DELETE: un centro con movimientos se inactiva.
+router.patch('/centros-costo/:id/activo', OPERAR, asyncHandler(async (req, res) => {
+  if (typeof req.body?.activo !== 'boolean') throw badRequest('Indique "activo": true o false.');
+  res.json({ data: await cambiarActivoCentro(req.params.id, req.body.activo) });
+}));
+
+// ─── B10-01 · Cierre de año (CNT-12) ─────────────────────────────────────────
+
+// Lo que haría el cierre (saldos a cancelar y resultado), sin guardar nada.
+router.get('/cierre/:anio', LEER, asyncHandler(async (req, res) => {
+  res.json({ data: await vistaPreviaCierre(req.params.anio) });
+}));
+
+// Cerrar el año es irreversible (D-20): solo el administrador.
+router.post('/cierre/:anio', requireRole('admin'), asyncHandler(async (req, res) => {
+  res.status(201).json({ data: await cerrarAnio(req.params.anio, req.body, req.user.sub) });
 }));
 
 export default router;

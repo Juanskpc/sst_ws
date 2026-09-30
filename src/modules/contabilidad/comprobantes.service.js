@@ -120,13 +120,17 @@ async function validarLineas(client, lineas) {
   if (!Array.isArray(lineas) || !lineas.length) throw badRequest('El comprobante necesita movimientos.');
   const cuentaIds = [...new Set(lineas.map((l) => l?.cuenta_id).filter(Boolean))];
   const cuentas = new Map((await client.query(
-    `SELECT id, codigo, nombre, acepta_movimiento, activa, exige_tercero FROM sst.cuentas_contables WHERE id = ANY($1::uuid[])`,
+    `SELECT id, codigo, nombre, acepta_movimiento, activa, exige_tercero, exige_centro_costo FROM sst.cuentas_contables WHERE id = ANY($1::uuid[])`,
     [cuentaIds],
   )).rows.map((c) => [c.id, c]));
   const terceroIds = [...new Set(lineas.map((l) => l?.tercero_id).filter(Boolean))];
   const terceros = new Set((await client.query(
     `SELECT id FROM sst.terceros WHERE id = ANY($1::uuid[])`, [terceroIds],
   )).rows.map((t) => t.id));
+  const centroIds = [...new Set(lineas.map((l) => l?.centro_costo_id).filter(Boolean))];
+  const centros = new Map((await client.query(
+    `SELECT id, codigo, activo FROM sst.centros_costo WHERE id = ANY($1::uuid[])`, [centroIds],
+  )).rows.map((c) => [c.id, c]));
 
   let debito = 0;
   let credito = 0;
@@ -141,6 +145,14 @@ async function validarLineas(client, lineas) {
     const terceroId = l.tercero_id || null;
     if (terceroId && !terceros.has(terceroId)) throw badRequest(`Línea ${n}: ese tercero no existe.`);
     if (cuenta.exige_tercero && !terceroId) throw badRequest(`Línea ${n}: la cuenta ${cuenta.codigo} exige tercero.`);
+    // B8-01 · Centro de costo: opcional, salvo en las cuentas que lo exigen.
+    const centroId = l.centro_costo_id || null;
+    if (centroId) {
+      const cc = centros.get(centroId);
+      if (!cc) throw badRequest(`Línea ${n}: ese centro de costo no existe.`);
+      if (!cc.activo) throw badRequest(`Línea ${n}: el centro de costo ${cc.codigo} está inactivo.`);
+    }
+    if (cuenta.exige_centro_costo && !centroId) throw badRequest(`Línea ${n}: la cuenta ${cuenta.codigo} exige centro de costo.`);
 
     const d = l.debito == null || l.debito === '' ? 0 : aCentavos(l.debito);
     const c = l.credito == null || l.credito === '' ? 0 : aCentavos(l.credito);
@@ -149,7 +161,7 @@ async function validarLineas(client, lineas) {
     debito += d;
     credito += c;
     return {
-      linea: n, cuenta_id: cuenta.id, tercero_id: terceroId, centro_costo_id: l.centro_costo_id || null,
+      linea: n, cuenta_id: cuenta.id, tercero_id: terceroId, centro_costo_id: centroId,
       debito: deCentavos(d), credito: deCentavos(c),
       base: l.base == null || l.base === '' ? null : deCentavos(aCentavos(l.base)),
       descripcion: l.descripcion ? String(l.descripcion).trim().slice(0, 500) || null : null,
@@ -198,10 +210,12 @@ export async function obtenerComprobante(id, db = pool) {
   const movimientos = (await db.query(
     `SELECT m.id, m.linea, m.cuenta_id, cc.codigo AS cuenta_codigo, cc.nombre AS cuenta_nombre,
             m.tercero_id, ${NOMBRE_TERCERO} AS tercero_nombre, t.numero_documento AS tercero_documento,
-            m.centro_costo_id, m.debito, m.credito, m.base, m.descripcion, m.documento_cruce, m.documento_cruce_id
+            m.centro_costo_id, ce.codigo AS centro_costo_codigo, ce.nombre AS centro_costo_nombre,
+            m.debito, m.credito, m.base, m.descripcion, m.documento_cruce, m.documento_cruce_id
        FROM sst.movimientos m
        JOIN sst.cuentas_contables cc ON cc.id = m.cuenta_id
        LEFT JOIN sst.terceros t ON t.id = m.tercero_id
+       LEFT JOIN sst.centros_costo ce ON ce.id = m.centro_costo_id
       WHERE m.comprobante_id = $1 ORDER BY m.linea`,
     [id],
   )).rows;
@@ -342,6 +356,9 @@ export async function anularComprobante(id, motivo, usuarioId = null, { client =
     if (c.estado !== 'CONTABILIZADO') throw conflict(`Solo se anula un comprobante contabilizado (este está ${c.estado.toLowerCase()}).`);
     // El asiento de una factura se anula anulando la factura (nota crédito): si se
     // anulara suelto, la factura seguiría viva sin su contabilidad.
+    if (c.origen_tipo === 'CIERRE_ANUAL') {
+      throw forbidden('El cierre de un año no se reversa (D-20): si hace falta un ajuste, se registra en el año siguiente.');
+    }
     if (c.origen_tipo && !permitirOrigen) {
       throw forbidden('Este comprobante lo generó un documento; se anula desde ese documento, no desde aquí.');
     }

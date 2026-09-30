@@ -77,6 +77,14 @@ export async function crearCompra(b = {}, usuarioId = null, { client = null } = 
       if (dup.rows[0]) throw conflict(`La factura ${numeroProveedor} de ${tercero.nombre} ya está registrada.`);
     }
 
+    // B8-01 · Centro de costo de la compra (opcional): va en las líneas de gasto.
+    const centroId = b.centro_costo_id || null;
+    if (centroId) {
+      const cc = (await db.query(`SELECT codigo, activo FROM sst.centros_costo WHERE id = $1`, [centroId])).rows[0];
+      if (!cc) throw badRequest('Ese centro de costo no existe.');
+      if (!cc.activo) throw badRequest(`El centro de costo ${cc.codigo} está inactivo.`);
+    }
+
     const items = Array.isArray(b.items) ? b.items.filter((i) => i && (i.cuenta_id || i.valor)) : [];
     if (!items.length) throw badRequest('La compra necesita al menos un ítem.');
     const itemsOk = [];
@@ -115,10 +123,10 @@ export async function crearCompra(b = {}, usuarioId = null, { client = null } = 
 
     const compra = (await db.query(
       `INSERT INTO sst.compras (tipo, tercero_id, numero_proveedor, cufe, fecha, forma_pago, vencimiento, cuenta_pago_id,
-                                descripcion, subtotal, total_iva, total_retenciones, total_a_pagar, creado_por)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id`,
+                                descripcion, subtotal, total_iva, total_retenciones, total_a_pagar, creado_por, centro_costo_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id`,
       [tipo, tercero.id, numeroProveedor, String(b.cufe ?? '').trim() || null, f, forma, vencimiento, cuentaPago?.id ?? null,
-       String(b.descripcion ?? '').trim().slice(0, 1000) || null, deCentavos(subtotal), deCentavos(iva), deCentavos(retenciones), deCentavos(total), usuarioId],
+       String(b.descripcion ?? '').trim().slice(0, 1000) || null, deCentavos(subtotal), deCentavos(iva), deCentavos(retenciones), deCentavos(total), usuarioId, centroId],
     )).rows[0];
     for (const [n, it] of itemsOk.entries()) {
       await db.query(
@@ -136,7 +144,9 @@ export async function crearCompra(b = {}, usuarioId = null, { client = null } = 
     // ── Asiento ──
     const cuenta = await resolvedorDeCuentas(db, tercero.id);
     const cruce = numeroProveedor ?? null;
-    const lineas = itemsOk.map((it) => ({ cuenta_id: it.cuenta_id, tercero_id: tercero.id, debito: deCentavos(it.valor), descripcion: it.descripcion, documento_cruce: cruce }));
+    const lineas = itemsOk.map((it) => ({
+      cuenta_id: it.cuenta_id, tercero_id: tercero.id, centro_costo_id: centroId, debito: deCentavos(it.valor), descripcion: it.descripcion, documento_cruce: cruce,
+    }));
     if (iva) lineas.push({ cuenta_id: cuenta('CP_IVA_DESCONTABLE'), tercero_id: tercero.id, debito: deCentavos(iva), base: deCentavos(subtotal), documento_cruce: cruce });
     for (const r of retOk) {
       lineas.push({ cuenta_id: r.cuenta_id, tercero_id: tercero.id, credito: deCentavos(r.valor), base: deCentavos(r.base), descripcion: r.nombre, documento_cruce: cruce });
@@ -167,7 +177,7 @@ export async function obtenerCompra(id, db = pool) {
   const c = (await db.query(
     `SELECT cm.id, cm.tipo, cm.tercero_id, ${NOMBRE} AS tercero_nombre, cm.numero_proveedor, cm.cufe,
             to_char(cm.fecha, 'YYYY-MM-DD') AS fecha, cm.forma_pago, to_char(cm.vencimiento, 'YYYY-MM-DD') AS vencimiento,
-            cm.cuenta_pago_id, cm.descripcion, cm.subtotal, cm.total_iva, cm.total_retenciones, cm.total_a_pagar,
+            cm.cuenta_pago_id, cm.centro_costo_id, cco.codigo AS centro_costo_codigo, cco.nombre AS centro_costo_nombre, cm.descripcion, cm.subtotal, cm.total_iva, cm.total_retenciones, cm.total_a_pagar,
             cm.estado, cm.motivo_anulacion, cm.comprobante_id,
             CASE WHEN cp.numero IS NULL THEN NULL ELSE tc.codigo || '-' || cp.numero END AS comprobante_numero,
             cd.id AS cxp_id, cd.saldo AS cxp_saldo
@@ -176,6 +186,7 @@ export async function obtenerCompra(id, db = pool) {
        LEFT JOIN sst.comprobantes cp ON cp.id = cm.comprobante_id
        LEFT JOIN sst.tipos_comprobante tc ON tc.id = cp.tipo_id
        LEFT JOIN sst.cartera_documentos cd ON cd.compra_id = cm.id AND NOT cd.anulado
+       LEFT JOIN sst.centros_costo cco ON cco.id = cm.centro_costo_id
       WHERE cm.id = $1`,
     [id],
   )).rows[0];
