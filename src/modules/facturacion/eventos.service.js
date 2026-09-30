@@ -1,6 +1,7 @@
 import { pool } from '../../config/db.js';
 import { badRequest, notFound } from '../../utils/httpError.js';
 import { proveedorFE } from './index.js';
+import { hoyCO } from '../../utils/formato.js';
 
 /**
  * A1-07 (FEL-12, 19) · Eventos RADIAN de las facturas ya emitidas.
@@ -119,7 +120,7 @@ export async function marcarAceptacionTacita(documentoId, usuarioId) {
   if (!doc) throw notFound('Esa factura no existe.');
   if (doc.estado !== 'VALIDADO') throw badRequest('Solo se puede marcar sobre una factura VALIDADA.');
   if (doc.forma_pago_codigo !== '2') throw badRequest('La aceptación tácita solo aplica a facturas a crédito.');
-  const hoy = new Date().toISOString().slice(0, 10);
+  const hoy = hoyCO();
   if (!doc.fecha_vencimiento || doc.fecha_vencimiento >= hoy) {
     throw badRequest('Todavía no vence el plazo de pago de esta factura.');
   }

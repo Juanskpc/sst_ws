@@ -11,6 +11,7 @@ import { storage } from '../../services/storage.service.js';
 import { actualizarEventosEnLote, consultarEventosDocumento, marcarAceptacionTacita } from './eventos.service.js';
 import { CAUSALES_NOTA_CREDITO, crearNotaCredito, emitirNotaCredito, reconciliarNotaCredito } from './notas.service.js';
 import { pool } from '../../config/db.js';
+import { hoyCO } from '../../utils/formato.js';
 
 const router = Router();
 router.use(authRequired);
@@ -126,7 +127,7 @@ router.get('/relacion.xlsx', LEER, asyncHandler(async (req, res) => {
   ws.views = [{ state: 'frozen', ySplit: 1 }];
 
   const buffer = await wb.xlsx.writeBuffer();
-  const sufijo = bolivar ? `prefactura-${grupos[0].prefactura.numero}` : new Date().toISOString().slice(0, 10);
+  const sufijo = bolivar ? `prefactura-${grupos[0].prefactura.numero}` : hoyCO();
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
   res.setHeader('Content-Disposition', `attachment; filename="relacion-${sufijo}.xlsx"`);
   res.send(Buffer.from(buffer));

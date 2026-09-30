@@ -12,6 +12,7 @@ import { parseNumeroCO, parseFechaCO } from '../../utils/parseo.js';
 import {
   esBolivar, normalizarModalidadEjecucion, normalizarTipoActividadBolivar,
 } from '../../utils/bolivar.js';
+import { hoyCO } from '../../utils/formato.js';
 
 const router = Router();
 router.use(authRequired);
@@ -401,7 +402,7 @@ export async function crearOrdenManual(b, userId, client) {
     modalidad: textoOpcional(b.modalidad),
     horas_asignadas: String(horas),
     valor_total: valorTotal != null ? String(valorTotal) : null,
-    fecha_orden: new Date().toISOString().slice(0, 10),
+    fecha_orden: hoyCO(),
     fecha_vencimiento: fechaVencimiento,
     ciudad_ejecucion: textoOpcional(b.ciudad_ejecucion) ?? (textoOpcional(b.empresa_nombre) ? null : pagador.municipio),
     direccion: textoOpcional(b.direccion) ?? (textoOpcional(b.empresa_nombre) ? null : pagador.direccion),

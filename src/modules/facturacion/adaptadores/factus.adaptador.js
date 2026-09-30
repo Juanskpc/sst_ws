@@ -1,5 +1,6 @@
 import { PuertoFacturacionElectronica } from '../puerto.js';
 import { request } from './factus.cliente.js';
+import { hoyCO } from '../../../utils/formato.js';
 
 /**
  * Factus nombra el documento de cada rango con un texto ("Factura de Venta",
@@ -150,7 +151,7 @@ export class FactusAdaptador extends PuertoFacturacionElectronica {
         // sin este campo rechaza con "El campo fecha de vencimiento es obligatorio").
         // Vencimiento = emisión + plazo_dias del pagador (A0-07); a falta de una
         // fecha de emisión explícita, usa hoy + el plazo.
-        due_date: datos.fechaVencimiento || new Date().toISOString().slice(0, 10),
+        due_date: datos.fechaVencimiento || hoyCO(),
       }],
       customer: mapearCustomer(datos.receptor),
       items: datos.items.map((it) => mapearItem(it, datos.descuentoComercialPct, datos.retenciones)),
@@ -287,7 +288,7 @@ export class FactusAdaptador extends PuertoFacturacionElectronica {
         payment_form: datos.formaPagoCodigo || '1',
         payment_method_code: datos.medioPagoCodigo || 'ZZZ',
         amount: datos.montoAPagar,
-        ...(String(datos.formaPagoCodigo) === '2' ? { due_date: datos.fechaVencimiento || new Date().toISOString().slice(0, 10) } : {}),
+        ...(String(datos.formaPagoCodigo) === '2' ? { due_date: datos.fechaVencimiento || hoyCO() } : {}),
       }],
       customer: mapearCustomer(datos.receptor),
       items: datos.items.map((it) => mapearItem(it, datos.descuentoComercialPct, datos.retenciones)),

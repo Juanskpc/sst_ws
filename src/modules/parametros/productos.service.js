@@ -1,6 +1,7 @@
 import { pool } from '../../config/db.js';
 import { badRequest, conflict, notFound } from '../../utils/httpError.js';
 import { textoPersona } from '../../utils/personas.js';
+import { hoyCO } from '../../utils/formato.js';
 
 /**
  * A0-06 · Productos y tarifas de venta.
@@ -139,7 +140,7 @@ async function validarTarifa(b = {}) {
   const valor = Number(b.valor);
   if (!Number.isFinite(valor) || valor < 0) throw badRequest('El valor debe ser un número positivo.');
 
-  const vigenteDesde = String(b.vigente_desde || '').trim() || new Date().toISOString().slice(0, 10);
+  const vigenteDesde = String(b.vigente_desde || '').trim() || hoyCO();
   if (!/^\d{4}-\d{2}-\d{2}$/.test(vigenteDesde)) throw badRequest('La vigencia debe ser una fecha AAAA-MM-DD.');
 
   return { pagador_tercero_id: pagador.rows[0].id, tipo_orden_id: tipoOrdenId, unidad, valor, vigente_desde: vigenteDesde };

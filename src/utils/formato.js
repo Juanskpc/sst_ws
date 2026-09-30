@@ -61,6 +61,16 @@ function partesCO(valor) {
  * escribe igual en todo el producto o el profesional cree que son dos cosas
  * distintas.
  */
+/**
+ * La fecha de HOY en Colombia, "AAAA-MM-DD". `new Date().toISOString()` es UTC y el
+ * servidor corre en UTC: de 7 p. m. a medianoche ya da el día siguiente, y una
+ * factura emitida el 30 a las 8 p. m. quedaba con fecha del 1 — otro mes contable.
+ */
+export function hoyCO() {
+  const p = partesCO(new Date());
+  return `${p.anio}-${String(p.mes).padStart(2, '0')}-${String(p.dia).padStart(2, '0')}`;
+}
+
 export const enPesosCO = (v) =>
   new Intl.NumberFormat('es-CO', { style: 'currency', currency: 'COP', maximumFractionDigits: 0 })
     .format(Number(v) || 0);

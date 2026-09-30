@@ -4,6 +4,7 @@ import { badRequest, conflict, notFound } from '../../utils/httpError.js';
 import { aCentavos, deCentavos, sumar } from '../../utils/dinero.js';
 import { calcularDocumento } from './calculo.js';
 import { resolverSeleccion } from './relacion.service.js';
+import { hoyCO } from '../../utils/formato.js';
 
 /**
  * `reference_code`: la clave de idempotencia frente a Factus (§5.1.5 del plan).
@@ -339,7 +340,7 @@ export async function crearBorrador({ arlId, pagadorTerceroId, ordenIds, prefact
     const descuentoComercialPct = Number(condicion.descuento_comercial_pct) || 0;
     const calculo = calcular(items, descuentoComercialPct, retenciones);
 
-    const fechaEmision = new Date().toISOString().slice(0, 10);
+    const fechaEmision = hoyCO();
     const { formaPagoId, medioPagoId } = await formaYMedioPago(condicion.plazo_dias, client);
 
     const docId = await guardarDocumento(client, {
@@ -532,7 +533,7 @@ export async function actualizarBorrador(id, body, usuarioId, dbClient = null) {
     const retenciones = await retencionesDeVenta(body.retenciones_ids, client);
     const calculo = calcular(items, descuentoComercialPct, retenciones);
 
-    const fechaEmision = /^\d{4}-\d{2}-\d{2}$/.test(body.fecha_emision) ? body.fecha_emision : new Date().toISOString().slice(0, 10);
+    const fechaEmision = /^\d{4}-\d{2}-\d{2}$/.test(body.fecha_emision) ? body.fecha_emision : hoyCO();
     const plazoDias = Number.isFinite(Number(body.plazo_dias)) ? Number(body.plazo_dias) : 0;
     const { formaPagoId, medioPagoId } = await formaYMedioPago(plazoDias, client);
 
