@@ -5,6 +5,7 @@ import { storage } from '../../services/storage.service.js';
 import { proveedorFE } from './index.js';
 import { faltantesParaFacturar } from '../terceros/terceros.service.js';
 import { generarReferenceCode, obtenerBorrador } from './borrador.service.js';
+import { hoyCO } from '../../utils/formato.js';
 
 /**
  * A1-05 (FEL-10) · Emitir un documento contra Factus y conectar con el eje de
@@ -114,7 +115,7 @@ export function validarParaEmitir({ doc, items, resolucion }) {
   }
 
   if (!resolucion) throw badRequest(`No hay una resolución de numeración activa para ${doc.tipo === 'NOTA_CREDITO' ? 'notas crédito' : 'facturas'}. Sincronícela en Parametrización → Resoluciones.`);
-  const hoy = new Date().toISOString().slice(0, 10);
+  const hoy = hoyCO();
   if (resolucion.fecha_hasta && resolucion.fecha_hasta < hoy) throw badRequest(`La resolución de numeración venció el ${resolucion.fecha_hasta}.`);
   if (resolucion.hasta != null && Number(resolucion.consecutivo_actual) >= Number(resolucion.hasta)) {
     throw badRequest('La resolución de numeración ya agotó su rango; sincronice o gestione una nueva con el proveedor.');
@@ -219,6 +220,29 @@ export function numeroCompleto(prefijo, numero) {
  * nuevo", pendiente de pantalla) en vez de dejarlo en silencio.
  */
 async function finalizarValidado(documentoId, resultado, usuarioId) {
+  const r = await finalizarValidadoTx(documentoId, resultado, usuarioId);
+  await contabilizarTrasValidar(documentoId, usuarioId);
+  return r;
+}
+
+/**
+ * B2-01 · Al quedar VALIDADO, el documento se contabiliza (FV/NC). Va DESPUÉS de
+ * confirmar la validación y en su propia transacción: la factura ya es válida ante
+ * la DIAN, y un asiento que falla (falta una regla, mes cerrado) no puede
+ * deshacerla. Queda pendiente, con el motivo en la línea de tiempo, y se reintenta
+ * desde Contabilidad. Importación dinámica: contabilidad importa de facturación.
+ */
+export async function contabilizarTrasValidar(documentoId, usuarioId) {
+  const { intentarContabilizar } = await import('../contabilidad/contabilizacion.service.js');
+  const r = await intentarContabilizar(documentoId, usuarioId);
+  if (!r.ok) {
+    await registrarSinDecision(documentoId, 'CONTABILIZACION_PENDIENTE',
+      `Validada ante la DIAN; el asiento contable quedó pendiente: ${r.error}`.slice(0, 2000), usuarioId).catch(() => {});
+  }
+  return r;
+}
+
+async function finalizarValidadoTx(documentoId, resultado, usuarioId) {
   return withTransaction(async (client) => {
     const avisosDescarga = [];
     const [pdf, xml] = await Promise.all([

@@ -10,6 +10,8 @@ import {
   actualizarBorrador, anularComprobante, cerrarPeriodo, contabilizarComprobante, crearComprobante, eliminarBorrador,
   listarComprobantes, listarPeriodos, listarTiposComprobante, obtenerComprobante, reabrirPeriodo,
 } from './comprobantes.service.js';
+import { eliminarRegla, guardarRegla, listarReglas, sembrarReglasSiigo } from './reglas.service.js';
+import { contabilizarDocumento, contabilizarPendientes, listarPendientes, vistaPreviaAsiento } from './contabilizacion.service.js';
 
 const router = Router();
 router.use(authRequired);
@@ -114,6 +116,47 @@ router.post('/periodos/:anio/:mes/cerrar', OPERAR, asyncHandler(async (req, res)
 // Reabrir un mes cerrado es excepcional: solo el administrador, y con motivo.
 router.post('/periodos/:anio/:mes/reabrir', requireRole('admin'), asyncHandler(async (req, res) => {
   res.json({ data: await reabrirPeriodo(req.params.anio, req.params.mes, req.body?.motivo, req.user.sub) });
+}));
+
+// ─── B2-01 · Reglas y contabilización automática (CNT-13, FEL-18) ────────────
+
+router.get('/reglas', LEER, asyncHandler(async (_req, res) => {
+  res.json({ data: await listarReglas() });
+}));
+
+// Crea o reemplaza la regla de un concepto para su alcance (general, producto o tercero).
+router.put('/reglas', OPERAR, asyncHandler(async (req, res) => {
+  res.json({ data: await guardarRegla(req.body, req.user.sub) });
+}));
+
+router.delete('/reglas/:id', OPERAR, asyncHandler(async (req, res) => {
+  await eliminarRegla(req.params.id);
+  res.status(204).end();
+}));
+
+// Carga las reglas generales que falten con las cuentas que usa hoy Siigo (§3.5).
+router.post('/reglas/por-defecto', OPERAR, asyncHandler(async (req, res) => {
+  res.json({ data: await sembrarReglasSiigo(req.user.sub) });
+}));
+
+// Documentos validados que aún no tienen asiento (con el motivo, si ya se intentó).
+router.get('/documentos/pendientes', LEER, asyncHandler(async (_req, res) => {
+  const data = await listarPendientes();
+  res.json({ data, total: data.length });
+}));
+
+// Backfill de la Fase A y reintento de los pendientes, en orden de emisión.
+router.post('/documentos/contabilizar-pendientes', OPERAR, asyncHandler(async (req, res) => {
+  res.json({ data: await contabilizarPendientes(req.user.sub) });
+}));
+
+// «Vista de contabilización»: el asiento que produce (o produciría) el documento.
+router.get('/documentos/:id/asiento', LEER, asyncHandler(async (req, res) => {
+  res.json({ data: await vistaPreviaAsiento(req.params.id) });
+}));
+
+router.post('/documentos/:id/contabilizar', OPERAR, asyncHandler(async (req, res) => {
+  res.json({ data: await contabilizarDocumento(req.params.id, req.user.sub) });
 }));
 
 export default router;

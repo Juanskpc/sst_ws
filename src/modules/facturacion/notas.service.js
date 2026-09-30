@@ -7,9 +7,10 @@ import { proveedorFE } from './index.js';
 import { calcularDocumento } from './calculo.js';
 import { obtenerBorrador } from './borrador.service.js';
 import {
-  cargarDocumentoParaEmitir, construirReceptor, finalizarRechazado, numeroCompleto,
+  cargarDocumentoParaEmitir, construirReceptor, contabilizarTrasValidar, finalizarRechazado, numeroCompleto,
   registrarFallaDeEnvio, registrarSinDecision, validarParaEmitir,
 } from './emision.service.js';
+import { hoyCO } from '../../utils/formato.js';
 
 /**
  * A2-01 (FEL-11) · Nota crédito sobre una factura VALIDADA.
@@ -140,7 +141,7 @@ export async function crearNotaCredito(facturaId, { causal, lineas, observacione
       retenciones: retenciones.map((r) => ({ codigo: r.codigo, tipo: r.tipo, tarifa: Number(r.tarifa) })),
     });
 
-    const hoy = new Date().toISOString().slice(0, 10);
+    const hoy = hoyCO();
     const numeroFactura = numeroCompleto(factura.prefijo, factura.numero);
     const nota = (await client.query(
       `INSERT INTO sst.documentos_electronicos
@@ -252,6 +253,13 @@ async function intentarEmisionNota({ doc, items, retenciones, formaPagoCodigo, m
  * y sus órdenes vuelven a NO FACTURADA con historial. Todo en una transacción.
  */
 async function finalizarNotaValidada(notaId, resultado, usuarioId) {
+  const r = await finalizarNotaValidadaTx(notaId, resultado, usuarioId);
+  // B2-01 · Igual que la factura: se contabiliza después, sin arriesgar la validación.
+  await contabilizarTrasValidar(notaId, usuarioId);
+  return r;
+}
+
+async function finalizarNotaValidadaTx(notaId, resultado, usuarioId) {
   return withTransaction(async (client) => {
     const avisos = [];
     const [pdf, xml] = await Promise.all([

@@ -111,8 +111,10 @@ try {
   igual([lsin.orden_id, lsin.facturable, lsin.marcada_por_defecto], [null, true, false], 'fila sin orden: facturable pero no se marca sola');
   igual(g.total_marcadas, 700000, 'el total marcado es solo el de b1');
   const sueltas = bol.grupos.find((x) => x.sin_prefactura);
-  igual(sueltas.lineas.map((l) => l.orden_id), [b3], 'b3 (prefactura no cargada) queda en "sin prefactura"');
-  igual(sueltas.lineas[0].facturable, false, 'b3 no es facturable');
+  // jdd_dev puede tener otras órdenes de Bolívar sin prefactura (las de ejemplo): se mira solo la de la prueba.
+  const lb3 = sueltas.lineas.find((l) => l.orden_id === b3);
+  igual(!!lb3 && !g.lineas.some((l) => l.orden_id === b3), true, 'b3 (prefactura no cargada) queda en "sin prefactura"');
+  igual(lb3?.facturable, false, 'b3 no es facturable');
 
   console.log('\n— Selección —');
   const ok = await resolverSeleccion({ arlId: axa.id, ordenIds: [a1] }, client);

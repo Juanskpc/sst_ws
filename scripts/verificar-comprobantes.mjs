@@ -13,6 +13,8 @@ const igual = (obtenido, esperado, texto) => {
   console.log(`${ok ? 'OK  ' : 'FAIL'} ${texto} → ${JSON.stringify(obtenido)}${ok ? '' : ` (esperado ${JSON.stringify(esperado)})`}`);
 };
 
+// Se compara contra lo que ya había: jdd_dev tiene asientos reales (backfill de B2-01).
+const antes = (await pool.query(`SELECT (SELECT count(*) FROM sst.comprobantes)::int AS c, (SELECT count(*) FROM sst.periodos_contables)::int AS p`)).rows[0];
 const client = await pool.connect();
 let n = 0;
 /** Corre `fn` en un SAVEPOINT y espera que falle con un mensaje que contenga `fragmento`. */
@@ -131,8 +133,8 @@ try {
 } finally {
   await client.query('ROLLBACK');
   client.release();
-  const restos = (await pool.query(`SELECT count(*)::int AS n FROM sst.comprobantes`)).rows[0].n;
-  const periodos = (await pool.query(`SELECT count(*)::int AS n FROM sst.periodos_contables`)).rows[0].n;
+  const restos = (await pool.query(`SELECT count(*)::int AS n FROM sst.comprobantes`)).rows[0].n - antes.c;
+  const periodos = (await pool.query(`SELECT count(*)::int AS n FROM sst.periodos_contables`)).rows[0].n - antes.p;
   console.log(`\nResiduos tras el ROLLBACK: ${restos} comprobantes, ${periodos} periodos`);
   if (restos || periodos) fallos++;
   await pool.end();
