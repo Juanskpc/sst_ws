@@ -26,6 +26,12 @@ export const CONCEPTOS = [
   { concepto: 'NC_RETEFUENTE', documento: 'NOTA_CREDITO', nombre: 'Devolución de la retención en la fuente', lado: 'C' },
   { concepto: 'NC_RETEIVA', documento: 'NOTA_CREDITO', nombre: 'Devolución de la retención de IVA', lado: 'C' },
   { concepto: 'NC_DESCUENTO', documento: 'NOTA_CREDITO', nombre: 'Reverso del descuento comercial', lado: 'C' },
+  // B5-01 / B4-01 · Compras, egresos y anticipos. El gasto de cada ítem NO es una
+  // regla: la cuenta se elige al registrar la compra (combustible, arriendo…).
+  { concepto: 'CP_CXP', documento: 'COMPRA', nombre: 'Cuenta por pagar al proveedor', lado: 'C' },
+  { concepto: 'CP_CXP_HONORARIOS', documento: 'COMPRA', nombre: 'Honorarios por pagar (servicios profesionales)', lado: 'C' },
+  { concepto: 'CP_IVA_DESCONTABLE', documento: 'COMPRA', nombre: 'IVA descontable de la compra', lado: 'D' },
+  { concepto: 'CE_ANTICIPO', documento: 'COMPRA', nombre: 'Anticipos a proveedores', lado: 'D' },
 ];
 const CONCEPTOS_VALIDOS = new Set(CONCEPTOS.map((c) => c.concepto));
 
@@ -41,6 +47,8 @@ const CUENTAS_SIIGO = {
   FV_AUTORRET_DB: '13551816', FV_AUTORRET_CR: '23657502', FV_INGRESO: '41800101', FV_IVA: '24080601',
   NC_DEVOLUCION: '41750502', NC_IVA: '24082001', NC_CXC: '13050501', NC_RETEFUENTE: '13551510',
   NC_RETEIVA: '13551701', NC_DESCUENTO: '53053501',
+  // FC-1-10 (23359501 Otros), DS-1-1316 (23352501 Honorarios), RP-1-2 (13300501 A proveedores).
+  CP_CXP: '23359501', CP_CXP_HONORARIOS: '23352501', CP_IVA_DESCONTABLE: '24081001', CE_ANTICIPO: '13300501',
 };
 
 /** Cuentas "Rete Ica N" del auxiliar de Siigo, por tarifa en porcentaje (5 ‰ = 0,5 %). */

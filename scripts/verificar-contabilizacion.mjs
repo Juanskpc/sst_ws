@@ -43,7 +43,7 @@ try {
   const sem = await sembrarReglasSiigo(null, client);
   // Si ya estaban cargadas (jdd_dev), no se crea ninguna: lo que importa es que no falte cuenta.
   const reglas = (await client.query(`SELECT count(DISTINCT concepto)::int AS n FROM sst.reglas_contables WHERE producto_id IS NULL AND tercero_id IS NULL`)).rows[0].n;
-  igual([reglas, sem.sin_cuenta], [14, []], 'las 14 reglas generales de Siigo quedan cargadas con cuentas del plan');
+  igual([reglas, sem.sin_cuenta], [18, []], 'las 18 reglas generales de Siigo quedan cargadas con cuentas del plan');
 
   const tercero = async (nombre) => (await client.query(`SELECT id FROM sst.terceros WHERE razon_social = $1`, [nombre])).rows[0].id;
   const axa = await tercero('AXA COLPATRIA SEGUROS DE VIDA SA');

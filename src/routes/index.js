@@ -19,6 +19,7 @@ import parametrosRoutes from '../modules/parametros/parametros.routes.js';
 import facturacionRoutes from '../modules/facturacion/facturacion.routes.js';
 import contabilidadRoutes from '../modules/contabilidad/contabilidad.routes.js';
 import carteraRoutes from '../modules/cartera/cartera.routes.js';
+import comprasRoutes from '../modules/compras/compras.routes.js';
 
 const router = Router();
 
@@ -42,6 +43,7 @@ router.use('/parametros', parametrosRoutes);
 router.use('/facturacion', facturacionRoutes);
 router.use('/contabilidad', contabilidadRoutes);
 router.use('/cartera', carteraRoutes);
+router.use('/compras', comprasRoutes);
 // M2
 router.use('/imports', importsRoutes);
 router.use('/drafts', draftsRoutes);

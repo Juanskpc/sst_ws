@@ -98,27 +98,28 @@ function edad(vencimiento, corte) {
 export const EDADES = ['POR_VENCER', 'D1_30', 'D31_60', 'D61_90', 'MAS_90'];
 
 /** Documentos de cartera por cobrar, con su edad. `soloAbiertos` = con saldo. */
-export async function listarCartera({ terceroId = null, soloAbiertos = true, corte = null } = {}, db = pool) {
+export async function listarCartera({ terceroId = null, soloAbiertos = true, corte = null, tipo = 'CXC' } = {}, db = pool) {
   const fechaCorte = corte || hoyCO();
   const r = await db.query(
     `SELECT c.id, c.tercero_id, ${NOMBRE} AS tercero_nombre, t.numero_documento AS tercero_documento,
             c.documento_id, c.numero, to_char(c.fecha, 'YYYY-MM-DD') AS fecha,
             to_char(c.vencimiento, 'YYYY-MM-DD') AS vencimiento, c.valor, c.saldo,
-            d.subtotal, d.tipo AS documento_tipo
+            COALESCE(d.subtotal, cm.subtotal) AS subtotal, d.tipo AS documento_tipo, c.compra_id
        FROM sst.cartera_documentos c
        JOIN sst.terceros t ON t.id = c.tercero_id
        LEFT JOIN sst.documentos_electronicos d ON d.id = c.documento_id
-      WHERE c.tipo = 'CXC' AND ($1::uuid IS NULL OR c.tercero_id = $1) AND (NOT $2 OR c.saldo > 0)
+       LEFT JOIN sst.compras cm ON cm.id = c.compra_id
+      WHERE c.tipo = $3 AND NOT c.anulado AND ($1::uuid IS NULL OR c.tercero_id = $1) AND (NOT $2 OR c.saldo > 0)
       ORDER BY c.vencimiento, c.numero`,
-    [terceroId, soloAbiertos],
+    [terceroId, soloAbiertos, tipo],
   );
   return r.rows.map((x) => ({ ...x, dias_vencido: Math.max(0, diasVencido(x.vencimiento, fechaCorte)), edad: edad(x.vencimiento, fechaCorte) }));
 }
 
 /** Antigüedad por cliente y edad (CXC-03), en centavos exactos. */
-export async function antiguedad(corte = null, db = pool) {
+export async function antiguedad(corte = null, db = pool, tipo = 'CXC') {
   const fechaCorte = corte || hoyCO();
-  const docs = await listarCartera({ corte: fechaCorte }, db);
+  const docs = await listarCartera({ corte: fechaCorte, tipo }, db);
   const porCliente = new Map();
   const total = Object.fromEntries([...EDADES, 'TOTAL'].map((e) => [e, 0]));
   for (const d of docs) {
@@ -139,25 +140,27 @@ export async function antiguedad(corte = null, db = pool) {
 }
 
 /** Estado de cuenta de un cliente (CXC-04): cada factura con sus notas y pagos. */
-export async function estadoCuenta(terceroId, db = pool) {
+export async function estadoCuenta(terceroId, db = pool, tipo = 'CXC') {
   const t = (await db.query(`SELECT id, ${NOMBRE} AS nombre, numero_documento, dv FROM sst.terceros t WHERE id = $1`, [terceroId])).rows[0];
   if (!t) throw notFound('Ese tercero no existe.');
-  const documentos = await listarCartera({ terceroId, soloAbiertos: false }, db);
+  const documentos = await listarCartera({ terceroId, soloAbiertos: false, tipo }, db);
   const movs = (await db.query(
     `SELECT a.cartera_documento_id, a.origen_tipo, a.origen_id, to_char(a.fecha, 'YYYY-MM-DD') AS fecha,
-            a.valor_pagado, a.valor_retenciones,
+            a.valor_pagado, a.valor_retenciones, a.valor_anticipo,
             CASE a.origen_tipo
               WHEN 'RECIBO_CAJA' THEN (SELECT tc.codigo || '-' || cp.numero FROM sst.recibos_caja rc
                                          JOIN sst.comprobantes cp ON cp.id = rc.comprobante_id
                                          JOIN sst.tipos_comprobante tc ON tc.id = cp.tipo_id WHERE rc.id = a.origen_id)
+              WHEN 'EGRESO' THEN (SELECT 'CE-' || cp.numero FROM sst.egresos e
+                                    JOIN sst.comprobantes cp ON cp.id = e.comprobante_id WHERE e.id = a.origen_id)
               ELSE (SELECT CASE WHEN d.prefijo IS NOT NULL AND d.numero NOT LIKE d.prefijo || '%' THEN d.prefijo || d.numero ELSE d.numero END
                       FROM sst.documentos_electronicos d WHERE d.id = a.origen_id)
             END AS soporte
        FROM sst.cartera_aplicaciones a
        JOIN sst.cartera_documentos c ON c.id = a.cartera_documento_id
-      WHERE c.tercero_id = $1 AND NOT a.anulada
+      WHERE c.tercero_id = $1 AND c.tipo = $2 AND NOT a.anulada
       ORDER BY a.fecha, a.creado_en`,
-    [terceroId],
+    [terceroId, tipo],
   )).rows;
   const saldo = documentos.reduce((s, d) => s + aCentavos(d.saldo), 0);
   return {
@@ -172,14 +175,16 @@ export async function estadoCuenta(terceroId, db = pool) {
  * del libro en las cuentas marcadas como cartera CXC. Deben ser iguales; si no, algo
  * se contabilizó a mano contra clientes sin pasar por la cartera (o al revés).
  */
-export async function conciliacion(db = pool) {
+export async function conciliacion(db = pool, tipo = 'CXC') {
+  // Por cobrar es saldo débito; por pagar, crédito.
   const libro = (await db.query(
-    `SELECT COALESCE(sum(m.debito - m.credito), 0) AS saldo
+    `SELECT COALESCE(sum(CASE WHEN $1 = 'CXC' THEN m.debito - m.credito ELSE m.credito - m.debito END), 0) AS saldo
        FROM sst.movimientos m
        JOIN sst.comprobantes c ON c.id = m.comprobante_id AND c.estado = 'CONTABILIZADO'
-       JOIN sst.cuentas_contables cc ON cc.id = m.cuenta_id AND cc.es_cartera = 'CXC'`,
+       JOIN sst.cuentas_contables cc ON cc.id = m.cuenta_id AND cc.es_cartera = $1`,
+    [tipo],
   )).rows[0].saldo;
-  const cartera = (await db.query(`SELECT COALESCE(sum(saldo), 0) AS saldo FROM sst.cartera_documentos WHERE tipo = 'CXC'`)).rows[0].saldo;
+  const cartera = (await db.query(`SELECT COALESCE(sum(saldo), 0) AS saldo FROM sst.cartera_documentos WHERE tipo = $1`, [tipo])).rows[0].saldo;
   const diferencia = aCentavos(libro) - aCentavos(cartera);
   return { saldo_libro: deCentavos(aCentavos(libro)), saldo_cartera: deCentavos(aCentavos(cartera)), diferencia: deCentavos(diferencia), cuadra: diferencia === 0 };
 }

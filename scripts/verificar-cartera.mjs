@@ -30,6 +30,9 @@ const SIIGO = {
   'RC-1-105': [['11100501', 'D', '1883937.55'], ['13050501', 'C', '2075820.01'], ['13551509', 'D', '191882.46']],
 };
 
+// Contra lo que ya había: jdd_dev tiene recibos de prueba propios.
+const cuentaResiduos = async () => (await pool.query(`SELECT (SELECT count(*) FROM sst.recibos_caja)::int + (SELECT count(*) FROM sst.documentos_electronicos WHERE reference_code LIKE 'ORB-ZZ-%')::int AS n`)).rows[0].n;
+const antes = await cuentaResiduos();
 const client = await pool.connect();
 let n = 0;
 const rechaza = async (fn, fragmento, texto) => {
@@ -146,7 +149,7 @@ try {
 } finally {
   await client.query('ROLLBACK');
   client.release();
-  const restos = (await pool.query(`SELECT (SELECT count(*) FROM sst.recibos_caja)::int + (SELECT count(*) FROM sst.documentos_electronicos WHERE reference_code LIKE 'ORB-ZZ-%')::int AS n`)).rows[0].n;
+  const restos = (await cuentaResiduos()) - antes;
   console.log(`\nResiduos tras el ROLLBACK: ${restos}`);
   if (restos) fallos++;
   await pool.end();
