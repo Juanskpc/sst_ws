@@ -89,6 +89,11 @@ const DRAFT_SELECT = `
          -- Eje de facturación (ago-2026): columna, pastilla y filtro de Órdenes.
          o.estado_cobro::text AS os_estado_cobro,
          o.cobro_numero_factura AS os_cobro_numero_factura,
+         -- 30-sep-2026 · El ✓ de «Validado plataforma» y el visto bueno del
+         -- cobro, que la tabla enseña sin abrir la orden.
+         o.validado_plataforma_en AS os_validado_plataforma_en,
+         uvp.nombre AS os_validado_plataforma_por,
+         o.cobro_aprobado_en AS os_cobro_aprobado_en,
          -- A3-01 · Orden de un cliente particular (sin ARL): quién la paga. La
          -- vista lo enseña donde las demás llevan la ARL, y oculta lo que solo
          -- tiene sentido con una (estado ARL, prefactura, formatos).
@@ -102,6 +107,7 @@ const DRAFT_SELECT = `
   LEFT JOIN sst.ordenes_servicio o ON o.id = d.orden_servicio_id
   LEFT JOIN sst.profesionales po ON po.id = o.profesional_asignado_id
   LEFT JOIN sst.profesionales pfo ON pfo.id = o.profesional_formatos_id
+  LEFT JOIN sst.usuarios uvp ON uvp.id = o.validado_plataforma_por
   LEFT JOIN sst.tipos_orden tp ON tp.id = COALESCE(o.tipo_orden_id, d.tipo_orden_id)
   LEFT JOIN sst.tipos_viatico tv ON tv.id = COALESCE(o.viaticos_tipo_id, d.tipo_viatico_id)`;
 
@@ -626,6 +632,20 @@ export async function materializarOrden(draftId, userId, client) {
     ]
   );
   const orden = ord.rows[0];
+
+  // 30-sep-2026 · Los gastos que el SIPAB trae en sus columnas se le COBRAN a la
+  // ARL: pasan a `cobro_*`, que es lo que el modal de cobro enseña y operación
+  // aprueba. Es la misma copia que hizo la migración con las ya cargadas.
+  if (detalleViaticos) {
+    const g = (k) => (Number(detalleViaticos[k]) > 0 ? Number(detalleViaticos[k]) : null);
+    await client.query(
+      `UPDATE sst.ordenes_servicio
+          SET cobro_transporte=$2, cobro_alojamiento=$3, cobro_alimentacion=$4,
+              cobro_tiempo_muerto=$5, cobro_material=$6
+        WHERE id=$1`,
+      [orden.id, g('transporte'), g('alojamiento'), g('alimentacion'), g('tiempo_muerto'), g('material_complementario')]
+    );
+  }
 
   // Primera entrada de auditoría (EST-03): creación → SIN PROGRAMAR.
   await client.query(

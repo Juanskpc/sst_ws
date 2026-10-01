@@ -63,7 +63,23 @@ export function casillasDeOrden(requeridas) {
   return [...new Set(claves)]
     .map((c) => PORCLAVE.get(c))
     .sort((a, b) => a.orden - b.orden)
-    .map((c) => ({ clave: c.clave, etiqueta: c.etiqueta }));
+    .map((c) => ({ clave: c.clave, etiqueta: c.etiqueta, opcional: esOpcional(c.clave) }));
+}
+
+/**
+ * Casillas que se OFRECEN pero no se exigen en la entrega inicial (30-sep-2026,
+ * pedido de JD&D): el registro fotográfico. Muchas empresas no dejan tomar fotos
+ * dentro de sus instalaciones y la visita no puede quedarse sin entregar por eso;
+ * el acta y la asistencia sí son las que decide la ARL.
+ *
+ * Es opcional solo en la ENTREGA: si el administrador la devuelve expresamente en
+ * un rechazo, entonces sí hay que subirla (pedirla y no exigirla dejaría el
+ * rechazo cerrado sin el documento que motivó el rechazo).
+ */
+const CASILLAS_OPCIONALES = new Set(['evidencias']);
+
+export function esOpcional(clave) {
+  return CASILLAS_OPCIONALES.has(String(clave || '').trim().toLowerCase());
 }
 
 /**

@@ -2909,6 +2909,31 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- 30-sep-2026 · «Validado plataforma» (check a mano, no bloquea) y el cobro de la
+-- orden desglosado + aprobado por operación. Por qué y cómo: ver
+-- db/migraciones/2026-09-30-validado-y-aprobacion-cobro.sql. Va ANTES de la vista
+-- de abajo porque es `SELECT o.*` (trampa 69).
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS validado_plataforma_en  TIMESTAMPTZ;
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS validado_plataforma_por UUID REFERENCES sst.usuarios(id);
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS cobro_transporte    NUMERIC(14,2);
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS cobro_alojamiento   NUMERIC(14,2);
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS cobro_alimentacion  NUMERIC(14,2);
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS cobro_tiempo_muerto NUMERIC(14,2);
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS cobro_material      NUMERIC(14,2);
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS cobro_aprobado_en    TIMESTAMPTZ;
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS cobro_aprobado_por   UUID REFERENCES sst.usuarios(id);
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS cobro_aprobado_total NUMERIC(14,2);
+CREATE TABLE IF NOT EXISTS sst.historial_aprobacion_cobro (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  orden_id    UUID NOT NULL REFERENCES sst.ordenes_servicio(id) ON DELETE CASCADE,
+  accion      TEXT NOT NULL CHECK (accion IN ('APROBADA', 'RETIRADA', 'ANULADA_POR_CAMBIO')),
+  total       NUMERIC(14,2),
+  observacion TEXT,
+  usuario_id  UUID REFERENCES sst.usuarios(id),
+  creado_en   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_hist_aprob_cobro_orden ON sst.historial_aprobacion_cobro(orden_id, creado_en);
+
 -- Listado expandido de OS con nombres legibles (apoya M3 / Informes).
 -- Se re-crea desde cero (no OR REPLACE) porque `o.*` cambia de columnas cuando
 -- se agregan campos a ordenes_servicio, y CREATE OR REPLACE no admite reordenar.

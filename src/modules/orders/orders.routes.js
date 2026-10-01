@@ -18,12 +18,15 @@ import { enPesosCO, fechaDiaCO, fechaHoraCO, horaAmPm, horasTexto } from '../../
 import { parseNumeroCO, parseFechaCO } from '../../utils/parseo.js';
 import { resolverEmpresaId } from '../companies/companies.service.js';
 import {
-  casillasDeOrden, esCategoriaValida, etiquetaCategoria, listaEtiquetas, normalizarCategoria,
+  casillasDeOrden, esCategoriaValida, esOpcional, etiquetaCategoria, listaEtiquetas, normalizarCategoria,
 } from '../../services/soportes.service.js';
 import {
   esBolivar, normalizarModalidadEjecucion, normalizarTipoActividadBolivar,
 } from '../../utils/bolivar.js';
 import { avisoDeEntrega, entregaDeLaOrden } from '../../services/entrega-arl.service.js';
+import {
+  ROLES_APRUEBAN, aprobarCobro, detalleCobro, guardarValores, retirarAprobacion,
+} from './cobro-orden.service.js';
 
 const router = Router();
 router.use(authRequired);
@@ -1302,7 +1305,13 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
   // SUP · Qué tiene que devolver, dicho en el mismo correo que le manda a la
   // visita. Antes el correo hablaba de "los soportes firmados" en abstracto y la
   // lista solo aparecía al abrir el portal, ya de vuelta de la empresa.
-  const queDevolver = listaEtiquetas(result.entrega.soportes);
+  // El registro fotográfico se ofrece pero no se exige (30-sep-2026): el correo lo dice.
+  const obligatorios = result.entrega.soportes.filter((c) => !esOpcional(c));
+  const opcionales = result.entrega.soportes.filter((c) => esOpcional(c));
+  const queDevolver = [
+    listaEtiquetas(obligatorios),
+    opcionales.length ? `y, si la empresa lo permite, ${listaEtiquetas(opcionales)} (opcional)` : '',
+  ].filter(Boolean).join(' ');
   // FOR · Qué va adjunto, con su nombre y en el orden en que se generó.
   //
   // El correo hablaba de "los formatos de la ARL" en abstracto y describía lo
@@ -1446,7 +1455,7 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
           result.entrega.soportes.length
             ? bloqueLista(
                 'Al terminar tendrás que subir',
-                result.entrega.soportes.map((c) => etiquetaCategoria(c)),
+                result.entrega.soportes.map((c) => etiquetaCategoria(c) + (esOpcional(c) ? ' (opcional)' : '')),
               )
             : '',
           parrafo('Cuando termines la visita, sube los soportes firmados desde aquí (no necesitas iniciar sesión):'),
@@ -1819,6 +1828,68 @@ router.post('/:id/status', requireRole('admin'), asyncHandler(async (req, res) =
     encuesta_enviada: !!encuesta?.enviada,
     encuesta_error: encuesta && !encuesta.enviada ? encuesta.motivo : null,
     data: orden,
+  });
+}));
+
+// ================= 30-sep-2026 · Cobro de la orden y «Validado plataforma» =================
+
+/** Desglose del cobro (honorarios + gastos), comparación con la prefactura y aprobación. */
+router.get('/:id/cobro-detalle', asyncHandler(async (req, res) => {
+  res.json({ data: await detalleCobro(req.params.id) });
+}));
+
+/**
+ * Corregir el valor hora y los gastos. La contadora también puede: es quien
+ * suele tener la tarifa a mano. Si cambia el total de una orden ya aprobada, la
+ * aprobación se cae y operación tiene que volver a darla.
+ */
+router.put('/:id/cobro-valores', requireRole('admin', 'administrativo', 'contador'), asyncHandler(async (req, res) => {
+  res.json({ data: await guardarValores(req.params.id, req.body, req.user.sub) });
+}));
+
+/** Visto bueno de operación: solo con él la orden pasa a Facturación y a la contabilidad. */
+router.post('/:id/cobro-aprobacion', requireRole(...ROLES_APRUEBAN), asyncHandler(async (req, res) => {
+  res.json({ data: await aprobarCobro(req.params.id, req.body, req.user.sub) });
+}));
+
+router.delete('/:id/cobro-aprobacion', requireRole(...ROLES_APRUEBAN), asyncHandler(async (req, res) => {
+  res.json({ data: await retirarAprobacion(req.params.id, req.body, req.user.sub) });
+}));
+
+/**
+ * «Validado plataforma»: alguien comprobó la orden en la plataforma de la ARL.
+ * Es un check a mano que no bloquea nada (decisión del 30-sep-2026) y es
+ * distinto del estado ARL, que lo pone la prefactura.
+ */
+router.patch('/:id/validado-plataforma', requireRole('admin', 'administrativo', 'contador'), asyncHandler(async (req, res) => {
+  const validado = req.body?.validado === true;
+  // Solo se valida en plataforma lo que ya se ejecutó (30-sep-2026): antes no hay
+  // nada que la ARL pueda ver. Desmarcar sí se permite siempre, para corregir.
+  if (validado) {
+    const e = (await pool.query(`SELECT estado::text AS estado FROM sst.ordenes_servicio WHERE id=$1`, [req.params.id])).rows[0];
+    if (!e) throw badRequest('Orden no encontrada');
+    if (!['EJECUTADA', 'FINALIZADA'].includes(e.estado)) {
+      throw badRequest(`La orden está ${e.estado}: se valida en plataforma cuando ya está EJECUTADA.`);
+    }
+  }
+  const r = await pool.query(
+    `UPDATE sst.ordenes_servicio
+        SET validado_plataforma_en  = CASE WHEN $2 THEN now() ELSE NULL END,
+            validado_plataforma_por = CASE WHEN $2 THEN $3::uuid ELSE NULL END,
+            actualizado_en = now()
+      WHERE id = $1
+      RETURNING id, validado_plataforma_en`,
+    [req.params.id, validado, req.user.sub],
+  );
+  if (!r.rows[0]) throw badRequest('Orden no encontrada');
+  const u = validado
+    ? (await pool.query(`SELECT nombre FROM sst.usuarios WHERE id=$1`, [req.user.sub])).rows[0]
+    : null;
+  res.json({
+    data: {
+      validado_plataforma_en: r.rows[0].validado_plataforma_en,
+      validado_plataforma_por_nombre: u?.nombre ?? null,
+    },
   });
 }));
 

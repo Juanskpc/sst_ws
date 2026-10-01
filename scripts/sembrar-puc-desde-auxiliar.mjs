@@ -5,7 +5,7 @@
 //
 //   node --import tsx scripts/sembrar-puc-desde-auxiliar.mjs [ruta.xlsx] [--simular]
 //
-// Por defecto lee ../DocFacturacion/ORBITA/puc.xlsx (fuera de git a propósito:
+// Por defecto lee ../1-cliente-jdd/contabilidad-siigo/puc.xlsx (fuera de git a propósito:
 // trae movimientos reales de la empresa). Solo corre contra jdd_dev.
 //
 // Los niveles superiores que el auxiliar no trae se crean con el nombre del PUC
@@ -53,7 +53,7 @@ const NOMBRES_PUC = {
   530535: 'Descuentos comerciales condicionados', 539595: 'Otros',
 };
 
-const ruta = process.argv.slice(2).find((a) => !a.startsWith('--')) ?? '../DocFacturacion/ORBITA/puc.xlsx';
+const ruta = process.argv.slice(2).find((a) => !a.startsWith('--')) ?? '../1-cliente-jdd/contabilidad-siigo/puc.xlsx';
 const simular = process.argv.includes('--simular');
 
 try {

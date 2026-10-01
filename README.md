@@ -9,7 +9,7 @@ Backend Node.js (Express 5 + PostgreSQL/Neon) para la plataforma de gestión de
 > módulo, las trampas conocidas y la lista de pendientes priorizada.
 
 > 🚩 **"Continúa con el trabajo pendiente que nos pidió el cliente"** = la tanda
-> del **22-ago-2026**. Empieza por **`jdd_consultores_app/docs/plan-peticiones-22-ago-2026.md`**,
+> del **22-ago-2026**. Empieza por **`jdd_consultores_app/docs/3-planes/plan-peticiones-22-ago-2026.md`**,
 > sección **§0 "Dónde retomar"**. **Las cinco fases están construidas y
 > migradas** (los enumerados del AT-031 de Bolívar, la matriz de formatos y
 > soportes por ARL, los viáticos, el profesional registrado ante la ARL con su
@@ -66,7 +66,7 @@ node scripts/smoke.js
 > `PORT=4010 EMAIL_DRIVER=console SMTP_HOST="" npm run dev`
 
 Login por **documento de identidad** + contraseña. Existen **dos cuentas admin
-separadas** (configurables en `.env`, ver `docs/06-auth-y-seguridad.md`):
+separadas** (configurables en `.env`, ver `docs/2-arquitectura/06-auth-y-seguridad.md`):
 
 - **Administrador Maestro** (exclusivo del equipo de desarrollo): documento
   `9999999999` / `MAESTRO_PASSWORD` (correo `admin@jdd.com`). Único que puede
@@ -116,7 +116,7 @@ src/
 - Trigger `fn_bloquear_regresion_ejecutada`: bloquea cualquier retroceso desde `EJECUTADA`.
 - Dedup IMP-09 **según la ARL**: `UNIQUE(arl_id, codigo_cronograma, secuencia)` para
   Bolívar y `UNIQUE(arl_id, numero_orden)` (parcial) para AXA/Colmena. `numero_orden`
-  y `cronograma+secuencia` son excluyentes por ARL. Ver `docs/04-pipeline-ia.md`.
+  y `cronograma+secuencia` son excluyentes por ARL. Ver `docs/2-arquitectura/04-pipeline-ia.md`.
 
 ## Endpoints (prefijo `/api`)
 

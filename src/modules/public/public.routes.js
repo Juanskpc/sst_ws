@@ -13,7 +13,7 @@ import {
 import { notify } from '../../services/notification.service.js';
 import { comprimirSoporte } from '../../services/compress.service.js';
 import {
-  casillasDeOrden, etiquetaCategoria, listaEtiquetas, normalizarCategoria,
+  casillasDeOrden, esOpcional, etiquetaCategoria, listaEtiquetas, normalizarCategoria,
   nombreCanonico, nombreOriginalLegible,
 } from '../../services/soportes.service.js';
 
@@ -205,14 +205,18 @@ router.post('/support/:token/files', uploadSupports, asyncHandler(async (req, re
     // administrador la ve EJECUTADA, la abre para revisar y se encuentra con que
     // faltan dos, sin nadie a quien reclamárselos porque el enlace ya se cerró.
     // Se entrega todo de una vez o no se entrega.
-    const requeridas = hayRechazo ? rechazados : deLaOrden;
+    //
+    // 30-sep-2026 · El registro fotográfico es OPCIONAL en la entrega inicial
+    // (`esOpcional`): se acepta si llega, pero su ausencia no frena el envío. En
+    // una corrección no hay opcionales: lo devuelto se devolvió porque hacía falta.
+    const requeridas = hayRechazo ? rechazados : deLaOrden.filter((c) => !esOpcional(c));
     const faltan = requeridas.filter((c) => !subidas.includes(c));
     if (faltan.length) {
       throw badRequest(
         hayRechazo
           ? `Falta adjuntar: ${listaEtiquetas(faltan)}. Los documentos devueltos se envían ` +
             `todos juntos: adjunte los ${requeridas.length} y vuelva a enviar.`
-          : `Falta adjuntar: ${listaEtiquetas(faltan)}. Los ${requeridas.length} documentos de la ` +
+          : `Falta adjuntar: ${listaEtiquetas(faltan)}. Los documentos obligatorios de la ` +
             'visita se envían juntos, en un solo envío.',
       );
     }

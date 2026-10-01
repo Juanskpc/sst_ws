@@ -89,7 +89,7 @@ const SIPAB_HEADERS = {
 };
 
 // Sinónimos para hojas que NO son el SIPAB tal cual (columnas añadidas a mano,
-// como la de vencimiento de `docs/BasesDatosEjemplo/…-con-vencimiento.xlsx`).
+// como la de vencimiento de `1-cliente-jdd/ordenes-reales/…-con-vencimiento.xlsx`).
 // Solo se consultan para encabezados que el mapa exacto no conoce, así que ya
 // no pueden robarle la columna a la lectura oficial.
 const HEADER_MAP = [

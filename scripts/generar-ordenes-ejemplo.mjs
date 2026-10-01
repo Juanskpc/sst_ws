@@ -5,17 +5,17 @@
  *   node --import tsx scripts/generar-ordenes-ejemplo.mjs
  *
  * Produce:
- *   · PDFs con el formato de AXA Colpatria  → docs/OrdenesEjemplo/Colpatria/
- *   · Excel con el formato SIPAB de Bolívar → docs/BasesDatosEjemplo/
+ *   · PDFs con el formato de AXA Colpatria  → 2-pruebas/ordenes/axa/      (raíz del monorepo)
+ *   · Excel con el formato SIPAB de Bolívar → 2-pruebas/ordenes/bolivar/
  *
  * **Todos los datos son inventados.** Las empresas, NIT, personas, teléfonos y
  * correos no existen: es justo lo que diferencia estos archivos de los de
- * `docs/OrdenesEjemplo/`, que son documentos reales de clientes y por eso están
+ * `1-cliente-jdd/ordenes-reales/`, que son documentos reales de clientes y por eso están
  * en `.gitignore` (razones sociales, NIT y hasta la seguridad social de una
  * persona). Estos se pueden compartir, commitear y enseñar en una demo sin
  * exponer a nadie.
  *
- * El layout del PDF replica el de la orden real `Colpatria/orden_001.pdf`
+ * El layout del PDF replica el de la orden real `1-cliente-jdd/ordenes-reales/axa/orden_001.pdf`
  * (carta apaisada, 792×612) porque la extracción lee el TEXTO del PDF: si los
  * rótulos no dicen lo mismo —"EMPRESA:", "AFILIACIÓN No:", "FECHA VENCIMIENTO
  * PARA PROGRAMACIÓN:"— el modelo no encuentra los campos.
@@ -32,9 +32,11 @@ import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
 import ExcelJS from 'exceljs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const RAIZ = path.resolve(__dirname, '..', '..', 'jdd_consultores_app', 'docs');
-const DIR_PDF = path.join(RAIZ, 'OrdenesEjemplo', 'Colpatria');
-const DIR_XLS = path.join(RAIZ, 'BasesDatosEjemplo');
+// 30-sep-2026 · Lo que generamos nosotros vive en `2-pruebas/` de la raíz del
+// monorepo, separado de lo que entregó el cliente (`1-cliente-jdd/`).
+const RAIZ = path.resolve(__dirname, '..', '..', '2-pruebas', 'ordenes');
+const DIR_PDF = path.join(RAIZ, 'axa');
+const DIR_XLS = path.join(RAIZ, 'bolivar');
 
 // ---------------------------------------------------------------------------
 // Datos de ejemplo (inventados)

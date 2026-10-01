@@ -334,9 +334,22 @@ export async function crearBorrador({ arlId, pagadorTerceroId, ordenIds, prefact
     }
 
     const retenciones = await retencionesDeVenta(condicion.retenciones_ids, client);
-    const items = lineasConEsArl.map((l) => construirItemDesdeLinea(l, {
-      productoArl, productoPrivado, formatoDescripcion: condicion.formato_descripcion,
-    }));
+    const items = lineasConEsArl.flatMap((l) => {
+      const honorarios = construirItemDesdeLinea(l, {
+        productoArl, productoPrivado, formatoDescripcion: condicion.formato_descripcion,
+      });
+      // 30-sep-2026 · Los gastos que aprobó operación (transporte, alojamiento,
+      // alimentación, tiempo muerto, material) van en su PROPIO ítem, con el
+      // mismo producto: mezclarlos con las horas inventaría un valor hora que no
+      // es el pactado. Las líneas de prefactura ya los traen dentro (gastos = 0).
+      if (!(Number(l.gastos) > 0)) return [honorarios];
+      return [honorarios, {
+        ...honorarios,
+        descripcion: `Gastos de desplazamiento (OS ${l.numero_orden || l.codigo || '—'})`,
+        cantidad: 1,
+        valor_unitario: Number(l.gastos),
+      }];
+    });
     const descuentoComercialPct = Number(condicion.descuento_comercial_pct) || 0;
     const calculo = calcular(items, descuentoComercialPct, retenciones);
 

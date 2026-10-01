@@ -2,7 +2,7 @@ import { z } from 'zod';
 
 /**
  * T0-09 · Esquema de Structured Outputs para el "DETALLE PREFACTURA" que emite
- * Bolívar (ver `DocFacturacion/PREFACTURAS/*.pdf`, no viaja por git).
+ * Bolívar (ver `1-cliente-jdd/prefacturas/bolivar/*.pdf`, no viaja por git).
  *
  * `.nullable()` y no `.optional()` en todo lo que puede faltar: OpenAI
  * Structured Outputs en modo estricto no admite claves opcionales (mismo motivo

@@ -1,6 +1,6 @@
 /**
  * Órdenes de EJEMPLO para presentar al cliente las seis peticiones de la
- * reunión del 22-ago-2026 (`docs/plan-peticiones-22-ago-2026.md`).
+ * reunión del 22-ago-2026 (`docs/3-planes/plan-peticiones-22-ago-2026.md`).
  *
  *   node scripts/generar-ordenes-demo-peticiones.mjs
  *
@@ -12,10 +12,11 @@
  *
  * Salida (carpeta IGNORADA por git, igual que las otras de ejemplo):
  *
- *   docs/OrdenesDemo/Bolivar/    demo-bolivar-sipab.xlsx   (6 órdenes en un Excel)
- *   docs/OrdenesDemo/Colpatria/  3 PDF
- *   docs/OrdenesDemo/Colmena/    2 PDF
- *   docs/OrdenesDemo/README.md   qué demuestra cada una, en orden de demo
+ *   2-pruebas/ordenes/bolivar/   demo-bolivar-sipab.xlsx   (6 órdenes en un Excel)
+ *   2-pruebas/ordenes/axa/       3 PDF
+ *   2-pruebas/ordenes/colmena/   2 PDF
+ *   2-pruebas/ordenes/README-demo-22-ago.md   qué demuestra cada una, en orden de demo
+ *   (todo en la raíz del monorepo, fuera de git)
  *
  * **Todos los datos son inventados**: empresas, NIT, personas, teléfonos y
  * correos no existen. Se puede proyectar en una reunión sin exponer a nadie.
@@ -36,10 +37,11 @@ import ExcelJS from 'exceljs';
 import { entregaDeLaOrden } from '../src/services/entrega-arl.service.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const RAIZ = path.resolve(__dirname, '..', '..', 'jdd_consultores_app', 'docs', 'OrdenesDemo');
-const DIR_BOL = path.join(RAIZ, 'Bolivar');
-const DIR_AXA = path.join(RAIZ, 'Colpatria');
-const DIR_COL = path.join(RAIZ, 'Colmena');
+// 30-sep-2026 · Salida en `2-pruebas/ordenes/` de la raíz del monorepo.
+const RAIZ = path.resolve(__dirname, '..', '..', '2-pruebas', 'ordenes');
+const DIR_BOL = path.join(RAIZ, 'bolivar');
+const DIR_AXA = path.join(RAIZ, 'axa');
+const DIR_COL = path.join(RAIZ, 'colmena');
 
 /** El proveedor somos nosotros: es fijo en todas las órdenes de las tres ARL. */
 const PROVEEDOR = {
@@ -247,7 +249,7 @@ async function generarExcelBolivar() {
 // ===========================================================================
 
 /**
- * El layout replica el de la orden real `Colpatria/orden_001.pdf` (carta
+ * El layout replica el de la orden real `1-cliente-jdd/ordenes-reales/axa/orden_001.pdf` (carta
  * apaisada, 792×612) porque la extracción lee el TEXTO del PDF: si los rótulos
  * no dicen lo mismo —"EMPRESA:", "AFILIACIÓN No:", "FECHA VENCIMIENTO PARA
  * PROGRAMACIÓN:"— el modelo no encuentra los campos.
@@ -606,7 +608,7 @@ Generadas por \`sst_ws/scripts/generar-ordenes-demo-peticiones.mjs\` (\`node scr
 correos no existen. Esta carpeta está en \`.gitignore\`.
 
 Cada orden está construida para disparar UNA rama concreta de las peticiones
-nuevas. El diseño de cada fase está en \`docs/plan-peticiones-22-ago-2026.md\`.
+nuevas. El diseño de cada fase está en \`docs/3-planes/plan-peticiones-22-ago-2026.md\`.
 
 > Las columnas **Formatos** y **Soportes** de las tablas de abajo no están
 > escritas a mano: se las pregunta el generador a \`entrega-arl.service.js\`, que
@@ -796,8 +798,8 @@ async function main() {
     console.log(`  PDF   Colmena/${nombre.padEnd(46)} ${cantidad(o.horas)} h · ${o.componente} · ${o.ciudad}`);
   }
 
-  await writeFile(path.join(RAIZ, 'README.md'), readme(nombresAxa, nombresColmena));
-  console.log(`  MD    README.md${' '.repeat(50)}guion de la demo\n`);
+  await writeFile(path.join(RAIZ, 'README-demo-22-ago.md'), readme(nombresAxa, nombresColmena));
+  console.log(`  MD    README-demo-22-ago.md${' '.repeat(50)}guion de la demo\n`);
   console.log(`Todo en → ${RAIZ}`);
   console.log('No se procesó ninguno: quedan listos para subirlos desde Importar.');
 }

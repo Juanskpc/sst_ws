@@ -2,7 +2,7 @@
  * Puerto de "proveedor de facturación electrónica" (patrón puerto + adaptador).
  *
  * Diseño únicamente — no hay ningún adaptador real conectado todavía. Ver
- * docs/facturacion-electronica.md §4 (arquitectura) y §7 (qué se puede avanzar
+ * docs/2-arquitectura/facturacion-electronica.md §4 (arquitectura) y §7 (qué se puede avanzar
  * sin el dato de volumen). No usar en producción hasta cerrar D-1, D-3, D-5.
  *
  * Un `receptor` NO es siempre una ARL: la reunión del 19-sep-2026 confirmó que
@@ -101,7 +101,7 @@ export class PuertoFacturacionElectronica {
   }
 
   /**
-   * Volumen mínimo (un solo empleado, ver docs/facturacion-electronica.md §8.E) —
+   * Volumen mínimo (un solo empleado, ver docs/2-arquitectura/facturacion-electronica.md §8.E) —
    * incluido aquí solo para dejar completo el contrato de los tres tipos de
    * documento DIAN (D-8), no porque vaya a construirse antes que los otros dos.
    * @param {{empleado: object, periodoPago: {desde: string, hasta: string}, devengados: object, deducciones: object}} datos

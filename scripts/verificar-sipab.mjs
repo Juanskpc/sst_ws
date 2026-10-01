@@ -12,7 +12,7 @@
  *
  * Los SIPAB reales no viajan por git (ver HANDOFF §2): para probar sin ellos,
  * `node --import tsx scripts/generar-ordenes-ejemplo.mjs` escribe dos con datos
- * inventados en `docs/BasesDatosEjemplo/`.
+ * inventados en `1-cliente-jdd/ordenes-reales/`.
  */
 import fs from 'node:fs';
 import { parseExcelSipab, readSheetPreview, runExtraction } from '../src/services/extraction.service.js';

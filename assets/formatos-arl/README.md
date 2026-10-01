@@ -12,7 +12,7 @@ Salvo una excepción anotada más abajo, son documentos públicos de la ARL
 
 Los ejemplos ya diligenciados que sirvieron para mapear las casillas **no** están
 aquí: llevan nombres, cédulas y firmas de asistentes reales, y viven fuera de git
-(`jdd_consultores_app/docs/Formatos/`, también ignorada). La única excepción es
+(`jdd_consultores_app/1-cliente-jdd/formatos-arl/`, también ignorada). La única excepción es
 `bolivar/informe-gestion.docx`, y está explicada abajo.
 
 **No salen todos en cada orden.** Cuáles se adjuntan lo decide

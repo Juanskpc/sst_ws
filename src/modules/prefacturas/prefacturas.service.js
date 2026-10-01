@@ -29,6 +29,8 @@ function clasificar(fila, orden, numeroPrefactura) {
     return { resultado: RESULTADOS.OTRA_PREFACTURA, orden };
   }
   if (orden.estado !== 'FINALIZADA') return { resultado: RESULTADOS.NO_FINALIZADA, orden };
+  // 30-sep-2026 · `valor_total` llega aquí como honorarios + gastos de cobro
+  // (ver las consultas): `valor_a_facturar` de Bolívar también los incluye.
   if (orden.valor_total != null && difieren(orden.valor_total, fila.valor_a_facturar)) {
     return { resultado: RESULTADOS.VALOR_DISTINTO, orden };
   }
@@ -47,7 +49,9 @@ export async function cruzarFilas(filas, numeroPrefactura, client = pool) {
   for (const fila of filas) {
     const r = await client.query(
       `SELECT o.id, o.codigo, o.estado, o.estado_arl::text AS estado_arl,
-              o.numero_prefactura, o.valor_total, o.empresa_nombre
+              o.numero_prefactura, (o.valor_total + COALESCE(o.cobro_transporte,0) + COALESCE(o.cobro_alojamiento,0)
+                + COALESCE(o.cobro_alimentacion,0) + COALESCE(o.cobro_tiempo_muerto,0)
+                + COALESCE(o.cobro_material,0)) AS valor_total, o.empresa_nombre
          FROM sst.ordenes_servicio o
          JOIN sst.arls a ON a.id = o.arl_id
         WHERE a.nombre ILIKE '%bol%var%'
@@ -117,7 +121,10 @@ export async function aplicarPrefactura({ datos, filasMarcadas, nombreArchivo, u
       // cambiar de estado mientras el modal seguía abierto.
       const orden = (await client.query(
         `SELECT o.id, o.codigo, a.nombre AS arl_nombre, o.estado::text AS estado,
-                o.estado_arl::text AS estado_arl, o.numero_prefactura, o.valor_total
+                o.estado_arl::text AS estado_arl, o.numero_prefactura,
+                (o.valor_total + COALESCE(o.cobro_transporte,0) + COALESCE(o.cobro_alojamiento,0)
+                + COALESCE(o.cobro_alimentacion,0) + COALESCE(o.cobro_tiempo_muerto,0)
+                + COALESCE(o.cobro_material,0)) AS valor_total
            FROM sst.ordenes_servicio o JOIN sst.arls a ON a.id = o.arl_id
           WHERE a.nombre ILIKE '%bol%var%'
             AND o.codigo_cronograma=$1 AND o.secuencia=$2 FOR UPDATE`,

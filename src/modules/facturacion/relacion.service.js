@@ -38,6 +38,8 @@ const MOTIVOS = {
   SIN_PREFACTURA: 'Bolívar se factura por prefactura: cargue el PDF de la prefactura de esta orden.',
   OTRA_PREFACTURA: 'La orden quedó aprobada con otra prefactura.',
   SIN_ORDEN: 'No cruza con ninguna orden de Orbita (puede ser de otro proveedor de Bolívar).',
+  RECARGAR_PREFACTURA: 'Está en esta prefactura pero no quedó aprobada: vuelva a cargar el PDF de la prefactura ahora que la orden está finalizada.',
+  SIN_APROBACION_COBRO: 'Operación todavía no aprueba el cobro de esta orden (Órdenes → columna Cobro).',
 };
 
 /**
@@ -50,7 +52,12 @@ const SQL_CANDIDATAS = `
          o.pagador_tercero_id, COALESCE(a.tercero_id, o.pagador_tercero_id) AS tercero_id,
          o.numero_orden, o.codigo_cronograma, o.secuencia, o.empresa_nombre,
          o.tipo_actividad, o.tema_actividad, o.horas_asignadas, o.valor_unitario, o.valor_total,
-         COALESCE((o.viaticos_detalle->>'transporte')::numeric, 0) AS transporte,
+         -- 30-sep-2026 · Los gastos que se le cobran al pagador (los aprueba
+         -- operación junto con los honorarios) y el visto bueno.
+         COALESCE(o.cobro_transporte, 0) AS transporte,
+         COALESCE(o.cobro_transporte, 0) + COALESCE(o.cobro_alojamiento, 0) + COALESCE(o.cobro_alimentacion, 0)
+           + COALESCE(o.cobro_tiempo_muerto, 0) + COALESCE(o.cobro_material, 0) AS gastos,
+         o.cobro_aprobado_en,
          o.estado_arl::text AS estado_arl, o.numero_prefactura,
          to_char(COALESCE(o.fecha_ejecucion, o.fecha_programada, o.actualizado_en), 'YYYY-MM-DD') AS fecha_ejecucion,
          doc.documento_id, doc.documento_estado,
@@ -93,6 +100,10 @@ function motivoBloqueo(o) {
   if (o.arl_id && o.estado_arl !== 'APROBADO') return MOTIVOS.NO_APROBADA;
   if (o.documento_estado === 'ENVIANDO') return MOTIVOS.ENVIANDO;
   if (o.documento_id) return MOTIVOS.EN_BORRADOR;
+  // 30-sep-2026 · Sin el visto bueno de operación la orden no pasa a la
+  // contabilidad, aunque la prefactura ya esté cargada (pedido de JD&D). Va
+  // después del borrador: una orden que ya está en uno no se aprueba de nuevo.
+  if (!o.cobro_aprobado_en) return MOTIVOS.SIN_APROBACION_COBRO;
   return null;
 }
 
@@ -104,6 +115,9 @@ function motivoBloqueo(o) {
  */
 function valorReferencia(o) {
   const horas = Number(o.horas_asignadas) || 0;
+  // Aprobado por operación: manda lo aprobado (honorarios de la orden). Los
+  // gastos van aparte, en `gastos`, y el borrador los factura en su propio ítem.
+  if (o.cobro_aprobado_en && o.valor_total != null) return { valor: Number(o.valor_total), origen: 'APROBADO' };
   if (o.tarifa_valor != null) {
     const centavos = o.tarifa_unidad === 'UNIDAD' ? aCentavos(o.tarifa_valor) : aCentavos(horas * Number(o.tarifa_valor));
     return { valor: Number(deCentavos(centavos)), origen: 'TARIFA' };
@@ -127,9 +141,13 @@ function lineaDeOrden(o, extra = {}) {
     tipo_actividad: o.tipo_actividad,
     tema_actividad: o.tema_actividad,
     horas: o.horas_asignadas != null ? Number(o.horas_asignadas) : null,
-    valor_unitario: o.tarifa_unidad === 'HORA' && o.tarifa_valor != null ? Number(o.tarifa_valor)
+    valor_unitario: o.cobro_aprobado_en && o.valor_unitario != null ? Number(o.valor_unitario)
+      : o.tarifa_unidad === 'HORA' && o.tarifa_valor != null ? Number(o.tarifa_valor)
       : o.valor_unitario != null ? Number(o.valor_unitario) : null,
     transporte: Number(extra.transporte ?? o.transporte) || 0,
+    // Gastos aprobados (transporte, alojamiento, alimentación, tiempo muerto,
+    // material). En una línea de prefactura van DENTRO de `valor_a_facturar`.
+    gastos: extra.origen === 'PREFACTURA' ? 0 : Number(o.gastos) || 0,
     fecha_ejecucion: o.fecha_ejecucion,
     valor_referencia: valor,
     origen_valor: origen,
@@ -141,7 +159,9 @@ function lineaDeOrden(o, extra = {}) {
   };
 }
 
-const total = (lineas) => Number(deCentavos(lineas.reduce((s, l) => s + aCentavos(l.valor_referencia ?? 0), 0)));
+// Honorarios + gastos aprobados (30-sep-2026): es lo que se va a facturar.
+const total = (lineas) => Number(deCentavos(lineas.reduce(
+  (s, l) => s + aCentavos(l.valor_referencia ?? 0) + aCentavos(l.gastos ?? 0), 0)));
 
 /**
  * Prefactura de Bolívar → grupo con una línea por fila. Las filas cuya orden ya
@@ -151,6 +171,7 @@ const total = (lineas) => Number(deCentavos(lineas.reduce((s, l) => s + aCentavo
 function grupoDePrefactura(pf, filas, ordenesPorId) {
   const lineas = [];
   let yaFacturadas = 0;
+  let sinOrden = 0;
   for (const f of filas) {
     if (f.orden_id && !ordenesPorId.has(f.orden_id)) {
       // La orden existe pero no es candidata: o ya se facturó, o aún no está FINALIZADA.
@@ -170,24 +191,22 @@ function grupoDePrefactura(pf, filas, ordenesPorId) {
 
     const valor = f.valor_a_facturar != null ? Number(f.valor_a_facturar) : null;
     if (!f.orden_id) {
-      // Bolívar paga lo que dice su prefactura, aunque Orbita no conozca la orden;
-      // pero puede ser de OTRO proveedor, así que no se marca sola.
-      lineas.push({
-        clave: `fila:${f.id}`, orden_id: null, fila_id: f.id, codigo: null, numero_orden: null,
-        codigo_cronograma: f.codigo_cronograma, secuencia: f.secuencia, empresa_nombre: f.razon_social,
-        tipo_actividad: f.actividad_programa, tema_actividad: null, horas: null, valor_unitario: null,
-        transporte: Number(f.transporte) || 0, fecha_ejecucion: null,
-        valor_referencia: valor, origen_valor: 'PREFACTURA',
-        facturable: true, motivo: null, aviso: MOTIVOS.SIN_ORDEN, marcada_por_defecto: false,
-        documento_id: null, documento_estado: null,
-      });
+      // 30-sep-2026 · Una fila cuya orden NO está en Orbita ya no se lista ni se
+      // factura (antes salía "Lista"): la prefactura de Bolívar trae todo el
+      // corte, incluidas órdenes que aún no se han importado u órdenes de otro
+      // proveedor, y facturarlas sería cobrar algo que Orbita no ejecutó. Solo
+      // se cuentan, para que la pantalla diga cuántas quedaron fuera.
+      sinOrden += 1;
       continue;
     }
 
     const o = ordenesPorId.get(f.orden_id);
-    const motivo = o.numero_prefactura && o.numero_prefactura !== pf.numero_prefactura
+    let motivo = o.numero_prefactura && o.numero_prefactura !== pf.numero_prefactura
       ? MOTIVOS.OTRA_PREFACTURA
       : motivoBloqueo(o);
+    // Está en la prefactura pero la carga no la aprobó (se importó o finalizó
+    // después): lo que falta es volver a cargarla, no esperar a la ARL.
+    if (motivo === MOTIVOS.NO_APROBADA) motivo = MOTIVOS.RECARGAR_PREFACTURA;
     lineas.push(lineaDeOrden(o, {
       fila_id: f.id, valor, origen: 'PREFACTURA', motivo, transporte: f.transporte, marcada: true,
     }));
@@ -201,6 +220,7 @@ function grupoDePrefactura(pf, filas, ordenesPorId) {
       valor_total: pf.valor_total != null ? Number(pf.valor_total) : null,
     },
     ya_facturadas: yaFacturadas,
+    sin_orden: sinOrden,
     lineas,
     n_facturables: lineas.filter((l) => l.facturable).length,
     total_marcadas: total(facturables),
@@ -229,14 +249,25 @@ export async function relacionPorFacturar({ arlId = null, pagadorTerceroId = nul
   // ligada puede ser candidata o no; `orden_finalizada_facturada` distingue las
   // que ya están facturadas de las que simplemente aún no se finalizan.
   const filas = (await db.query(
-    `SELECT pf.id AS prefactura_id, f.id, f.orden_id, f.codigo_cronograma, f.secuencia, f.razon_social,
+    `SELECT pf.id AS prefactura_id, f.id, o.id AS orden_id, f.codigo_cronograma, f.secuencia, f.razon_social,
             f.actividad_programa, f.transporte, f.valor_a_facturar, o.codigo AS orden_codigo,
             (o.id IS NOT NULL AND (o.estado_cobro = 'FACTURADA' OR EXISTS (
                SELECT 1 FROM sst.documento_ordenes dor
                 WHERE dor.orden_id = o.id AND dor.documento_validado_id IS NOT NULL))) AS orden_finalizada_facturada
        FROM sst.prefactura_filas f
        JOIN sst.prefacturas pf ON pf.id = f.prefactura_id
-       LEFT JOIN sst.ordenes_servicio o ON o.id = f.orden_id
+       -- La orden se busca también por cronograma+secuencia (30-sep-2026): si se
+       -- importó DESPUÉS de cargar la prefactura, f.orden_id sigue vacío, pero
+       -- la orden ya existe y tiene que aparecer (con el motivo que le falte).
+       LEFT JOIN LATERAL (
+         SELECT x.id, x.codigo, x.estado_cobro
+           FROM sst.ordenes_servicio x JOIN sst.arls a ON a.id = x.arl_id
+          WHERE x.id = f.orden_id
+             OR (f.orden_id IS NULL AND a.nombre ILIKE '%bol%var%'
+                 AND x.codigo_cronograma = f.codigo_cronograma AND x.secuencia = f.secuencia)
+          ORDER BY (x.id = f.orden_id) DESC
+          LIMIT 1
+       ) o ON true
       ORDER BY pf.fecha_corte DESC NULLS LAST, pf.numero_prefactura DESC, f.codigo_cronograma, f.secuencia`,
   )).rows;
   const prefacturas = (await db.query(

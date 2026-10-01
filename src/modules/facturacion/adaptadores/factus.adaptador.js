@@ -38,7 +38,7 @@ function unidadFactus(codigo) {
 /**
  * `EXENTO` (A0-06) se modela como IVA al 0 % (`code: '01', rate: '0.00'`), no
  * como `is_excluded: true`: excluido y exento son figuras legales distintas
- * (nota de docs/facturacion-electronica.md §7, punto 7) y "exento por norma" es
+ * (nota de docs/2-arquitectura/facturacion-electronica.md §7, punto 7) y "exento por norma" es
  * lo que dijo la reunión (A0-06, Q-14) — no lo que Factus llama excluido.
  * ⚠️ Sin confirmar contra el sandbox con un producto real todavía: ver la
  * bitácora de A1-02.
