@@ -42,7 +42,7 @@ export function estadoProveedor(emisor) {
   const configurado = proveedorConfigurado();
   const sandbox = configurado ? proveedorEsSandbox() : null;
   let aviso = null;
-  if (!configurado) aviso = 'El proveedor de facturación no está configurado en el servidor (faltan las variables FACTUS_*).';
+  if (!configurado) aviso = 'El proveedor tecnológico de facturación todavía no está conectado.';
   else if (emisor?.ambiente === 'PRODUCCION' && sandbox) aviso = 'La ficha dice PRODUCCION pero el servidor apunta al sandbox del proveedor.';
   else if (emisor?.ambiente === 'PRUEBAS' && !sandbox) aviso = 'La ficha dice PRUEBAS pero el servidor apunta al ambiente real del proveedor.';
   return { configurado, sandbox, aviso };
