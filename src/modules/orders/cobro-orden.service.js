@@ -1,6 +1,7 @@
 import { pool, withTransaction } from '../../config/db.js';
 import { badRequest, notFound } from '../../utils/httpError.js';
 import { aCentavos, deCentavos } from '../../utils/dinero.js';
+import { esAxa } from '../../utils/bolivar.js';
 
 /**
  * 30-sep-2026 · El COBRO de una orden: cuánto se le factura al pagador, de qué
@@ -40,7 +41,7 @@ const sumar = (...vs) => Number(deCentavos(vs.reduce((s, v) => s + aCentavos(v ?
 const difieren = (a, b) => Math.abs((Number(a) || 0) - (Number(b) || 0)) >= 1;
 
 const SQL_ORDEN = `
-  SELECT o.id, o.codigo, o.estado::text AS estado, o.estado_cobro::text AS estado_cobro,
+  SELECT o.id, o.codigo, o.estado::text AS estado, o.estado_cobro::text AS estado_cobro, o.estado_arl::text AS estado_arl,
          o.cobro_numero_factura, o.arl_id, a.nombre AS arl_nombre, o.pagador_tercero_id,
          o.horas_asignadas, o.valor_unitario, o.valor_total, o.numero_prefactura,
          o.cobro_transporte, o.cobro_alojamiento, o.cobro_alimentacion, o.cobro_tiempo_muerto, o.cobro_material,
@@ -192,6 +193,27 @@ function leerImporte(valor, etiqueta) {
   return Number(deCentavos(aCentavos(n)));
 }
 
+/**
+ * 1-oct-2026 · AXA no manda prefactura: su única aprobación es el visto bueno
+ * del cobro. Aprobarlo deja la orden con estado ARL APROBADO (lo que Facturación
+ * exige) y retirarlo la devuelve a PENDIENTE, con su línea en el historial del
+ * estado ARL como cualquier cambio manual. Bolívar y Colmena no cambian.
+ */
+async function sincronizarArlAxa(client, o, nuevo, usuarioId) {
+  if (!esAxa(o.arl_nombre) || o.estado_arl === nuevo) return;
+  await client.query(
+    `UPDATE sst.ordenes_servicio
+        SET estado_arl = $2::sst.estado_arl, estado_arl_en = now(), estado_arl_por = $3
+      WHERE id = $1`,
+    [o.id, nuevo, usuarioId],
+  );
+  await client.query(
+    `INSERT INTO sst.historial_estado_arl (orden_id, estado_anterior, estado_nuevo, usuario_id, origen)
+     VALUES ($1, $2::sst.estado_arl, $3::sst.estado_arl, $4, 'MANUAL')`,
+    [o.id, o.estado_arl, nuevo, usuarioId],
+  );
+}
+
 async function anotar(client, ordenId, accion, total, observacion, usuarioId) {
   await client.query(
     `INSERT INTO sst.historial_aprobacion_cobro (orden_id, accion, total, observacion, usuario_id)
@@ -244,6 +266,7 @@ export async function guardarValores(ordenId, body, usuarioId) {
         );
         await anotar(client, ordenId, 'ANULADA_POR_CAMBIO', o.cobro_aprobado_total,
           `Cambió el total aprobado (${o.cobro_aprobado_total} → ${nueva.total ?? 'sin valor'}).`, usuarioId);
+        await sincronizarArlAxa(client, o, 'PENDIENTE', usuarioId);
       }
     }
     return detalleCobro(ordenId, client);
@@ -275,6 +298,7 @@ export async function aprobarCobro(ordenId, { observacion } = {}, usuarioId) {
       [ordenId, usuarioId, total],
     );
     await anotar(client, ordenId, 'APROBADA', total, observacion, usuarioId);
+    await sincronizarArlAxa(client, o, 'APROBADO', usuarioId);
     return detalleCobro(ordenId, client);
   });
 }
@@ -294,6 +318,7 @@ export async function retirarAprobacion(ordenId, { observacion } = {}, usuarioId
       [ordenId],
     );
     await anotar(client, ordenId, 'RETIRADA', o.cobro_aprobado_total, observacion, usuarioId);
+    await sincronizarArlAxa(client, o, 'PENDIENTE', usuarioId);
     return detalleCobro(ordenId, client);
   });
 }

@@ -186,13 +186,17 @@ async function textoDelPdf(buffer) {
  *   sigue estando el dedup del pipeline.
  */
 export async function detectarOrdenExistente({ buffer, mime, filename, client = pool }) {
-  const porHash = await porHuella(hashArchivo(buffer), client);
-  if (porHash.length) return { existe: true, via: 'huella', ordenes: porHash };
-
+  // El Excel va ANTES que la huella: sus filas se leen sin IA y la comparación
+  // fila a fila es exacta. Con la huella primero, un SIPAB del que se guardó
+  // solo una parte (2 de 6 filas) quedaba apartado entero y las filas nuevas
+  // no se podían importar nunca, ni con "Procesar de todos modos".
   if (esExcel(mime, filename)) {
     const { ordenes, todas, total } = await porFilasDelExcel(buffer, client);
     return { existe: todas && ordenes.length > 0, via: 'excel', ordenes, total_filas: total };
   }
+
+  const porHash = await porHuella(hashArchivo(buffer), client);
+  if (porHash.length) return { existe: true, via: 'huella', ordenes: porHash };
 
   const texto = await textoDelPdf(buffer);
   if (!texto) return { existe: false, via: null, ordenes: [] };

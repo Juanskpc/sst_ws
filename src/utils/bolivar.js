@@ -85,3 +85,12 @@ export function esBolivar(arlNombre) {
     .normalize('NFD').replace(/[̀-ͯ]/g, '')
     .toLowerCase().includes('bolivar');
 }
+
+/**
+ * ¿Esta ARL es AXA Colpatria? Vive aquí, junto a `esBolivar`, porque las dos
+ * son las únicas reglas de ARL que necesitan la importación y la confirmación.
+ */
+export function esAxa(arlNombre) {
+  const slug = String(arlNombre ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+  return slug.includes('colpatria') || /(^|[^a-z])axa([^a-z]|$)/.test(slug);
+}

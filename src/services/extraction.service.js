@@ -1,6 +1,6 @@
 import { CAMPOS_BORRADOR, CANONICAL_FIELDS, classifyPdfArl } from './gemini.service.js';
 import { extractPdfWithOpenAI } from './openai-extraction.bridge.js';
-import { normalizarTipoActividadBolivar } from '../utils/bolivar.js';
+import { esAxa, normalizarTipoActividadBolivar } from '../utils/bolivar.js';
 import { leerRejillaExcel } from '../utils/excel-grid.js';
 
 /**
@@ -566,5 +566,10 @@ export async function runExtraction({ buffer, mime, filename, arlHint }) {
     ({ arlNombre, confidence: arlConfidence } = await classifyPdfArl(buffer));
   }
   const { fields, engine } = await extractPdfWithOpenAI(buffer);
+  // 1-oct-2026 · La orden de AXA NO trae el NIT de la empresa cliente: el único
+  // NIT impreso es el de JD&D ("Señores: JDYD CONSULTORES… NIT/CED: 901203812"),
+  // y el modelo lo tomaba como si fuera del cliente. Se deja vacío para que lo
+  // escriba quien revisa; la vista previa lo pide como obligatorio.
+  if (esAxa(arlNombre)) fields.nit_nic = { ...fields.nit_nic, value: null, confidence: 0 };
   return { arlNombre, arlConfidence, records: [{ fields, engine }] };
 }

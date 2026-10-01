@@ -2923,6 +2923,11 @@ ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS cobro_material      NU
 ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS cobro_aprobado_en    TIMESTAMPTZ;
 ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS cobro_aprobado_por   UUID REFERENCES sst.usuarios(id);
 ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS cobro_aprobado_total NUMERIC(14,2);
+-- 1-oct-2026 · N.º de radicado ante Bolívar (a mano). Ver
+-- db/migraciones/2026-10-01-numero-radicado.sql.
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS numero_radicado     TEXT;
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS numero_radicado_en  TIMESTAMPTZ;
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS numero_radicado_por UUID REFERENCES sst.usuarios(id);
 CREATE TABLE IF NOT EXISTS sst.historial_aprobacion_cobro (
   id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   orden_id    UUID NOT NULL REFERENCES sst.ordenes_servicio(id) ON DELETE CASCADE,

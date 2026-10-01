@@ -10,7 +10,7 @@ import { resolverEmpresaId } from '../companies/companies.service.js';
 // (`PUT /orders/:id`): viven en utils para que no puedan divergir.
 import { parseNumeroCO, parseFechaCO } from '../../utils/parseo.js';
 import {
-  esBolivar, normalizarModalidadEjecucion, normalizarTipoActividadBolivar,
+  esAxa, esBolivar, normalizarModalidadEjecucion, normalizarTipoActividadBolivar,
 } from '../../utils/bolivar.js';
 import { hoyCO } from '../../utils/formato.js';
 
@@ -94,6 +94,8 @@ const DRAFT_SELECT = `
          o.validado_plataforma_en AS os_validado_plataforma_en,
          uvp.nombre AS os_validado_plataforma_por,
          o.cobro_aprobado_en AS os_cobro_aprobado_en,
+         -- 1-oct-2026 · N.º de radicado ante Bolívar, bajo el botón de Cobro.
+         o.numero_radicado AS os_numero_radicado,
          -- A3-01 · Orden de un cliente particular (sin ARL): quién la paga. La
          -- vista lo enseña donde las demás llevan la ARL, y oculta lo que solo
          -- tiene sentido con una (estado ARL, prefactura, formatos).
@@ -546,6 +548,13 @@ export async function materializarOrden(draftId, userId, client) {
     throw badRequest(
       'Falta indicar si la actividad es presencial o virtual. Elíjalo en la vista previa: ' +
       'de ello depende qué formatos de Bolívar se le envían al profesional.',
+    );
+  }
+  // El NIT de AXA lo escribe quien revisa (la orden no lo trae): sin él la OS
+  // se enlazaría a la empresa equivocada en el maestro, que se resuelve por NIT.
+  if (esAxa(arl.rows[0]?.nombre) && !val('nit_nic')) {
+    throw badRequest(
+      'Falta el NIT de la empresa. Las órdenes de AXA no lo traen: escríbalo en la vista previa.',
     );
   }
 
