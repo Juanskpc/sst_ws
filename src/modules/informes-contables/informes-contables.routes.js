@@ -184,15 +184,15 @@ router.get('/estado-resultados/xlsx', LEER, asyncHandler(async (req, res) => {
     extra: ['Formato provisional: los renglones son los grupos del PUC hasta que la contadora defina los suyos', 'Sin el comprobante de cierre de año'],
   });
   const comp = !!e.desde_anterior;
+  // La utilidad bruta (ingresos − costos) va entre los costos y los gastos, no al final.
   hojaEstado(ws, e.secciones, comp, comp ? ['Periodo', 'Mismo periodo del año anterior'] : ['Periodo'], [
-    ['Utilidad bruta', e.utilidad_bruta, e.utilidad_bruta_anterior],
     ['Utilidad (pérdida) del periodo', e.utilidad, e.utilidad_anterior],
-  ]);
+  ], { COSTOS: ['Utilidad bruta', e.utilidad_bruta, e.utilidad_bruta_anterior] });
   await enviarLibro(res, wb, `estado-resultados_${e.desde}_${e.hasta}`);
 }));
 
 /** Secciones con sus renglones y total; al final, las líneas de resultado. */
-function hojaEstado(ws, secciones, comparativo, columnas, pie) {
+function hojaEstado(ws, secciones, comparativo, columnas, pie, trasSeccion = {}) {
   titulosDeColumna(ws, ['Concepto', ...columnas], [52, ...columnas.map(() => 22)]);
   const nums = comparativo ? [2, 3] : [2];
   for (const s of secciones) {
@@ -201,6 +201,8 @@ function hojaEstado(ws, secciones, comparativo, columnas, pie) {
       pesos(ws.addRow([`    ${r.grupo ? `${r.grupo} · ` : ''}${r.nombre}`, r.valor, ...(comparativo ? [r.anterior] : [])]), nums);
     }
     subtotal(ws.addRow([`Total ${s.nombre.toLowerCase()}`, s.total, ...(comparativo ? [s.total_anterior] : [])]), nums);
+    const extra = trasSeccion[s.clave];
+    if (extra) total(ws.addRow([extra[0], extra[1], ...(comparativo ? [extra[2]] : [])]), nums);
   }
   ws.addRow([]);
   for (const [texto, v, ant] of pie) total(ws.addRow([texto, v, ...(comparativo ? [ant] : [])]), nums);
