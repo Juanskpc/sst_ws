@@ -2318,6 +2318,15 @@ INSERT INTO sst.permisos_rol (rol, vista, permitido) VALUES
   ('administrativo', 'contabilidad', FALSE)
 ON CONFLICT (rol, vista) DO NOTHING;
 
+-- C1-01 · Informes contables (migración 2026-10-02-informes-contables-permiso.sql).
+-- Solo consultan el libro: el mismo reparto que Contabilidad.
+INSERT INTO sst.permisos_rol (rol, vista, permitido) VALUES
+  ('admin',          'informes_contables', TRUE),
+  ('contador',       'informes_contables', TRUE),
+  ('auditor',        'informes_contables', TRUE),
+  ('administrativo', 'informes_contables', FALSE)
+ON CONFLICT (rol, vista) DO NOTHING;
+
 -- B1-01 · Motor de comprobantes (migración 2026-09-29-comprobantes.sql)
 -- Libro diario: comprobante + movimientos. Cuadre, cuentas válidas, tercero y
 -- periodo abierto se verifican al commit (trigger diferido); lo contabilizado no

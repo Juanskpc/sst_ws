@@ -20,6 +20,7 @@ import facturacionRoutes from '../modules/facturacion/facturacion.routes.js';
 import contabilidadRoutes from '../modules/contabilidad/contabilidad.routes.js';
 import carteraRoutes from '../modules/cartera/cartera.routes.js';
 import comprasRoutes from '../modules/compras/compras.routes.js';
+import informesContablesRoutes from '../modules/informes-contables/informes-contables.routes.js';
 
 const router = Router();
 
@@ -44,6 +45,8 @@ router.use('/facturacion', facturacionRoutes);
 router.use('/contabilidad', contabilidadRoutes);
 router.use('/cartera', carteraRoutes);
 router.use('/compras', comprasRoutes);
+// Fase C · informes contables (balance de comprobación, auxiliar…)
+router.use('/informes-contables', informesContablesRoutes);
 // M2
 router.use('/imports', importsRoutes);
 router.use('/drafts', draftsRoutes);
