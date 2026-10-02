@@ -14,6 +14,10 @@ import { eliminarRegla, guardarRegla, listarReglas, sembrarReglasSiigo } from '.
 import { cerrarAnio, vistaPreviaCierre } from './cierre.service.js';
 import { actualizarCentro, cambiarActivoCentro, crearCentro, listarCentros } from './centros.service.js';
 import { contabilizarDocumento, contabilizarPendientes, listarPendientes, vistaPreviaAsiento } from './contabilizacion.service.js';
+import {
+  actualizarActivo, crearActivo, depreciarMes, eliminarActivo, listarActivos, listarCorridas, obtenerActivo, qrActivo,
+  revertirDepreciacion, vistaPreviaDepreciacion,
+} from './activos.service.js';
 
 const router = Router();
 router.use(authRequired);
@@ -192,6 +196,55 @@ router.get('/cierre/:anio', LEER, asyncHandler(async (req, res) => {
 // Cerrar el año es irreversible (D-20): solo el administrador.
 router.post('/cierre/:anio', requireRole('admin'), asyncHandler(async (req, res) => {
   res.status(201).json({ data: await cerrarAnio(req.params.anio, req.body, req.user.sub) });
+}));
+
+// ─── C7-01 · Activos fijos y depreciación (ACT-01..03) ──────────────────────
+
+router.get('/activos', LEER, asyncHandler(async (_req, res) => {
+  const data = await listarActivos();
+  res.json({ data, total: data.length });
+}));
+
+router.get('/activos/:id', LEER, asyncHandler(async (req, res) => {
+  res.json({ data: await obtenerActivo(req.params.id) });
+}));
+
+// El QR de la etiqueta: abre la ficha del activo en ORBITA (con sesión).
+router.get('/activos/:id/qr.png', LEER, asyncHandler(async (req, res) => {
+  const png = await qrActivo(req.params.id);
+  res.setHeader('Content-Type', 'image/png');
+  res.send(png);
+}));
+
+router.post('/activos', OPERAR, asyncHandler(async (req, res) => {
+  res.status(201).json({ data: await crearActivo(req.body, req.user.sub) });
+}));
+
+router.put('/activos/:id', OPERAR, asyncHandler(async (req, res) => {
+  res.json({ data: await actualizarActivo(req.params.id, req.body, req.user.sub) });
+}));
+
+// Solo mientras no tenga depreciación: después ya es contabilidad.
+router.delete('/activos/:id', OPERAR, asyncHandler(async (req, res) => {
+  await eliminarActivo(req.params.id);
+  res.status(204).end();
+}));
+
+router.get('/depreciaciones', LEER, asyncHandler(async (_req, res) => {
+  res.json({ data: await listarCorridas() });
+}));
+
+// Lo que depreciaría el mes, sin guardar nada.
+router.get('/depreciaciones/:anio/:mes', LEER, asyncHandler(async (req, res) => {
+  res.json({ data: await vistaPreviaDepreciacion(req.params.anio, req.params.mes) });
+}));
+
+router.post('/depreciaciones/:anio/:mes', OPERAR, asyncHandler(async (req, res) => {
+  res.status(201).json({ data: await depreciarMes(req.params.anio, req.params.mes, req.user.sub) });
+}));
+
+router.post('/depreciaciones/:anio/:mes/revertir', OPERAR, asyncHandler(async (req, res) => {
+  res.json({ data: await revertirDepreciacion(req.params.anio, req.params.mes, req.body?.motivo, req.user.sub) });
 }));
 
 export default router;
