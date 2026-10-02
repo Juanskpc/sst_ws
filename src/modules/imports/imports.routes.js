@@ -66,7 +66,15 @@ router.post('/', requireRole('admin'), uploadImport.single('file'), asyncHandler
   // esta comprobación al elegir el archivo, pero el gasto se decide aquí: un
   // cliente que no la haya hecho —o una pestaña abierta desde antes— no puede
   // colar un documento ya procesado.
-  const deteccion = await detectarOrdenExistente({ buffer, mime: mimetype, filename: originalname });
+  //
+  // `forzar=true` lo manda «Procesar de todos modos»: la detección previa no es
+  // infalible (un archivo que menciona otra orden puede parecer repetido) y la
+  // persona ya decidió gastar la IA. No se salta la deduplicación: el pipeline
+  // compara fila a fila después de extraer y una orden de verdad repetida sigue
+  // saliendo como duplicada. Antes este chequeo devolvía 409 también con el botón,
+  // así que el botón no servía (prueba de punta a punta del 1-oct).
+  const forzar = req.body?.forzar === 'true';
+  const deteccion = forzar ? { existe: false } : await detectarOrdenExistente({ buffer, mime: mimetype, filename: originalname });
   if (deteccion.existe) {
     return res.status(409).json({
       error: deteccion.ordenes.length === 1
