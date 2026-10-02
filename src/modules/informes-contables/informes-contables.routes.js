@@ -6,6 +6,7 @@ import { balanceComprobacion } from './balance.service.js';
 import { auxiliarPorCuenta, informePorTercero } from './auxiliar.service.js';
 import { libroAuxiliar } from './libros.service.js';
 import { ventasPorCliente } from './ventas.service.js';
+import { estadoResultados, estadoSituacionFinanciera } from './estados.service.js';
 import { enviarLibro, libroConEncabezado, pesos, titulosDeColumna } from './excel.js';
 
 const router = Router();
@@ -147,6 +148,63 @@ router.get('/ventas/xlsx', LEER, asyncHandler(async (req, res) => {
   total(ws.addRow(['Total', '', '', null, v.totales.facturas, v.totales.notas, v.totales.subtotal, v.totales.total_iva, v.totales.total_retenciones, v.totales.total_a_pagar]), [7, 8, 9, 10]);
   await enviarLibro(res, wb, `ventas-por-cliente_${v.filtros.desde}_${v.filtros.hasta}`);
 }));
+
+// ─── C5-01 · Estados financieros (RPC-04, RPC-05) · formato provisional ─────
+
+// ?corte=AAAA-MM-DD&comparativo=true
+router.get('/estado-situacion', LEER, asyncHandler(async (req, res) => {
+  res.json({ data: await estadoSituacionFinanciera(req.query) });
+}));
+
+router.get('/estado-situacion/xlsx', LEER, asyncHandler(async (req, res) => {
+  const e = await estadoSituacionFinanciera(req.query);
+  const { wb, ws } = await libroConEncabezado({
+    titulo: 'Estado de situación financiera', hoja: 'Situación financiera', desde: e.corte, hasta: e.corte,
+    extra: ['Formato provisional: los renglones son los grupos del PUC hasta que la contadora defina los suyos'],
+    rangoTexto: `A ${e.corte}`,
+  });
+  const comp = !!e.corte_anterior;
+  hojaEstado(ws, e.secciones, comp, comp ? [`Al ${e.corte}`, `Al ${e.corte_anterior}`] : [`Al ${e.corte}`], [
+    ['Resultado del ejercicio', e.resultado_ejercicio, e.resultado_ejercicio_anterior],
+    ['Total activo', e.total_activo, e.total_activo_anterior],
+    ['Total pasivo + patrimonio + resultado', e.total_pasivo_patrimonio, e.total_pasivo_patrimonio_anterior],
+  ]);
+  await enviarLibro(res, wb, `estado-situacion-financiera_${e.corte}`);
+}));
+
+// ?desde=&hasta=&comparativo=true
+router.get('/estado-resultados', LEER, asyncHandler(async (req, res) => {
+  res.json({ data: await estadoResultados(req.query) });
+}));
+
+router.get('/estado-resultados/xlsx', LEER, asyncHandler(async (req, res) => {
+  const e = await estadoResultados(req.query);
+  const { wb, ws } = await libroConEncabezado({
+    titulo: 'Estado de resultados', hoja: 'Resultados', desde: e.desde, hasta: e.hasta,
+    extra: ['Formato provisional: los renglones son los grupos del PUC hasta que la contadora defina los suyos', 'Sin el comprobante de cierre de año'],
+  });
+  const comp = !!e.desde_anterior;
+  hojaEstado(ws, e.secciones, comp, comp ? ['Periodo', 'Mismo periodo del año anterior'] : ['Periodo'], [
+    ['Utilidad bruta', e.utilidad_bruta, e.utilidad_bruta_anterior],
+    ['Utilidad (pérdida) del periodo', e.utilidad, e.utilidad_anterior],
+  ]);
+  await enviarLibro(res, wb, `estado-resultados_${e.desde}_${e.hasta}`);
+}));
+
+/** Secciones con sus renglones y total; al final, las líneas de resultado. */
+function hojaEstado(ws, secciones, comparativo, columnas, pie) {
+  titulosDeColumna(ws, ['Concepto', ...columnas], [52, ...columnas.map(() => 22)]);
+  const nums = comparativo ? [2, 3] : [2];
+  for (const s of secciones) {
+    ws.addRow([s.nombre]).font = { bold: true, color: { argb: 'FF000B50' } };
+    for (const r of s.renglones) {
+      pesos(ws.addRow([`    ${r.grupo ? `${r.grupo} · ` : ''}${r.nombre}`, r.valor, ...(comparativo ? [r.anterior] : [])]), nums);
+    }
+    subtotal(ws.addRow([`Total ${s.nombre.toLowerCase()}`, s.total, ...(comparativo ? [s.total_anterior] : [])]), nums);
+  }
+  ws.addRow([]);
+  for (const [texto, v, ant] of pie) total(ws.addRow([texto, v, ...(comparativo ? [ant] : [])]), nums);
+}
 
 // ─── Escritores de hoja comunes ──────────────────────────────────────────────
 

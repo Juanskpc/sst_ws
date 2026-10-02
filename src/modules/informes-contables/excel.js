@@ -23,7 +23,7 @@ export const FORMATO_PESOS = '#,##0.00;-#,##0.00;0.00';
  * Libro con el encabezado puesto. Devuelve la hoja y la fila donde van los
  * títulos de columna. `extra`: líneas de filtros aplicados (cuenta, tercero…).
  */
-export async function libroConEncabezado({ titulo, hoja, desde, hasta, extra = [] }) {
+export async function libroConEncabezado({ titulo, hoja, desde, hasta, extra = [], rangoTexto = null }) {
   const emisor = await obtenerEmisor().catch(() => null);
   const wb = new ExcelJS.Workbook();
   wb.creator = 'ORBITA';
@@ -34,7 +34,7 @@ export async function libroConEncabezado({ titulo, hoja, desde, hasta, extra = [
     titulo,
     emisor?.razon_social,
     emisor ? `NIT ${emisor.nit}-${emisor.dv}` : null,
-    `Del ${fechaLarga(desde)} al ${fechaLarga(hasta)}`,
+    rangoTexto ? `A ${fechaLarga(hasta)}` : `Del ${fechaLarga(desde)} al ${fechaLarga(hasta)}`,
     ...extra,
   ].filter(Boolean);
   lineas.forEach((texto, i) => {

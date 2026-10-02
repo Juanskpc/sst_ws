@@ -9,6 +9,7 @@ import { cerrarAnio } from '../src/modules/contabilidad/cierre.service.js';
 import { balanceComprobacion } from '../src/modules/informes-contables/balance.service.js';
 import { auxiliarPorCuenta, informePorTercero } from '../src/modules/informes-contables/auxiliar.service.js';
 import { libroAuxiliar } from '../src/modules/informes-contables/libros.service.js';
+import { estadoResultados, estadoSituacionFinanciera } from '../src/modules/informes-contables/estados.service.js';
 import { aCentavos } from '../src/utils/dinero.js';
 
 let fallos = 0;
@@ -113,6 +114,26 @@ try {
     'sin el CA: el ingreso conserva su saldo y no hay utilidad');
   const enero = await balanceComprobacion({ desde: '2025-01-01', hasta: '2025-01-31', cuenta: '4' }, client);
   igual(enero.filas.length, 0, 'en 2025 el ingreso de 2024 ya no arrastra saldo (lo canceló el cierre)');
+
+  console.log('\n— C5-01 · Estados financieros (2024) —');
+  const esfJun = await estadoSituacionFinanciera({ corte: '2024-06-30' }, client);
+  const sec = (e, clave) => e.secciones.find((x) => x.clave === clave);
+  igual([sec(esfJun, 'ACTIVO').total, sec(esfJun, 'PASIVO').total, esfJun.resultado_ejercicio, esfJun.cuadra],
+    ['699999.45', '0.00', '699999.45', true], 'ESF al 30-jun: activo = resultado del ejercicio aún sin cerrar, y cuadra');
+  igual(sec(esfJun, 'ACTIVO').renglones.map((r) => [r.grupo, r.valor]), [['11', '699999.45']], 'sin renglones definidos, el activo va por grupo del PUC');
+  const erJun = await estadoResultados({ desde: '2024-01-01', hasta: '2024-06-30' }, client);
+  igual([sec(erJun, 'INGRESOS').total, sec(erJun, 'GASTOS').total, erJun.utilidad], ['1000000.00', '300000.55', '699999.45'],
+    'ER enero-junio: ingresos − gastos = utilidad');
+  const erAnio = await estadoResultados({ desde: '2024-01-01', hasta: '2024-12-31' }, client);
+  igual(erAnio.utilidad, '699999.45', 'el ER del año cerrado NO sale en cero (excluye el CA)');
+  const esfDic = await estadoSituacionFinanciera({ corte: '2024-12-31', comparativo: 'true' }, client);
+  igual([sec(esfDic, 'PATRIMONIO').total, esfDic.resultado_ejercicio, esfDic.cuadra], ['699999.45', '0.00', true],
+    'ESF al 31-dic, tras el cierre: la utilidad está en el patrimonio y el resultado en cero');
+  igual(esfDic.total_activo_anterior, '0.00', 'comparativo con el año anterior (2023, vacío)');
+  await client.query(`UPDATE sst.cuentas_contables SET renglon_esf = 'Efectivo y equivalentes al efectivo' WHERE codigo = '11'`);
+  const conRenglon = await estadoSituacionFinanciera({ corte: '2024-06-30' }, client);
+  igual(sec(conRenglon, 'ACTIVO').renglones.map((r) => [r.nombre, r.grupo]), [['Efectivo y equivalentes al efectivo', null]],
+    'el renglón definido en la cuenta (o un ancestro) manda sobre el grupo del PUC');
 
   console.log('\n— C3-01 y C4-01 · Tercero y libros (febrero de 2025) —');
   const feb = { desde: '2025-02-01', hasta: '2025-02-28' };
