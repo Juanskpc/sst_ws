@@ -5,6 +5,7 @@ import { authRequired, requireRole } from '../../middleware/auth.js';
 import { balanceComprobacion } from './balance.service.js';
 import { auxiliarPorCuenta, informePorTercero } from './auxiliar.service.js';
 import { libroAuxiliar } from './libros.service.js';
+import { ventasPorCliente } from './ventas.service.js';
 import { enviarLibro, libroConEncabezado, pesos, titulosDeColumna } from './excel.js';
 
 const router = Router();
@@ -119,6 +120,32 @@ router.get('/libros/xlsx', LEER, asyncHandler(async (req, res) => {
   if (l.agrupado_por === 'tercero') hojaPorTercero(ws, l, true);
   else hojaPorCuenta(ws, l, { conBase: true });
   await enviarLibro(res, wb, `libro-${l.libro.toLowerCase()}_${l.filtros.desde}_${l.filtros.hasta}`);
+}));
+
+// ─── C6-01 · Ventas por cliente (RPC-01) ─────────────────────────────────────
+
+router.get('/ventas', LEER, asyncHandler(async (req, res) => {
+  res.json({ data: await ventasPorCliente(req.query) });
+}));
+
+router.get('/ventas/xlsx', LEER, asyncHandler(async (req, res) => {
+  const v = await ventasPorCliente(req.query);
+  const { wb, ws } = await libroConEncabezado({
+    titulo: 'Ventas por cliente', hoja: 'Ventas', desde: v.filtros.desde, hasta: v.filtros.hasta,
+    extra: [...(await lineasDeFiltro(v.filtros)), 'Facturas y notas crédito ante la DIAN; las notas restan'],
+  });
+  titulosDeColumna(ws, ['Cliente', 'Documento', 'Factura / nota', 'Fecha', 'Facturas', 'Notas crédito', 'Subtotal', 'IVA', 'Retenciones', 'Total a pagar'],
+    [42, 15, 18, 12, 10, 13, 17, 15, 15, 17]);
+  for (const c of v.clientes) {
+    subtotal(ws.addRow([c.nombre, c.documento ?? '', '', null, c.facturas, c.notas, c.subtotal, c.total_iva, c.total_retenciones, c.total_a_pagar]), [7, 8, 9, 10]);
+    for (const d of c.documentos) {
+      const fila = ws.addRow(['', '', `${d.tipo === 'NOTA_CREDITO' ? 'NC ' : ''}${d.numero ?? ''}${d.referencia ? ` (de ${d.referencia})` : ''}`, fechaExcel(d.fecha), null, null, d.subtotal, d.total_iva, d.total_retenciones, d.total_a_pagar]);
+      fila.getCell(4).numFmt = 'dd/mm/yyyy';
+      pesos(fila, [7, 8, 9, 10]);
+    }
+  }
+  total(ws.addRow(['Total', '', '', null, v.totales.facturas, v.totales.notas, v.totales.subtotal, v.totales.total_iva, v.totales.total_retenciones, v.totales.total_a_pagar]), [7, 8, 9, 10]);
+  await enviarLibro(res, wb, `ventas-por-cliente_${v.filtros.desde}_${v.filtros.hasta}`);
 }));
 
 // ─── Escritores de hoja comunes ──────────────────────────────────────────────
