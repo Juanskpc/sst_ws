@@ -64,6 +64,7 @@ export function pesos(fila, columnas) {
     if (celda.value !== null && celda.value !== '' && celda.value !== undefined) celda.value = Number(celda.value);
     celda.numFmt = FORMATO_PESOS;
   }
+  return fila;
 }
 
 export async function enviarLibro(res, wb, nombre) {

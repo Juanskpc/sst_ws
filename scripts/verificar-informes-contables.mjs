@@ -1,4 +1,4 @@
-// Verifica C1-01 (balance de comprobación) y C2-01 (auxiliar por cuenta) contra
+// Verifica C1-01 (balance), C2-01 (auxiliar), C3-01 (por tercero) y C4-01 (libros) contra
 // jdd_dev DENTRO de una transacción con ROLLBACK. Los asientos de prueba van en
 // 2024, que no tiene movimientos reales, para que las cifras esperadas sean exactas;
 // además se cruzan el balance y el auxiliar sobre el libro entero de desarrollo.
@@ -7,7 +7,8 @@ import { pool } from '../src/config/db.js';
 import { anularComprobante, crearComprobante } from '../src/modules/contabilidad/comprobantes.service.js';
 import { cerrarAnio } from '../src/modules/contabilidad/cierre.service.js';
 import { balanceComprobacion } from '../src/modules/informes-contables/balance.service.js';
-import { auxiliarPorCuenta } from '../src/modules/informes-contables/auxiliar.service.js';
+import { auxiliarPorCuenta, informePorTercero } from '../src/modules/informes-contables/auxiliar.service.js';
+import { libroAuxiliar } from '../src/modules/informes-contables/libros.service.js';
 import { aCentavos } from '../src/utils/dinero.js';
 
 let fallos = 0;
@@ -112,6 +113,55 @@ try {
     'sin el CA: el ingreso conserva su saldo y no hay utilidad');
   const enero = await balanceComprobacion({ desde: '2025-01-01', hasta: '2025-01-31', cuenta: '4' }, client);
   igual(enero.filas.length, 0, 'en 2025 el ingreso de 2024 ya no arrastra saldo (lo canceló el cierre)');
+
+  console.log('\n— C3-01 y C4-01 · Tercero y libros (febrero de 2025) —');
+  const feb = { desde: '2025-02-01', hasta: '2025-02-28' };
+  const enFeb = (await q1(
+    `SELECT count(*)::int AS n FROM sst.comprobantes WHERE fecha BETWEEN '2025-02-01' AND '2025-02-28'`,
+  )).n;
+  igual(enFeb, 0, 'febrero de 2025 está vacío (cifras exactas)');
+  const [ta, tb] = (await client.query(`SELECT id FROM sst.terceros ORDER BY id LIMIT 2`)).rows.map((r) => r.id);
+  const cxc = await cuenta('13050501');
+  const ivaGen = await cuenta('24080601');
+  const reteFte = await cuenta('13551509');
+  // Venta a A con IVA (base 100.000) y retención; venta a B sin IVA; recaudo parcial de A.
+  await ni('2025-02-05', [
+    { cuenta_id: cxc, tercero_id: ta, debito: '108000' },
+    { cuenta_id: reteFte, tercero_id: ta, debito: '11000', base: '100000' },
+    { cuenta_id: ingreso, tercero_id: ta, credito: '100000' },
+    { cuenta_id: ivaGen, tercero_id: ta, credito: '19000', base: '100000' },
+  ]);
+  await ni('2025-02-10', [{ cuenta_id: cxc, tercero_id: tb, debito: '50000' }, { cuenta_id: ingreso, tercero_id: tb, credito: '50000' }]);
+  await ni('2025-02-20', [{ cuenta_id: banco, debito: '60000' }, { cuenta_id: cxc, tercero_id: ta, credito: '60000' }]);
+
+  const gen = await informePorTercero({ ...feb, modo: 'general' }, client);
+  const tA = gen.terceros.find((t) => t.tercero_id === ta);
+  igual(tA.cuentas.map((c) => [c.codigo, c.debito, c.credito, c.saldo_final]),
+    [['13050501', '108000.00', '60000.00', '48000.00'], ['13551509', '11000.00', '0.00', '11000.00'],
+      ['24080601', '0.00', '19000.00', '-19000.00'], ['41800101', '0.00', '100000.00', '-100000.00']],
+    'general: el tercero A con cada cuenta y su saldo');
+  igual(tA.totales.saldo_final, '-60000.00', 'el total de A es su parte de los asientos (sin la contrapartida del banco)');
+  igual([gen.terceros.at(-1).tercero_id, gen.terceros.at(-1).nombre], [null, 'Sin tercero'], 'las líneas sin tercero van aparte, al final');
+  igual(gen.totales.debito, gen.totales.credito, 'con «Sin tercero» los totales son los del libro (débitos = créditos)');
+  igual(tA.cuentas[0].movimientos, undefined, 'el general no carga las líneas');
+  const soloCon = await informePorTercero({ ...feb, solo_con_tercero: 'true' }, client);
+  igual(soloCon.terceros.some((t) => !t.tercero_id), false, 'solo_con_tercero aparta las líneas sin tercero');
+  const det = await informePorTercero({ ...feb, modo: 'detallado', tercero_id: ta }, client);
+  igual(det.terceros.map((t) => t.tercero_id), [ta], 'detallado filtrado por un tercero');
+  igual(det.terceros[0].cuentas[0].movimientos.map((m) => m.saldo), ['108000.00', '48000.00'], 'detallado: la cartera de A con su saldo corrido');
+
+  const iva = await libroAuxiliar({ ...feb, libro: 'IVA' }, client);
+  igual(iva.cuentas.map((c) => c.codigo), ['24080601'], 'libro de IVA: solo la rama 2408');
+  igual([iva.cuentas[0].movimientos[0].credito, iva.cuentas[0].movimientos[0].base], ['19000.00', '100000.00'], 'el IVA generado con su base gravable');
+  const rf = await libroAuxiliar({ ...feb, libro: 'RETEFUENTE' }, client);
+  igual(rf.cuentas.map((c) => [c.codigo, c.saldo_final]), [['13551509', '11000.00']], 'retención en la fuente: la que practicó el cliente (135515)');
+  const imp = await libroAuxiliar({ ...feb, libro: 'IMPUESTOS' }, client);
+  igual(imp.cuentas.map((c) => c.codigo), ['13551509', '24080601'], 'todos los impuestos juntos');
+  const lcxc = await libroAuxiliar({ ...feb, libro: 'CXC' }, client);
+  igual(lcxc.agrupado_por, 'tercero', 'la cartera por cobrar se lee por cliente');
+  igual(lcxc.terceros.map((t) => [t.tercero_id, t.totales.saldo_final]).sort(), [[ta, '48000.00'], [tb, '50000.00']].sort(),
+    'CxC: lo que debe cada cliente al cierre de febrero');
+  await rechaza(() => libroAuxiliar({ ...feb, libro: 'XYZ' }, client), 'Libro inválido', 'libro que no existe');
 
   console.log('\n— Libro entero de desarrollo —');
   const todo = { desde: '2000-01-01', hasta: '2100-12-31' };

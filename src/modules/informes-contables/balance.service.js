@@ -67,6 +67,10 @@ export function leerFiltros(q = {}) {
 export function condicionesMovimiento(f, p) {
   const w = [`c.estado = 'CONTABILIZADO'`, `c.fecha <= ${p(f.hasta)}`];
   if (f.cuenta) w.push(`left(cc.codigo, ${p(f.cuenta.length)}) = ${p(f.cuenta)}`);
+  // Los libros de C4-01 acotan a un juego de cuentas: por prefijo del PUC (impuestos)
+  // o por las marcadas como cartera (CxC / CxP).
+  if (f.prefijos?.length) w.push(`cc.codigo LIKE ANY(${p(f.prefijos.map((x) => `${x}%`))})`);
+  if (f.cuentaIds) w.push(`m.cuenta_id = ANY(${p(f.cuentaIds)}::uuid[])`);
   if (f.terceroId) w.push(`m.tercero_id = ${p(f.terceroId)}`);
   if (f.centroCostoId) w.push(`m.centro_costo_id = ${p(f.centroCostoId)}`);
   if (f.sinCierre) w.push(`tc.codigo <> 'CA'`);
