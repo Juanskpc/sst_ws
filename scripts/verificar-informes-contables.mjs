@@ -95,12 +95,19 @@ try {
   igual(a.totales, b.totales, 'los totales del auxiliar = los del balance');
 
   console.log('\n— Cierre de año (2024) —');
-  const nueva = async (codigo, nombre, padre, mov = false) => (await q1(
-    `INSERT INTO sst.cuentas_contables (codigo, nombre, naturaleza, padre_id, acepta_movimiento) VALUES ($1, $2, 'CREDITO', $3, $4) RETURNING id`,
-    [codigo, nombre, padre, mov])).id;
+  // Con el PUC real de Siigo cargado (6-oct-2026) la clase 3 ya existe: se reutiliza
+  // la cuenta que haya y solo se crea la que falte.
+  const nueva = async (codigo, nombre, padre, mov = false) =>
+    (await q1(`SELECT id FROM sst.cuentas_contables WHERE codigo = $1`, [codigo]))?.id
+    ?? (await q1(
+      `INSERT INTO sst.cuentas_contables (codigo, nombre, naturaleza, padre_id, acepta_movimiento) VALUES ($1, $2, 'CREDITO', $3, $4) RETURNING id`,
+      [codigo, nombre, padre, mov])).id;
   const c36 = await nueva('36', 'Resultados del ejercicio', await nueva('3', 'Patrimonio', null));
   const utilidad = await nueva('36050501', 'Utilidad del ejercicio', await nueva('360505', 'Utilidad', await nueva('3605', 'Utilidad', c36)), true);
   const perdida = await nueva('36100501', 'Pérdida del ejercicio', await nueva('361005', 'Pérdida', await nueva('3610', 'Pérdida', c36)), true);
+  // En el PUC real 360505 y 361005 son hojas con movimiento; aquí reciben una
+  // auxiliar de prueba, así que dentro de la transacción pasan a agrupar.
+  await client.query(`UPDATE sst.cuentas_contables SET acepta_movimiento = false WHERE codigo IN ('360505', '361005')`);
   // El cierre exige el año sin borradores (B10-01).
   await client.query(`DELETE FROM sst.comprobantes WHERE id = $1`, [borrador.id]);
   await cerrarAnio(2024, { cuenta_utilidad_id: utilidad, cuenta_perdida_id: perdida }, null, op);
