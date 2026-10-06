@@ -75,7 +75,7 @@ router.get('/anios', asyncHandler(async (_req, res) => {
 router.get('/periodos', asyncHandler(async (_req, res) => {
   const r = await pool.query(
     `SELECT h.periodo,
-            count(*)::int                         AS ordenes,
+            count(DISTINCT h.orden_id)::int       AS ordenes,
             sum(h.horas)::numeric                 AS horas,
             count(DISTINCT h.profesional_id)::int AS profesionales,
             (SELECT count(*)::int FROM sst.precuentas p WHERE p.periodo = h.periodo) AS precuentas_generadas

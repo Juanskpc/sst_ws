@@ -10,7 +10,7 @@ import { resolverEmpresaId } from '../companies/companies.service.js';
 // (`PUT /orders/:id`): viven en utils para que no puedan divergir.
 import { parseNumeroCO, parseFechaCO } from '../../utils/parseo.js';
 import {
-  esAxa, esBolivar, normalizarModalidadEjecucion, normalizarTipoActividadBolivar,
+  esBolivar, normalizarModalidadEjecucion, normalizarTipoActividadBolivar,
 } from '../../utils/bolivar.js';
 import { hoyCO } from '../../utils/formato.js';
 
@@ -86,6 +86,14 @@ const DRAFT_SELECT = `
          -- invisible: es un dato que hay que poder ver sin abrir la orden.
          o.profesional_formatos_id AS os_profesional_formatos_id,
          pfo.nombre AS os_profesional_formatos_nombre,
+         -- 5-oct-2026 · Asesores adicionales de la orden y sus horas: la fila los
+         -- enseña junto al principal y el modal de asignación parte de ellos.
+         (SELECT COALESCE(json_agg(json_build_object(
+                    'profesional_id', c.profesional_id, 'nombre', pc.nombre, 'horas', c.horas::float
+                  ) ORDER BY pc.nombre), '[]'::json)
+            FROM sst.orden_coasesores c
+            JOIN sst.profesionales pc ON pc.id = c.profesional_id
+           WHERE c.orden_id = o.id) AS os_coasesores,
          -- Eje de facturación (ago-2026): columna, pastilla y filtro de Órdenes.
          o.estado_cobro::text AS os_estado_cobro,
          o.cobro_numero_factura AS os_cobro_numero_factura,
@@ -550,13 +558,9 @@ export async function materializarOrden(draftId, userId, client) {
       'de ello depende qué formatos de Bolívar se le envían al profesional.',
     );
   }
-  // El NIT de AXA lo escribe quien revisa (la orden no lo trae): sin él la OS
-  // se enlazaría a la empresa equivocada en el maestro, que se resuelve por NIT.
-  if (esAxa(arl.rows[0]?.nombre) && !val('nit_nic')) {
-    throw badRequest(
-      'Falta el NIT de la empresa. Las órdenes de AXA no lo traen: escríbalo en la vista previa.',
-    );
-  }
+  // 5-oct-2026 · El NIT de AXA es OPCIONAL: la orden no lo trae y AXA no lo exige,
+  // así que no puede frenar la carga. Sin NIT la empresa se resuelve por nombre
+  // en el maestro (`resolverEmpresaId`), que ya contempla ese caso.
 
   // Identidad por ARL: Bolívar usa cronograma+secuencia; AXA/Colmena, numero_orden.
   // La orden particular no tiene documento de origen que identificar: su número

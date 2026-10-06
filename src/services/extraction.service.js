@@ -569,7 +569,7 @@ export async function runExtraction({ buffer, mime, filename, arlHint }) {
   // 1-oct-2026 · La orden de AXA NO trae el NIT de la empresa cliente: el único
   // NIT impreso es el de JD&D ("Señores: JDYD CONSULTORES… NIT/CED: 901203812"),
   // y el modelo lo tomaba como si fuera del cliente. Se deja vacío para que lo
-  // escriba quien revisa; la vista previa lo pide como obligatorio.
+  // escriba quien revisa si lo conoce (opcional desde el 5-oct-2026).
   if (esAxa(arlNombre)) fields.nit_nic = { ...fields.nit_nic, value: null, confidence: 0 };
   return { arlNombre, arlConfidence, records: [{ fields, engine }] };
 }

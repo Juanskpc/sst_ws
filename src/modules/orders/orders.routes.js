@@ -4,7 +4,9 @@ import { pool, withTransaction } from '../../config/db.js';
 import { asyncHandler } from '../../utils/asyncHandler.js';
 import { authRequired, requireRole } from '../../middleware/auth.js';
 import { badRequest } from '../../utils/httpError.js';
-import { getOrderExpanded, changeStatus, generateOrderDocuments, profesionalDeUsuario } from './orders.service.js';
+import {
+  getOrderExpanded, changeStatus, generateOrderDocuments, profesionalDeUsuario, coasesoresDeOrden,
+} from './orders.service.js';
 import { randomToken } from '../../utils/security.js';
 import { env } from '../../config/env.js';
 import { sendEmail } from '../../services/email.service.js';
@@ -280,7 +282,14 @@ router.get('/', asyncHandler(async (req, res) => {
     clauses.push(`estado_arl = $${params.length}::sst.estado_arl`);
   }
   if (arl_id) { params.push(arl_id); clauses.push(`arl_id = $${params.length}`); }
-  if (profesional_id) { params.push(profesional_id); clauses.push(`profesional_asignado_id = $${params.length}`); }
+  // 5-oct-2026 · También las órdenes en las que va de COASESOR: este filtro pinta
+  // la agenda del modal de asignación, y esas horas las tiene igual de ocupadas.
+  if (profesional_id) {
+    params.push(profesional_id);
+    clauses.push(`(profesional_asignado_id = $${params.length} OR EXISTS (
+      SELECT 1 FROM sst.orden_coasesores c
+       WHERE c.orden_id = vw_ordenes_expandidas.id AND c.profesional_id = $${params.length}))`);
+  }
   if (q) {
     params.push(`%${q}%`);
     const p = `$${params.length}`;
@@ -352,7 +361,10 @@ router.get('/mias', asyncHandler(async (req, res) => {
                WHERE v.orden_id = o.id
             ), '[]'::json) AS franjas
        FROM sst.vw_ordenes_expandidas o
-      WHERE o.profesional_asignado_id = $1${filtroEstado}
+      WHERE (o.profesional_asignado_id = $1
+             -- 5-oct-2026 · O va de coasesor: la visita también es suya.
+             OR EXISTS (SELECT 1 FROM sst.orden_coasesores c
+                         WHERE c.orden_id = o.id AND c.profesional_id = $1))${filtroEstado}
       -- Primero lo que aún tiene que ejecutar y por fecha de visita: es una
       -- agenda, no un histórico. Las ya cerradas caen al final.
       ORDER BY (o.estado = 'PROGRAMADA') DESC,
@@ -657,6 +669,7 @@ router.get('/:id/cobro', asyncHandler(async (req, res) => {
 // Detalle completo: OS + historial + documentos + soportes + enlace público.
 router.get('/:id', asyncHandler(async (req, res) => {
   const orden = await getOrderExpanded(req.params.id);
+  const coasesores = await coasesoresDeOrden(req.params.id);
   const [historial, docs, soportes, enlace, franjas, historialCobro, historialArl] = await Promise.all([
     pool.query(
       `SELECT h.*, u.nombre AS cambiado_por_nombre FROM sst.historial_estados_orden h
@@ -688,6 +701,7 @@ router.get('/:id', asyncHandler(async (req, res) => {
       documentos: docs.rows,
       soportes: soportes.rows,
       franjas,
+      coasesores,
       enlace_publico: enlace.rows[0]
         ? { ...enlace.rows[0], url: `${env.publicAppUrl}/soporte?token=${enlace.rows[0].token}` }
         : null,
@@ -882,6 +896,17 @@ router.put('/:id', requireRole('admin'), asyncHandler(async (req, res) => {
           `UPDATE sst.ordenes_servicio SET valor_hora_cobro=$2, valor_hora_origen=$3 WHERE id=$1`,
           [req.params.id, tarifa.valorHora, tarifa.origen]
         );
+        // 5-oct-2026 · Y lo mismo para cada asesor adicional: el tipo nuevo le
+        // cambia el valor hora igual que al principal.
+        for (const c of await coasesoresDeOrden(req.params.id, client)) {
+          const co = (await client.query(`SELECT * FROM sst.profesionales WHERE id=$1`, [c.profesional_id])).rows[0];
+          const tarifaCo = await valorHoraDeOrden({ ordenId: req.params.id, profesional: co }, client);
+          await client.query(
+            `UPDATE sst.orden_coasesores SET valor_hora_cobro=$3, valor_hora_origen=$4
+              WHERE orden_id=$1 AND profesional_id=$2`,
+            [req.params.id, c.profesional_id, tarifaCo.valorHora, tarifaCo.origen]
+          );
+        }
       }
     }
     return actual;
@@ -1029,6 +1054,29 @@ router.post('/:id/assign/preview', requireRole('admin'), asyncHandler(async (req
 }));
 
 /**
+ * 5-oct-2026 · Coasesores que llegan en el cuerpo: `[{ profesional_id, horas }]`.
+ *
+ * `undefined` = el cliente no dijo nada y se conservan los que la orden tuviera;
+ * un arreglo (aunque vacío) los REEMPLAZA, igual que las franjas.
+ */
+function normalizarCoasesores(bruto) {
+  if (bruto === undefined || bruto === null) return null;
+  if (!Array.isArray(bruto)) throw badRequest('coasesores debe ser una lista.');
+  const vistos = new Set();
+  return bruto.map((c) => {
+    const id = String(c?.profesional_id ?? '').trim();
+    const horas = Number(c?.horas);
+    if (!id) throw badRequest('Elija el asesor adicional.');
+    if (vistos.has(id)) throw badRequest('El mismo asesor adicional está repetido.');
+    vistos.add(id);
+    if (!Number.isFinite(horas) || horas <= 0) {
+      throw badRequest('Indique cuántas horas de la orden realiza cada asesor adicional.');
+    }
+    return { profesional_id: id, horas: Math.round(horas * 100) / 100 };
+  });
+}
+
+/**
  * M5 · Todo lo que una asignación escribe en BD, dentro de la transacción que se
  * le pase. Lo comparten la asignación real (`POST /:id/assign`, que confirma) y
  * la VISTA PREVIA de formatos (`POST /:id/assign/preview`, que deshace): así lo
@@ -1055,6 +1103,7 @@ async function aplicarAsignacion(req, client, { vistaPrevia = false } = {}) {
 
   const observaciones = observacionesDeFormatos(req.body?.observaciones_formatos);
   const camposUsuario = camposDeFormatos(req.body?.campos_formatos);
+  const coasesoresPedidos = normalizarCoasesores(req.body?.coasesores);
 
   const prof = await client.query(`SELECT * FROM sst.profesionales WHERE id=$1`, [profesionalId]);
   if (!prof.rows[0]) throw badRequest('Profesional no existe');
@@ -1126,6 +1175,41 @@ async function aplicarAsignacion(req, client, { vistaPrevia = false } = {}) {
       formatosProf?.id ?? null,
     ]
   );
+
+  // 5-oct-2026 · Asesores adicionales: van a la MISMA visita (mismas franjas) y
+  // cada uno cobra sus horas. Se reemplazan en bloque cuando el cliente manda la
+  // lista; si no la manda se conservan, pero se vuelven a validar contra el
+  // principal de hoy (cambiar de principal a quien ya iba de coasesor lo dejaría
+  // dos veces en la misma orden).
+  const coasesores = coasesoresPedidos
+    ?? (await coasesoresDeOrden(req.params.id, client)).map((c) => ({ profesional_id: c.profesional_id, horas: c.horas }));
+  if (coasesores.some((c) => c.profesional_id === profesionalId)) {
+    throw badRequest('El asesor adicional no puede ser el mismo que el asesor principal.');
+  }
+  const horasCoasesores = coasesores.reduce((t, c) => t + c.horas, 0);
+  if (coasesores.length && !(Number(horasOrden) > 0)) {
+    throw badRequest('La orden no tiene horas asignadas: no hay qué repartir entre varios asesores.');
+  }
+  if (coasesores.length && horasCoasesores >= Number(horasOrden)) {
+    throw badRequest(
+      `Los asesores adicionales suman ${horasTexto(horasCoasesores)} h y la orden tiene ` +
+      `${horasTexto(horasOrden)} h: al asesor principal le tiene que quedar alguna hora.`
+    );
+  }
+  await client.query(`DELETE FROM sst.orden_coasesores WHERE orden_id=$1`, [req.params.id]);
+  for (const c of coasesores) {
+    const co = (await client.query(`SELECT * FROM sst.profesionales WHERE id=$1`, [c.profesional_id])).rows[0];
+    if (!co) throw badRequest('El asesor adicional no existe.');
+    if (co.estado !== 'Activo') throw badRequest(`${co.nombre} está Inactivo y no se le puede asignar la orden.`);
+    // Mismo criterio que el principal: su valor hora de HOY, congelado.
+    const tarifaCo = await valorHoraDeOrden({ ordenId: req.params.id, profesional: co }, client);
+    await client.query(
+      `INSERT INTO sst.orden_coasesores
+         (orden_id, profesional_id, horas, valor_hora_cobro, valor_hora_origen, creado_por)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [req.params.id, c.profesional_id, c.horas, tarifaCo.valorHora, tarifaCo.origen, req.user.sub]
+    );
+  }
 
   // ASG-02 · Las franjas se reemplazan en bloque: reprogramar es volver a
   // decidir toda la visita, y conservar las viejas dejaría horas fantasma en
@@ -1239,6 +1323,7 @@ async function aplicarAsignacion(req, client, { vistaPrevia = false } = {}) {
     secuenciaCalendario: guardada.rows[0].secuencia_calendario,
     franjas: await franjasDeOrden(req.params.id, client),
     franjasPrevias,
+    coasesores: await coasesoresDeOrden(req.params.id, client),
   };
 }
 
@@ -1268,7 +1353,7 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
       minutos_programados: repartidos,
       minutos_orden: objetivo,
       faltan_minutos: Math.max(0, objetivo - repartidos),
-      data: { ...result.orden, franjas: result.franjas },
+      data: { ...result.orden, franjas: result.franjas, coasesores: result.coasesores },
     });
   }
 
@@ -1284,9 +1369,9 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
   // ASG-05 · Invitaciones de calendario, UNA POR FRANJA. Arreglo vacío si la OS
   // se asignó sin fecha, que está permitido: se puede decidir el profesional
   // antes que el día.
-  const invitaciones = adjuntosInvitacion(construirInvitaciones({
+  const invitacionesPara = (profesional) => adjuntosInvitacion(construirInvitaciones({
     orden: result.orden,
-    profesional: result.profesional,
+    profesional,
     organizador: { nombre: req.user.nombre, correo: req.user.correo },
     secuencia: result.secuenciaCalendario,
     franjas: result.franjas,
@@ -1361,11 +1446,30 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
       `deje el nombre impreso tal como viene.`
     : null;
 
-  let correoEnviado = true;
-  let correoError = null;
-  try {
+  // 5-oct-2026 · Con varios asesores en la orden, CADA UNO recibe el correo con
+  // los formatos y las invitaciones, y con SUS horas. El enlace de soportes es
+  // uno por orden y lo lleva el principal: una casilla guarda un solo documento,
+  // y dos personas subiendo a la vez se pisarían.
+  const equipo = result.coasesores;
+  const horasCo = equipo.reduce((t, c) => t + Number(c.horas), 0);
+  const horasPrincipal = Math.max(0, Number(o.horas_asignadas ?? 0) - horasCo);
+  const companeros = (excluirId) => [
+    { id: result.profesional.id, nombre: result.profesional.nombre, horas: horasPrincipal },
+    ...equipo.map((c) => ({ id: c.profesional_id, nombre: c.nombre, horas: Number(c.horas) })),
+  ].filter((p) => p.id !== excluirId).map((p) => `${p.nombre} (${horasTexto(p.horas)} h)`);
+
+  /** `dest`: a quién se le escribe, cuántas horas son suyas y si es el principal. */
+  const enviarCorreoA = async (dest) => {
+    const invitaciones = invitacionesPara(dest.profesional);
+    const horasDest = equipo.length ? horasTexto(dest.horas) : horasTexto(o.horas_asignadas);
+    const notaEquipo = equipo.length
+      ? `Esta orden la ejecutan varios asesores en las mismas fechas y horarios. ` +
+        `De las ${horasTexto(o.horas_asignadas)} h de la orden, a usted le corresponden ${horasTexto(dest.horas)} h. ` +
+        `Va con: ${companeros(dest.profesional.id).join(', ')}.` +
+        (dest.principal ? '' : ` Los soportes firmados los sube ${result.profesional.nombre}, asesor principal de la orden.`)
+      : null;
     await sendEmail({
-      to: result.profesional.correo,
+      to: dest.profesional.correo,
       // El administrador que asigna va en copia para que la invitación entre
       // también en SU calendario: el requisito pide los dos, no solo el asesor.
       cc: req.user.correo || undefined,
@@ -1375,7 +1479,7 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
       // La versión en texto se conserva íntegra: es lo que ve quien lee en texto
       // plano y lo que queda en los registros del driver 'console'.
       text:
-        `Hola ${result.profesional.nombre},\n\n` +
+        `Hola ${dest.profesional.nombre},\n\n` +
         (esRepro
           ? `La OS ${o.codigo} (${o.pagador_nombre ?? o.arl_nombre}) para ${o.empresa_nombre} fue REPROGRAMADA.\n`
           : `Se te asignó la OS ${o.codigo} (${o.pagador_nombre ?? o.arl_nombre}) para ${o.empresa_nombre}.\n`) +
@@ -1384,7 +1488,8 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
         (varias
           ? `La visita se realiza en ${result.franjas.length} franjas:\n${franjasEnTexto(result.franjas)}\n`
           : `Fecha programada: ${fecha}\n`) +
-        `Horas: ${horasTexto(o.horas_asignadas)}\n` +
+        `Horas: ${horasDest}\n` +
+        (notaEquipo ? `${notaEquipo}\n` : '') +
         (lugar ? `Lugar: ${lugar}\n` : '') +
         (contacto ? `Contacto SST: ${contacto}\n` : '') +
         (notaSuplente ? `\n${notaSuplente}\n` : '') +
@@ -1400,8 +1505,10 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
         // La lista concreta, también en texto plano. Estaba calculada y no se
         // imprimía: quien lee el correo en texto solo veía «los soportes
         // firmados», que es justo lo que este bloque vino a quitar.
-        (queDevolver ? `Al terminar tendrás que subir: ${queDevolver}.\n` : '') +
-        `Enlace para subir los soportes (sin login):\n${supportUrl}\n` +
+        (dest.principal
+          ? (queDevolver ? `Al terminar tendrás que subir: ${queDevolver}.\n` : '') +
+            `Enlace para subir los soportes (sin login):\n${supportUrl}\n`
+          : '') +
         (invitaciones.length
           ? `\nAdjuntamos ${invitaciones.length === 1 ? 'la invitación' : `${invitaciones.length} invitaciones`} para tu calendario.\n`
           : ''),
@@ -1410,7 +1517,7 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
         subtitulo: `${o.codigo} · ${o.empresa_nombre || ''}`,
         pie: 'JD&D Consultores · Seguridad y Salud en el Trabajo',
         cuerpo: [
-          parrafo(`Hola ${result.profesional.nombre},`),
+          parrafo(`Hola ${dest.profesional.nombre},`),
           parrafo(
             esRepro
               ? `La visita de esta orden cambió de programación. Estos son los datos vigentes; ` +
@@ -1422,8 +1529,9 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
             filaDato('Orden', o.codigo),
             filaDato(o.arl_id ? 'ARL' : 'Cliente', o.pagador_nombre ?? o.arl_nombre),
             filaDato('Empresa', o.empresa_nombre),
-            filaDato('Horas', horasTexto(o.horas_asignadas)),
-            filaDato('Viáticos aprobados', viaticosTexto),
+            filaDato('Horas', horasDest),
+            // Los viáticos de la orden son del asesor principal.
+            filaDato('Viáticos aprobados', dest.principal ? viaticosTexto : null),
             filaDato('Lugar', lugar),
             filaDato('Contacto SST', contacto),
             filaDato('Formatos a nombre de', result.formatosProf?.nombre ?? null),
@@ -1446,21 +1554,26 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
           // ASG · El nombre impreso no es el suyo, y hay que decírselo aquí: es
           // lo primero que va a ver al abrir el PDF adjunto.
           notaSuplente ? bloqueAviso(notaSuplente) : '',
+          notaEquipo ? bloqueAviso(notaEquipo) : '',
           // La regla de la ARL, cuando hay algo que explicar: por qué esta
           // capacitación virtual no lleva AT-028, o que hay que redactar un
           // informe. Va como aviso destacado, no como un párrafo más.
           result.entrega.nota ? bloqueAviso(result.entrega.nota) : '',
           // Lo que tendrá que devolver, ANTES de ir a la visita: descubrir en el
           // portal que hacía falta una firma más obliga a volver a la empresa.
-          result.entrega.soportes.length
+          dest.principal && result.entrega.soportes.length
             ? bloqueLista(
                 'Al terminar tendrás que subir',
                 result.entrega.soportes.map((c) => etiquetaCategoria(c) + (esOpcional(c) ? ' (opcional)' : '')),
               )
             : '',
-          parrafo('Cuando termines la visita, sube los soportes firmados desde aquí (no necesitas iniciar sesión):'),
-          boton('Subir soportes firmados', supportUrl),
-          enlaceCrudo(supportUrl),
+          ...(dest.principal
+            ? [
+                parrafo('Cuando termines la visita, sube los soportes firmados desde aquí (no necesitas iniciar sesión):'),
+                boton('Subir soportes firmados', supportUrl),
+                enlaceCrudo(supportUrl),
+              ]
+            : []),
         ].join(''),
       }),
       attachments: [
@@ -1468,17 +1581,34 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
         ...invitaciones,
       ],
     });
-  } catch (e) {
-    correoEnviado = false;
-    correoError = e?.message || 'No fue posible entregar el correo.';
-    console.error('[assign] correo no enviado:', correoError);
+  };
+
+  let correoEnviado = true;
+  let correoError = null;
+  const destinatarios = [
+    { profesional: result.profesional, horas: horasPrincipal, principal: true },
+    ...equipo.map((c) => ({
+      profesional: { id: c.profesional_id, nombre: c.nombre, correo: c.correo, usuario_id: c.usuario_id },
+      horas: Number(c.horas), principal: false,
+    })),
+  ];
+  for (const dest of destinatarios) {
+    try {
+      await enviarCorreoA(dest);
+    } catch (e) {
+      // Uno que falle no impide escribirle a los demás; se avisa de cuál fue.
+      correoEnviado = false;
+      correoError = `${dest.profesional.nombre}: ${e?.message || 'no fue posible entregar el correo.'}`;
+      console.error('[assign] correo no enviado:', correoError);
+    }
   }
 
   // La campanita es informativa: tampoco debe tumbar una asignación válida.
-  if (result.profesional.usuario_id) {
+  for (const dest of destinatarios) {
+    if (!dest.profesional.usuario_id) continue;
     try {
       await notify({
-        userId: result.profesional.usuario_id,
+        userId: dest.profesional.usuario_id,
         tipo: result.esReprogramacion ? 'REPROGRAMACION' : 'ASIGNACION',
         titulo: result.esReprogramacion ? 'OS reprogramada' : 'Nueva OS asignada',
         mensaje: `${result.orden.codigo} · ${result.orden.empresa_nombre || ''} · ${fecha}`,
@@ -1532,6 +1662,7 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
       support_url: supportUrl,
       documentos: result.docs.map(({ _buffer, ...d }) => d),
       franjas: result.franjas,
+      coasesores: result.coasesores,
     },
   });
 }));

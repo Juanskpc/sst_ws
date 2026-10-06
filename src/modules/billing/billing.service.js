@@ -357,9 +357,11 @@ export async function generarPrecuentas({ periodo, profesionalId = null, precuen
             FROM sst.precuenta_items i
             JOIN sst.precuentas pc ON pc.id = i.precuenta_id
            WHERE i.orden_id = h.orden_id
+             -- 5-oct-2026 · Por profesional: con coasesores la misma orden entra
+             -- en la cuenta de cada uno, y la de un compañero no la da por cobrada.
+             AND pc.profesional_id = h.profesional_id
              AND pc.id IS DISTINCT FROM $${iRehacer}::uuid
              AND NOT (pc.periodo = $${iPeriodo}
-                      AND pc.profesional_id = h.profesional_id
                       AND pc.estado NOT IN ('aceptada','rechazada'))
         )
       ORDER BY h.profesional_id, h.fecha_ejecucion`,

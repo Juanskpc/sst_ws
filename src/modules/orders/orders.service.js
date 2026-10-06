@@ -14,6 +14,26 @@ export async function getOrderExpanded(id, client = pool) {
 }
 
 /**
+ * 5-oct-2026 · Asesores ADICIONALES de una orden (`sst.orden_coasesores`), con
+ * lo necesario para escribirles y para explicar el reparto de horas.
+ *
+ * El principal no está aquí: es `profesional_asignado_id`, y sus horas son las
+ * de la orden menos la suma de estas.
+ */
+export async function coasesoresDeOrden(ordenId, client = pool) {
+  const r = await client.query(
+    `SELECT c.profesional_id, p.nombre, p.correo, p.usuario_id,
+            c.horas::float AS horas, c.valor_hora_cobro, c.valor_hora_origen
+       FROM sst.orden_coasesores c
+       JOIN sst.profesionales p ON p.id = c.profesional_id
+      WHERE c.orden_id = $1
+      ORDER BY p.nombre`,
+    [ordenId]
+  );
+  return r.rows;
+}
+
+/**
  * ASG-08 · Ficha de profesional que corresponde a una cuenta de acceso.
  *
  * Se resuelve primero por `usuario_id` —el enlace explícito, que es el que deja

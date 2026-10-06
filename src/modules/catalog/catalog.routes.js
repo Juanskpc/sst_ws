@@ -4,6 +4,7 @@ import { asyncHandler } from '../../utils/asyncHandler.js';
 import { authRequired, requireRole, requireMaestro } from '../../middleware/auth.js';
 import { badRequest, conflict, notFound } from '../../utils/httpError.js';
 import { tieneFormatosPropios } from '../../services/formatos-arl.service.js';
+import { validarTextoOpcional } from '../../utils/personas.js';
 
 const router = Router();
 router.use(authRequired);
@@ -400,6 +401,86 @@ router.delete('/tipos-viatico/:id', requireRole('admin'), asyncHandler(async (re
   );
   if (!r.rows[0]) throw notFound('Tipo de viático no encontrado');
   res.json({ message: `"${r.rows[0].nombre}" ya no se puede elegir en órdenes nuevas.` });
+}));
+
+// ---------------------------------------------------------------------------
+// ESPECIALIDADES de los profesionales (5-oct-2026)
+//
+// Se escribían a mano en cada ficha y la misma acababa con varias grafías. Ahora
+// se eligen de este catálogo, que administra el administrador. La ficha guarda
+// el NOMBRE (`profesionales.especialidad`), no un id: por eso renombrar aquí se
+// propaga a las fichas y eliminar no le quita la especialidad a nadie.
+// ---------------------------------------------------------------------------
+
+/** Mismas reglas que el resto de textos de personas: mayúsculas, 3 a 120 letras. */
+const nombreEspecialidad = (v) => {
+  const nombre = validarTextoOpcional(v, 'La especialidad');
+  if (!nombre) throw badRequest('El nombre de la especialidad es obligatorio.');
+  return nombre;
+};
+
+router.get('/especialidades', asyncHandler(async (_req, res) => {
+  const r = await pool.query(
+    `SELECT e.id, e.nombre,
+            (SELECT count(*)::int FROM sst.profesionales p
+              WHERE upper(btrim(p.especialidad)) = upper(btrim(e.nombre))) AS profesionales
+       FROM sst.especialidades e
+      ORDER BY e.nombre`
+  );
+  res.json({ data: r.rows });
+}));
+
+router.post('/especialidades', requireRole('admin'), asyncHandler(async (req, res) => {
+  const nombre = nombreEspecialidad(req.body?.nombre);
+  try {
+    const r = await pool.query(
+      `INSERT INTO sst.especialidades (nombre) VALUES ($1) RETURNING id, nombre`, [nombre]
+    );
+    res.status(201).json({ data: { ...r.rows[0], profesionales: 0 } });
+  } catch (e) {
+    if (e.code === '23505') throw conflict(`Ya existe la especialidad "${nombre}".`);
+    throw e;
+  }
+}));
+
+/** Renombrar arrastra a las fichas que la tenían: siguen siendo la misma especialidad. */
+router.put('/especialidades/:id', requireRole('admin'), asyncHandler(async (req, res) => {
+  const nombre = nombreEspecialidad(req.body?.nombre);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const antes = await client.query(
+      `SELECT nombre FROM sst.especialidades WHERE id = $1 FOR UPDATE`, [req.params.id]
+    );
+    if (!antes.rows[0]) throw notFound('Especialidad no encontrada');
+    const r = await client.query(
+      `UPDATE sst.especialidades SET nombre = $2, actualizado_en = now()
+        WHERE id = $1 RETURNING id, nombre`,
+      [req.params.id, nombre]
+    );
+    const fichas = await client.query(
+      `UPDATE sst.profesionales SET especialidad = $2
+        WHERE upper(btrim(especialidad)) = upper(btrim($1))`,
+      [antes.rows[0].nombre, nombre]
+    );
+    await client.query('COMMIT');
+    res.json({ data: { ...r.rows[0], profesionales: fichas.rowCount } });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    if (e.code === '23505') throw conflict(`Ya existe la especialidad "${nombre}".`);
+    throw e;
+  } finally {
+    client.release();
+  }
+}));
+
+/** Se borra del catálogo; los profesionales que ya la tenían la conservan. */
+router.delete('/especialidades/:id', requireRole('admin'), asyncHandler(async (req, res) => {
+  const r = await pool.query(
+    `DELETE FROM sst.especialidades WHERE id = $1 RETURNING nombre`, [req.params.id]
+  );
+  if (!r.rows[0]) throw notFound('Especialidad no encontrada');
+  res.json({ message: `"${r.rows[0].nombre}" ya no se puede elegir.` });
 }));
 
 export default router;
