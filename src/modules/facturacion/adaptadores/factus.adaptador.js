@@ -344,8 +344,102 @@ export class FactusAdaptador extends PuertoFacturacionElectronica {
     return { base64 };
   }
 
-  async emitirDocumentoSoporte() {
-    throw new Error('La emisión de documento soporte todavía no está disponible.');
+  // ─── A4-01 · Documento soporte ────────────────────────────────────────────
+  // POST /v2/support-documents/validate, GET /v2/support-documents/:number y
+  // /download-pdf (developers.factus.com.co/documentos-soporte, leída el
+  // 7-oct-2026). Probado en sandbox con `scripts/factus-probar-ds.mjs`: validó
+  // SEDS984000922 y la respuesta trae `number` (con el prefijo pegado), `cuds`,
+  // `is_validated`, `totals` y `links.qr`. Hallazgo: la DIAN exige que el
+  // proveedor residente vaya con documento tipo NIT (31) aunque sea persona
+  // natural — su cédula con el DV —; con 13 (cédula) rechaza con 422.
+
+  /**
+   * @param {{referenceCode: string, proveedor: object, items: {codigo?: string, descripcion: string, cantidad: number, valorUnitario: number}[],
+   *   numberingRangeId?: number, formaPagoCodigo: string, medioPagoCodigo: string, montoAPagar: string,
+   *   fechaVencimiento?: string, observacion?: string}} datos
+   */
+  async emitirDocumentoSoporte(datos) {
+    const p = datos.proveedor;
+    const juridica = p.tipoPersona !== 'NATURAL';
+    const cuerpo = {
+      reference_code: datos.referenceCode,
+      numbering_range_id: datos.numberingRangeId || undefined,
+      observation: datos.observacion ? String(datos.observacion).slice(0, 500) : undefined,
+      payment_details: [{
+        payment_form: datos.formaPagoCodigo || '2',
+        payment_method_code: datos.medioPagoCodigo || 'ZZZ',
+        amount: datos.montoAPagar,
+        ...(String(datos.formaPagoCodigo || '2') === '2' ? { due_date: datos.fechaVencimiento || hoyCO() } : {}),
+      }],
+      provider: {
+        identification_document_code: '31',
+        identification: String(p.nit).replace(/\D/g, ''),
+        dv: p.dv != null ? String(p.dv) : undefined,
+        legal_organization_code: juridica ? '1' : '2',
+        names: p.razonSocial,
+        ...(juridica ? { company: p.razonSocial } : {}),
+        address: p.direccion,
+        country_code: 'CO',
+        municipality_code: p.municipioDane || undefined,
+        email: p.email || undefined,
+        phone: p.telefono || undefined,
+      },
+      // Honorarios sin IVA: el tributo 01 va en 0 % y excluido, como lo validó el sandbox.
+      items: datos.items.map((it) => ({
+        code_reference: it.codigo || 'HON',
+        name: it.descripcion,
+        quantity: dosDec(it.cantidad),
+        discount_rate: '0.00',
+        price: dosDec(it.valorUnitario),
+        unit_measure_code: '94',
+        standard_code: '999',
+        taxes: [{ code: '01', rate: '0.00', is_excluded: true }],
+      })),
+    };
+    const r = await request('POST', '/v2/support-documents/validate', cuerpo);
+    const ds = r.data?.support_document || r.data || {};
+    const { rechazos, avisos } = clasificarErrores(ds.errors);
+    return {
+      referenceCode: datos.referenceCode,
+      numeroDocumento: ds.number || null,
+      validado: Boolean(ds.is_validated),
+      cufe: ds.cuds || ds.cude || null,
+      urlPublica: ds.links?.qr || ds.links?.public_url || null,
+      totales: { total: ds.totals?.total ?? null },
+      eventos: { rechazos, avisos },
+      respuestaCruda: r,
+    };
+  }
+
+  /** GET /v2/support-documents/:number · reconciliación de un DS que quedó ENVIANDO. */
+  async consultarDocumentoSoporte(numeroDocumento) {
+    if (!numeroDocumento) {
+      return { estado: 'SIN_NUMERO', detalle: 'Todavía sin número asignado: reintente con la misma referencia.' };
+    }
+    const r = await request('GET', `/v2/support-documents/${encodeURIComponent(numeroDocumento)}`);
+    const ds = r.data?.support_document || r.data || {};
+    const { rechazos } = clasificarErrores(ds.errors);
+    return {
+      estado: rechazos.length ? 'RECHAZADO' : ds.is_validated ? 'VALIDADO' : 'ENVIANDO',
+      detalle: rechazos.map(([, v]) => v).join('; ') || undefined,
+      cufe: ds.cuds || ds.cude || null,
+      urlPublica: ds.links?.qr || ds.links?.public_url || null,
+      respuestaCruda: r,
+    };
+  }
+
+  async descargarPdfDocumentoSoporte(numeroDocumento) {
+    const r = await request('GET', `/v2/support-documents/${encodeURIComponent(numeroDocumento)}/download-pdf`);
+    const base64 = r.data?.pdf_base_64_encoded;
+    if (!base64) throw new Error(`El proveedor tecnológico no devolvió el PDF de ${numeroDocumento}`);
+    return { base64 };
+  }
+
+  async descargarXmlDocumentoSoporte(numeroDocumento) {
+    const r = await request('GET', `/v2/support-documents/${encodeURIComponent(numeroDocumento)}/download-xml`);
+    const base64 = r.data?.xml_base_64_encoded;
+    if (!base64) throw new Error(`El proveedor tecnológico no devolvió el XML de ${numeroDocumento}`);
+    return { base64 };
   }
 
   async emitirNominaElectronica() {

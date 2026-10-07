@@ -93,7 +93,9 @@ export class PuertoFacturacionElectronica {
     throw new Error('PuertoFacturacionElectronica.descargarXml no implementado');
   }
 
-  /** @param {{receptor: Receptor, items: LineaDocumento[], ordenesServicioIds: number[]}} datos
+  /** A4-01 · El proveedor del DS es el profesional (o quien vende a JD&D sin facturar).
+   *  También: `consultarDocumentoSoporte`, `descargarPdfDocumentoSoporte`, `descargarXmlDocumentoSoporte`.
+   *  @param {{referenceCode: string, proveedor: Receptor, items: LineaDocumento[], montoAPagar: string}} datos
    *  @returns {Promise<ResultadoEmision>} */
   // eslint-disable-next-line no-unused-vars
   async emitirDocumentoSoporte(datos) {

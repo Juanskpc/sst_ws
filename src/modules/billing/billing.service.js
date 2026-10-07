@@ -114,7 +114,13 @@ export async function resumenPorMes({ anio, client = pool }) {
   );
 
   const cuentas = await client.query(
-    `SELECT * FROM sst.vw_precuentas WHERE periodo LIKE $1`, [`${y}-%`]
+    `SELECT c.*,
+            -- A4-01 · su documento soporte vivo, si ya lo tiene.
+            (SELECT json_build_object('id', d.id, 'estado', d.estado, 'prefijo', d.prefijo, 'numero', d.numero)
+               FROM sst.documentos_electronicos d
+              WHERE d.precuenta_id = c.id AND d.tipo = 'DOC_SOPORTE' AND d.estado <> 'ANULADO'
+              ORDER BY d.creado_en DESC LIMIT 1) AS documento_soporte
+       FROM sst.vw_precuentas c WHERE c.periodo LIKE $1`, [`${y}-%`]
   );
 
   // Trabajo PENDIENTE agrupado por profesional y mes. La vista ya excluye lo
@@ -185,6 +191,7 @@ export async function resumenPorMes({ anio, client = pool }) {
       // Cuál es dentro de su mes: de la 2 en adelante son complementarias.
       numero: c.numero,
       del_mes: c.del_mes,
+      documento_soporte: c.documento_soporte ?? null,
     })),
     ...[...grupos.values()].map((g) => ({
       ...g,
@@ -194,6 +201,7 @@ export async function resumenPorMes({ anio, client = pool }) {
       respondido_en: null,
       observaciones: null,
       numero: null,
+      documento_soporte: null,
       // Si ya hay cuentas de ese mes, esto es un complemento por generar.
       del_mes: cuentas.rows.filter(
         (c) => c.periodo === g.periodo && c.profesional_id === g.profesional_id,

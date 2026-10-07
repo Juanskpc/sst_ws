@@ -49,7 +49,10 @@ export async function cargarDocumentoParaEmitir(id, client, tipo = 'FACTURA') {
       WHERE d.id = $1 AND d.tipo = $2`,
     [id, tipo],
   )).rows[0];
-  if (!doc) throw notFound(tipo === 'FACTURA' ? 'Esa factura no existe.' : 'Esa nota crédito no existe.');
+  if (!doc) {
+    const nombre = { FACTURA: 'Esa factura', NOTA_CREDITO: 'Esa nota crédito', DOC_SOPORTE: 'Ese documento soporte' }[tipo] ?? 'Ese documento';
+    throw notFound(`${nombre} no existe.`);
+  }
 
   const items = (await client.query(
     `SELECT it.id, it.orden_id, it.codigo, it.descripcion, it.cantidad, it.valor_unitario,

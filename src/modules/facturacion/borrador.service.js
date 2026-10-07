@@ -381,6 +381,8 @@ const DOCUMENTO_SELECT = `
   d.cufe, d.qr_url, d.pdf_path, d.xml_path, d.errores,
   -- A2-01 · en una nota crédito: a qué factura corrige y por qué causal DIAN.
   d.causal, d.documento_referencia_id, ref.prefijo AS referencia_prefijo, ref.numero AS referencia_numero,
+  -- A4-01 · en un documento soporte: la cuenta de cobro de la que sale.
+  d.precuenta_id,
   d.creado_en, d.actualizado_en`;
 const DOCUMENTO_FROM = `
   FROM sst.documentos_electronicos d
@@ -419,8 +421,8 @@ export async function listarBorradores({ estado = 'BORRADOR', arlId, pagadorTerc
  * no se recalcula: quedó fijo en el momento de validarse.
  */
 export async function obtenerBorrador(id, client = pool) {
-  // A2-01 · el mismo detalle sirve para la nota crédito (mismas tablas).
-  const doc = (await client.query(`SELECT ${DOCUMENTO_SELECT}, d.respuesta_proveedor ${DOCUMENTO_FROM} WHERE d.id = $1 AND d.tipo IN ('FACTURA', 'NOTA_CREDITO')`, [id])).rows[0];
+  // A2-01 · el mismo detalle sirve para la nota crédito y (A4-01) el documento soporte.
+  const doc = (await client.query(`SELECT ${DOCUMENTO_SELECT}, d.respuesta_proveedor ${DOCUMENTO_FROM} WHERE d.id = $1 AND d.tipo IN ('FACTURA', 'NOTA_CREDITO', 'DOC_SOPORTE')`, [id])).rows[0];
   if (!doc) throw notFound('Ese documento no existe.');
 
   // A1-07 · la línea de tiempo del documento: propios de Orbita (CREADO,
