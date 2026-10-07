@@ -296,6 +296,77 @@ export async function obtenerSoporte(id, client = pool) {
   };
 }
 
+// ─── A4-02 · Documento soporte manual ────────────────────────────────────────
+
+/**
+ * Documento soporte que NO sale de una cuenta de cobro: la contadora (§3.5: su DS
+ * va a 51101001 Honorarios - Contabilidad) o cualquier compra a quien no está
+ * obligado a facturar. Cada línea lleva su cuenta de costo o gasto, porque no hay
+ * orden de la que deducir el pagador. Nace en BORRADOR, como el de la cuenta de cobro.
+ *
+ * @param {{ tercero_id: string, observaciones?: string, lineas: { descripcion: string, cantidad: number|string,
+ *   valor_unitario: number|string, cuenta_id: string }[] }} b
+ * @param {{ client?: import('pg').PoolClient }} [opciones] para la carga masiva (todo o nada).
+ */
+export async function crearSoporteManual(b = {}, usuarioId = null, { client = null } = {}) {
+  const trabajo = async (db) => {
+    const tercero = (await db.query(
+      `SELECT id, activo, COALESCE(razon_social, btrim(concat_ws(' ', nombres, apellidos))) AS nombre FROM sst.terceros WHERE id = $1`,
+      [b.tercero_id],
+    )).rows[0];
+    if (!tercero) throw badRequest('Elija a quién se le compra (el proveedor debe existir en Terceros).');
+    if (!tercero.activo) throw badRequest(`${tercero.nombre} está inactivo en Terceros.`);
+    const lineas = Array.isArray(b.lineas) ? b.lineas : [];
+    if (!lineas.length) throw badRequest('Agregue al menos una línea.');
+    const items = [];
+    for (const [i, l] of lineas.entries()) {
+      const descripcion = String(l.descripcion ?? '').trim();
+      const cantidad = Number(String(l.cantidad ?? '1').replace(',', '.'));
+      const valor = Number(String(l.valor_unitario ?? '').replace(',', '.'));
+      if (!descripcion) throw badRequest(`Línea ${i + 1}: escriba el detalle.`);
+      if (!(cantidad > 0)) throw badRequest(`Línea ${i + 1}: la cantidad debe ser mayor que cero.`);
+      if (!(valor > 0)) throw badRequest(`Línea ${i + 1}: el valor debe ser mayor que cero.`);
+      const cuenta = l.cuenta_id ? (await db.query(
+        `SELECT id, codigo, acepta_movimiento, activa FROM sst.cuentas_contables WHERE id = $1`, [l.cuenta_id],
+      )).rows[0] : null;
+      if (!cuenta) throw badRequest(`Línea ${i + 1}: elija la cuenta de costo o gasto.`);
+      if (!cuenta.acepta_movimiento || !cuenta.activa) throw badRequest(`Línea ${i + 1}: la cuenta ${cuenta.codigo} no recibe movimiento.`);
+      const total = Math.round(cantidad * valor * 100);
+      items.push({ descripcion: descripcion.slice(0, 500), cantidad, valor, cuenta_id: cuenta.id, total });
+    }
+    const total = items.reduce((s, it) => s + it.total, 0);
+    const [forma, medio] = await Promise.all([
+      db.query(`SELECT id FROM sst.formas_pago WHERE codigo_dian = '2'`),
+      db.query(`SELECT id FROM sst.medios_pago WHERE codigo_dian = 'ZZZ'`),
+    ]);
+    const hoy = hoyCO();
+    const doc = (await db.query(
+      `INSERT INTO sst.documentos_electronicos
+         (tipo, reference_code, estado, tercero_id, fecha_emision, fecha_vencimiento, forma_pago_id, medio_pago_id, observaciones,
+          total_bruto, total_descuento, subtotal, total_iva, total_retenciones, total_a_pagar, creado_por, actualizado_por)
+       VALUES ('DOC_SOPORTE', $1, 'BORRADOR', $2, $3, $4, $5, $6, $7, $8, 0, $8, 0, 0, $8, $9, $9)
+       RETURNING id`,
+      [generarReferenceCodeSoporte(), tercero.id, hoy, sumarDias(hoy, PLAZO_DIAS), forma.rows[0]?.id ?? null, medio.rows[0]?.id ?? null,
+        String(b.observaciones ?? '').trim().slice(0, 500) || null, deCentavos(total), usuarioId],
+    )).rows[0];
+    for (const [i, it] of items.entries()) {
+      await db.query(
+        `INSERT INTO sst.documento_items
+           (documento_id, codigo, descripcion, cantidad, valor_unitario, descuento, base, total_linea, cuenta_costo_id, orden)
+         VALUES ($1, 'DS', $2, $3, $4, 0, $5, $5, $6, $7)`,
+        [doc.id, it.descripcion, it.cantidad, it.valor, deCentavos(it.total), it.cuenta_id, i],
+      );
+    }
+    await db.query(
+      `INSERT INTO sst.documento_eventos (documento_id, codigo, descripcion, usuario_id) VALUES ($1, 'CREADO', $2, $3)`,
+      [doc.id, `Documento soporte manual para ${tercero.nombre}.`, usuarioId],
+    );
+    return doc.id;
+  };
+  const id = client ? await trabajo(client) : await withTransaction(trabajo);
+  return obtenerSoporte(id, client ?? pool);
+}
+
 // ─── A4-03 · Nota de ajuste ────────────────────────────────────────────────
 
 /**

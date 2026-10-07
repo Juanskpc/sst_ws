@@ -3,9 +3,11 @@ import { asyncHandler } from '../../utils/asyncHandler.js';
 import { badRequest } from '../../utils/httpError.js';
 import { authRequired, requireRole } from '../../middleware/auth.js';
 import { storage } from '../../services/storage.service.js';
+import { uploadImport } from '../../middleware/upload.js';
+import { importarSoportes, plantillaSoportes } from './soporte-importar.service.js';
 import { numeroCompleto } from './emision.service.js';
 import {
-  CAUSALES_NOTA_AJUSTE, corregirSoporte, crearDesdePrecuenta, crearNotaAjuste, eliminarSoporte, emitirSoporte, listarPorGenerar,
+  CAUSALES_NOTA_AJUSTE, corregirSoporte, crearDesdePrecuenta, crearNotaAjuste, crearSoporteManual, eliminarSoporte, emitirSoporte, listarPorGenerar,
   listarSoportes, obtenerSoporte, reconciliarSoporte,
 } from './soporte.service.js';
 
@@ -34,6 +36,24 @@ router.get('/', LEER, asyncHandler(async (req, res) => {
 router.get('/notas/causales', LEER, (_req, res) => {
   res.json({ data: Object.entries(CAUSALES_NOTA_AJUSTE).map(([codigo, nombre]) => ({ codigo, nombre })) });
 });
+
+// A4-02 · Documento soporte manual (sin cuenta de cobro): { tercero_id, observaciones?, lineas: [{ descripcion, cantidad, valor_unitario, cuenta_id }] }.
+router.post('/manual', OPERAR, asyncHandler(async (req, res) => {
+  const data = await crearSoporteManual(req.body || {}, req.user.sub);
+  res.status(201).json({ message: 'Documento soporte creado en borrador.', data });
+}));
+
+// A4-02 · Carga masiva: plantilla y revisión/importación (crea borradores; todo o nada).
+router.get('/plantilla.xlsx', LEER, asyncHandler(async (_req, res) => {
+  const buf = await plantillaSoportes();
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', 'attachment; filename="plantilla-documentos-soporte.xlsx"');
+  res.send(Buffer.from(buf));
+}));
+router.post('/importar', OPERAR, uploadImport.single('file'), asyncHandler(async (req, res) => {
+  if (!req.file) throw badRequest('Adjunte el Excel de documentos soporte.');
+  res.json({ data: await importarSoportes(req.file.buffer, { usuarioId: req.user.sub, simular: req.query.simular === 'true' }) });
+}));
 
 // Cuentas de cobro aceptadas que todavía no tienen documento soporte.
 router.get('/por-generar', LEER, asyncHandler(async (_req, res) => {
