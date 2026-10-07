@@ -8,7 +8,8 @@ import { storage } from '../../services/storage.service.js';
 import { proveedorFE } from './index.js';
 import { obtenerBorrador } from './borrador.service.js';
 import {
-  cargarDocumentoParaEmitir, finalizarRechazado, numeroCompleto, registrarFallaDeEnvio, registrarSinDecision,
+  cargarDocumentoParaEmitir, contabilizarTrasValidar, finalizarRechazado, numeroCompleto, registrarFallaDeEnvio,
+  registrarSinDecision,
 } from './emision.service.js';
 import { periodoLargo } from '../billing/billing.service.js';
 
@@ -191,11 +192,13 @@ const LISTA_SELECT = `
          t.numero_documento AS tercero_documento,
          d.precuenta_id, pc.periodo, p.nombre AS profesional_nombre,
          (SELECT count(*)::int FROM sst.documento_items i WHERE i.documento_id = d.id) AS total_lineas,
+         d.comprobante_id IS NOT NULL AS contabilizado, cxp.saldo AS saldo_por_pagar,
          d.creado_en
     FROM sst.documentos_electronicos d
     JOIN sst.terceros t ON t.id = d.tercero_id
     LEFT JOIN sst.precuentas pc ON pc.id = d.precuenta_id
-    LEFT JOIN sst.profesionales p ON p.id = pc.profesional_id`;
+    LEFT JOIN sst.profesionales p ON p.id = pc.profesional_id
+    LEFT JOIN sst.cartera_documentos cxp ON cxp.documento_id = d.id`;
 
 /** Lista por estado (varios separados por coma); `periodo` (AAAA-MM) la acota al mes de la cuenta de cobro. */
 export async function listarSoportes({ estado, periodo } = {}) {
@@ -232,8 +235,18 @@ export async function obtenerSoporte(id, client = pool) {
     [id],
   )).rows;
   const porItem = new Map(arls.map((a) => [a.item_id, a]));
+  // Contabilización y pago: el asiento DS y lo que falta pagarle al asesor.
+  const contable = (await client.query(
+    `SELECT d.comprobante_id, d.contabilizacion_error, cxp.valor AS cxp_valor, cxp.saldo AS cxp_saldo
+       FROM sst.documentos_electronicos d LEFT JOIN sst.cartera_documentos cxp ON cxp.documento_id = d.id
+      WHERE d.id = $1`,
+    [id],
+  )).rows[0];
   return {
     ...doc,
+    comprobante_id: contable?.comprobante_id ?? null,
+    contabilizacion_error: contable?.contabilizacion_error ?? null,
+    cxp: contable?.cxp_valor != null ? { valor: contable.cxp_valor, saldo: contable.cxp_saldo } : null,
     precuenta: origen ? { ...origen, periodo_largo: periodoLargo(origen.periodo) } : null,
     items: doc.items.map((it) => ({
       ...it,
@@ -295,8 +308,18 @@ function intentarEmisionSoporte({ doc, items, formaPagoCodigo, medioPagoCodigo, 
   });
 }
 
-/** VALIDADO: número, CUDS, PDF y XML en una transacción. Una descarga fallida no revierte nada. */
+/**
+ * VALIDADO: número, CUDS, PDF y XML en una transacción. Una descarga fallida no
+ * revierte nada. Después, en su propia transacción, el asiento DS y la cuenta por
+ * pagar al asesor: si falla (falta una regla, mes cerrado) el DS sigue válido ante
+ * la DIAN y queda «contabilidad pendiente», como la factura.
+ */
 async function finalizarSoporteValidado(id, resultado, usuarioId) {
+  await finalizarSoporteValidadoTx(id, resultado, usuarioId);
+  await contabilizarTrasValidar(id, usuarioId);
+}
+
+async function finalizarSoporteValidadoTx(id, resultado, usuarioId) {
   return withTransaction(async (client) => {
     const avisos = [];
     const proveedor = proveedorFE();

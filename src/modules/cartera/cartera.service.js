@@ -30,7 +30,7 @@ const numeroDocumento = (d) => (!d.numero ? null
  * misma transacción que su asiento. `cuentaId` es la cuenta de clientes a la que
  * fue el total. Idempotente: si ya existe, no hace nada.
  */
-export async function abrirCarteraDeFactura(client, documentoId, cuentaId) {
+export async function abrirCarteraDeFactura(client, documentoId, cuentaId, tipo = 'CXC') {
   const d = (await client.query(
     `SELECT id, tercero_id, prefijo, numero, reference_code, total_a_pagar,
             to_char(COALESCE(fecha_emision, creado_en::date), 'YYYY-MM-DD') AS fecha,
@@ -41,9 +41,9 @@ export async function abrirCarteraDeFactura(client, documentoId, cuentaId) {
   if (!d || aCentavos(d.total_a_pagar) <= 0) return null;
   const r = await client.query(
     `INSERT INTO sst.cartera_documentos (tipo, tercero_id, documento_id, numero, fecha, vencimiento, valor, saldo, cuenta_id)
-     VALUES ('CXC', $1, $2, $3, $4, $5, $6, $6, $7)
+     VALUES ($8, $1, $2, $3, $4, $5, $6, $6, $7)
      ON CONFLICT (documento_id) DO NOTHING RETURNING id`,
-    [d.tercero_id, d.id, numeroDocumento(d) ?? d.reference_code, d.fecha, d.vencimiento, d.total_a_pagar, cuentaId],
+    [d.tercero_id, d.id, numeroDocumento(d) ?? d.reference_code, d.fecha, d.vencimiento, d.total_a_pagar, cuentaId, tipo],
   );
   return r.rows[0]?.id ?? null;
 }

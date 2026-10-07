@@ -4,6 +4,11 @@
 // cobro ACEPTADA de dos órdenes (una con viáticos), y recorre el circuito real:
 // crear el borrador → emitir → VALIDADO con número, CUDS, PDF y XML. Comprueba
 // también los bloqueos (cuenta no aceptada, segundo DS de la misma cuenta).
+// La contabilización (asiento DS, cuenta por pagar y su pago con un egreso) se
+// prueba dentro de una transacción con ROLLBACK: un comprobante contabilizado no
+// se puede borrar, y la base de desarrollo no debe quedar con rastros. Para eso la
+// regla DS_CXP se apaga un momento antes de emitir (lo que de paso prueba el caso
+// «validado ante la DIAN, contabilidad pendiente»).
 // Al terminar borra todo lo sembrado, salvo con --conservar (para verlo en pantalla).
 //
 // Uso: node --import tsx scripts/verificar-documento-soporte.mjs [--conservar]
@@ -11,6 +16,9 @@ import { pool } from '../src/config/db.js';
 import { esSandbox } from '../src/modules/facturacion/adaptadores/factus.cliente.js';
 import { crearDesdePrecuenta, emitirSoporte, eliminarSoporte, listarSoportes } from '../src/modules/facturacion/soporte.service.js';
 import { storage } from '../src/services/storage.service.js';
+import { contabilizarEn } from '../src/modules/contabilidad/contabilizacion.service.js';
+import { crearEgreso } from '../src/modules/cartera/pagos.service.js';
+import { resumenPorMes } from '../src/modules/billing/billing.service.js';
 
 const conservar = process.argv.includes('--conservar');
 if (!esSandbox()) throw new Error('Solo corre contra el sandbox del proveedor.');
@@ -78,8 +86,14 @@ try {
     ok(false, 'segundo DS de la misma cuenta bloqueado');
   } catch (e) { ok(e.statusCode === 409, `segundo DS bloqueado (${e.message})`); }
 
-  // 4 · Emisión real en el sandbox.
+  // 4 · Emisión real en el sandbox (con la regla DS_CXP apagada: el asiento queda pendiente).
+  sembrado.reglaApagada = (await q(
+    `UPDATE sst.reglas_contables SET activa = false WHERE concepto = 'DS_CXP' AND tercero_id IS NULL AND activa RETURNING id`,
+  ))[0]?.id;
+  if (!sembrado.reglaApagada) throw new Error('Falta la regla general DS_CXP en jdd_dev (Contabilidad → Reglas → cargar las de Siigo).');
   const emitido = await emitirSoporte(borrador.id, admin.id);
+  await q(`UPDATE sst.reglas_contables SET activa = true WHERE id = $1`, [sembrado.reglaApagada]);
+  sembrado.reglaApagada = null;
   ok(emitido.estado === 'VALIDADO', `emitido: ${emitido.estado} ${emitido.prefijo ?? ''} ${emitido.numero ?? ''}`);
   ok(Boolean(emitido.cufe), `CUDS ${String(emitido.cufe).slice(0, 16)}…`);
   ok(Boolean(emitido.pdf_path) && Boolean(emitido.xml_path), `PDF ${emitido.pdf_path} · XML ${emitido.xml_path}`);
@@ -92,12 +106,50 @@ try {
   const lista = await listarSoportes({ periodo: '2026-09' });
   ok(lista.some((d) => d.id === borrador.id && d.profesional_nombre === `ASESOR ${MARCA}`), 'aparece en la lista del periodo');
 
-  // 5 · Un validado no se borra.
+  ok(emitido.eventos.some((e) => e.codigo === 'CONTABILIZACION_PENDIENTE') && !emitido.comprobante_id,
+    'sin la regla, queda «contabilidad pendiente» y el DS sigue validado');
+
+  // 6 · Contabilización + cuenta por pagar + egreso, todo con ROLLBACK.
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const comp = await contabilizarEn(client, borrador.id, admin.id);
+    const movs = (await client.query(
+      `SELECT c.codigo, m.debito, m.credito FROM sst.movimientos m JOIN sst.cuentas_contables c ON c.id = m.cuenta_id
+        WHERE m.comprobante_id = $1 ORDER BY m.credito NULLS FIRST, c.codigo`, [comp.id],
+    )).rows;
+    console.log('   asiento:', movs.map((m) => `${m.codigo} ${Number(m.debito) ? 'D ' + m.debito : 'C ' + m.credito}`).join(' | '));
+    ok(String(comp.numero_completo ?? '').startsWith('DS'), `comprobante ${comp.numero_completo}`);
+    const debitos = movs.filter((m) => Number(m.debito) > 0);
+    const costo = debitos.reduce((s, m) => s + Number(m.debito), 0);
+    ok(debitos.every((m) => m.codigo === '73050501') && costo === 455000, 'débitos al costo de Bolívar (73050501) por 455.000');
+    ok(movs.some((m) => m.codigo === '23352501' && Number(m.credito) === 455000), 'crédito a honorarios por pagar (23352501) por 455.000');
+    const cxp = (await client.query(`SELECT id, tipo, saldo FROM sst.cartera_documentos WHERE documento_id = $1`, [borrador.id])).rows[0];
+    ok(cxp?.tipo === 'CXP' && Number(cxp.saldo) === 455000, `cuenta por pagar abierta por ${cxp?.saldo}`);
+
+    const banco = (await client.query(
+      `SELECT id, codigo FROM sst.cuentas_contables WHERE codigo LIKE '1110%' AND acepta_movimiento AND activa ORDER BY codigo LIMIT 1`,
+    )).rows[0];
+    const egreso = await crearEgreso({
+      tercero_id: sembrado.tercero, fecha: borrador.fecha_emision ?? new Date().toISOString().slice(0, 10), cuenta_banco_id: banco.id,
+      aplicaciones: [{ cartera_documento_id: cxp.id, valor_pagado: 455000 }],
+    }, admin.id, { client });
+    const saldo = (await client.query(`SELECT saldo FROM sst.cartera_documentos WHERE id = $1`, [cxp.id])).rows[0].saldo;
+    ok(Number(saldo) === 0, `egreso ${egreso.numero_completo ?? ''} (banco ${banco.codigo}) deja la cuenta por pagar en ${saldo}`);
+    const fila = (await resumenPorMes({ anio: 2026, client })).find((f) => f.precuenta_id === sembrado.precuenta);
+    ok(fila?.documento_soporte && Number(fila.documento_soporte.saldo) === 0, 'Cuentas de cobro ve el DS pagado (saldo 0)');
+  } finally {
+    await client.query('ROLLBACK');
+    client.release();
+  }
+
+  // 7 · Un validado no se borra.
   try {
     await eliminarSoporte(borrador.id);
     ok(false, 'un DS validado no se elimina');
   } catch (e) { ok(e.statusCode === 409, 'un DS validado no se elimina'); }
 } finally {
+  if (sembrado.reglaApagada) await q(`UPDATE sst.reglas_contables SET activa = true WHERE id = $1`, [sembrado.reglaApagada]);
   if (conservar) {
     console.log(`\nConservado para verlo en pantalla (precuenta ${sembrado.precuenta}).`);
   } else {

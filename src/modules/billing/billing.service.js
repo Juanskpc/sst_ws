@@ -116,7 +116,9 @@ export async function resumenPorMes({ anio, client = pool }) {
   const cuentas = await client.query(
     `SELECT c.*,
             -- A4-01 · su documento soporte vivo, si ya lo tiene.
-            (SELECT json_build_object('id', d.id, 'estado', d.estado, 'prefijo', d.prefijo, 'numero', d.numero)
+            -- saldo = lo que falta pagarle al asesor (su cuenta por pagar); 0 = pagada.
+            (SELECT json_build_object('id', d.id, 'estado', d.estado, 'prefijo', d.prefijo, 'numero', d.numero,
+                                      'saldo', (SELECT cd.saldo FROM sst.cartera_documentos cd WHERE cd.documento_id = d.id))
                FROM sst.documentos_electronicos d
               WHERE d.precuenta_id = c.id AND d.tipo = 'DOC_SOPORTE' AND d.estado <> 'ANULADO'
               ORDER BY d.creado_en DESC LIMIT 1) AS documento_soporte

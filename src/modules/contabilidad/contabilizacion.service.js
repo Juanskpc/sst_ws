@@ -29,7 +29,7 @@ import { abrirCarteraDeFactura, aplicarNotaCredito, sincronizarCartera } from '.
  * pendiente con su motivo y se reintenta desde Contabilidad.
  */
 
-const PREFIJO_CONCEPTO = { FACTURA: 'FV', NOTA_CREDITO: 'NC' };
+const PREFIJO_CONCEPTO = { FACTURA: 'FV', NOTA_CREDITO: 'NC', DOC_SOPORTE: 'DS' };
 
 /** Número de pantalla (Factus ya trae el prefijo pegado; no se duplica). */
 function numeroDocumento(d) {
@@ -72,7 +72,8 @@ export async function construirAsiento(documentoId, db = pool) {
   )).rows[0];
   if (!d) throw notFound('Ese documento no existe.');
   const pre = PREFIJO_CONCEPTO[d.tipo];
-  if (!pre) throw badRequest('Por ahora se contabilizan facturas y notas crédito (el documento soporte llega con A4-01).');
+  if (!pre) throw badRequest('Ese tipo de documento no se contabiliza todavía.');
+  if (d.tipo === 'DOC_SOPORTE') return asientoSoporte(d, db);
   const esNota = d.tipo === 'NOTA_CREDITO';
 
   const items = (await db.query(
@@ -148,6 +149,79 @@ export async function construirAsiento(documentoId, db = pool) {
   };
 }
 
+/**
+ * A4-01 · Asiento del documento soporte, como DS-1-1316 de Siigo:
+ *
+ *   D  Costo de honorarios, UNA LÍNEA POR ÍTEM, a la cuenta del PAGADOR de su orden
+ *      (la ARL o el cliente particular: regla DS_COSTO de ese tercero; la general
+ *      como respaldo). Un ítem con cuenta propia (DS manual, A4-02) usa esa.
+ *   C  Honorarios por pagar al asesor (DS_CXP), por el total.
+ *
+ * Sin retención: el DS de la cuenta de cobro no la lleva (supuesto a confirmar).
+ */
+async function asientoSoporte(d, db) {
+  const items = (await db.query(
+    `SELECT i.id, i.descripcion, i.total_linea, i.cuenta_costo_id,
+            COALESCE(a.tercero_id, o.pagador_tercero_id) AS pagador_tercero_id,
+            COALESCE(a.nombre, NULLIF(btrim(COALESCE(tp.razon_social, concat_ws(' ', tp.nombres, tp.apellidos))), '')) AS pagador_nombre
+       FROM sst.documento_items i
+       LEFT JOIN sst.ordenes_servicio o ON o.id = i.orden_id
+       LEFT JOIN sst.arls a ON a.id = o.arl_id
+       LEFT JOIN sst.terceros tp ON tp.id = o.pagador_tercero_id
+      WHERE i.documento_id = $1 ORDER BY i.orden`,
+    [d.id],
+  )).rows;
+  if (!items.length) throw badRequest('El documento no tiene ítems.');
+
+  const reglasCosto = (await db.query(
+    `SELECT cuenta_id, tercero_id FROM sst.reglas_contables WHERE concepto = 'DS_COSTO' AND activa AND producto_id IS NULL`,
+  )).rows;
+  const costoDe = (it) => {
+    if (it.cuenta_costo_id) return it.cuenta_costo_id;
+    const regla = reglasCosto.find((r) => r.tercero_id && r.tercero_id === it.pagador_tercero_id)
+      ?? reglasCosto.find((r) => !r.tercero_id);
+    if (!regla) {
+      throw badRequest(`Falta la regla contable «Costo de honorarios» para ${it.pagador_nombre ?? 'el pagador de la orden'} (Contabilidad → Reglas).`);
+    }
+    return regla.cuenta_id;
+  };
+  const cuenta = await resolvedorDeCuentas(db, d.tercero_id);
+  const numero = numeroDocumento(d) ?? d.reference_code;
+  const lineas = items.map((it) => ({
+    cuenta_id: costoDe(it),
+    tercero_id: d.tercero_id,
+    debito: deCentavos(aCentavos(it.total_linea)),
+    credito: null,
+    base: null,
+    descripcion: String(it.descripcion).slice(0, 500),
+    documento_cruce: numero,
+    documento_cruce_id: d.id,
+  }));
+  lineas.push({
+    cuenta_id: cuenta('DS_CXP'),
+    tercero_id: d.tercero_id,
+    debito: null,
+    credito: deCentavos(aCentavos(d.total_a_pagar)),
+    base: null,
+    descripcion: null,
+    documento_cruce: numero,
+    documento_cruce_id: d.id,
+  });
+  const debitos = lineas.reduce((s, l) => s + (l.debito ? aCentavos(l.debito) : 0), 0);
+  const creditos = aCentavos(d.total_a_pagar);
+  if (debitos !== creditos) {
+    throw badRequest(`El asiento de ${numero} no cuadra (débitos ${deCentavos(debitos)}, créditos ${deCentavos(creditos)}): revise los totales del documento.`);
+  }
+  return {
+    documento: { id: d.id, tipo: d.tipo, estado: d.estado, numero, tercero_nombre: d.tercero_nombre },
+    tipo_comprobante: 'DS',
+    fecha: d.fecha,
+    descripcion: `Documento soporte ${numero} · ${d.tercero_nombre}`,
+    lineas,
+    totales: { debito: deCentavos(debitos), credito: deCentavos(creditos) },
+  };
+}
+
 /** Vista previa con los nombres de cuenta (para la pantalla). */
 export async function vistaPreviaAsiento(documentoId) {
   const a = await construirAsiento(documentoId);
@@ -195,6 +269,11 @@ export async function contabilizarEn(client, documentoId, usuarioId = null) {
     if (cxc) await abrirCarteraDeFactura(client, documentoId, cxc);
   } else if (d.tipo === 'NOTA_CREDITO') {
     await aplicarNotaCredito(client, documentoId);
+  } else if (d.tipo === 'DOC_SOPORTE') {
+    // A4-01 · El DS abre la cuenta por pagar al asesor (DS_CXP es la última línea);
+    // se paga con un comprobante de egreso, como cualquier compra a crédito.
+    const cxp = a.lineas[a.lineas.length - 1]?.credito ? a.lineas[a.lineas.length - 1].cuenta_id : null;
+    if (cxp) await abrirCarteraDeFactura(client, documentoId, cxp, 'CXP');
   }
   return comp;
 }
@@ -233,7 +312,7 @@ export async function listarPendientes(db = pool) {
             d.total_a_pagar, d.contabilizacion_error,
             COALESCE(t.razon_social, NULLIF(btrim(concat_ws(' ', t.nombres, t.apellidos)), '')) AS tercero_nombre
        FROM sst.documentos_electronicos d JOIN sst.terceros t ON t.id = d.tercero_id
-      WHERE d.tipo IN ('FACTURA', 'NOTA_CREDITO') AND d.estado IN ('VALIDADO', 'ANULADO') AND d.comprobante_id IS NULL
+      WHERE d.tipo IN ('FACTURA', 'NOTA_CREDITO', 'DOC_SOPORTE') AND d.estado IN ('VALIDADO', 'ANULADO') AND d.comprobante_id IS NULL
       ORDER BY d.fecha_emision NULLS LAST, d.creado_en`,
   );
   return r.rows.map((x) => ({ ...x, numero_completo: numeroDocumento(x) }));

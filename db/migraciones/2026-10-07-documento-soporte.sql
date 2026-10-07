@@ -21,6 +21,17 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_documento_soporte_precuenta
   ON sst.documentos_electronicos (precuenta_id)
   WHERE tipo = 'DOC_SOPORTE' AND precuenta_id IS NOT NULL AND estado <> 'ANULADO';
 
+-- Contabilización del DS (como DS-1-1316 de Siigo): D costo de honorarios por
+-- PAGADOR de la orden (73050501 Bolívar, 73050503 AXA, 73050516 Colmena… una regla
+-- por tercero pagador) / C 23352501 honorarios por pagar al asesor.
+ALTER TABLE sst.reglas_contables DROP CONSTRAINT IF EXISTS reglas_contables_concepto_check;
+ALTER TABLE sst.reglas_contables ADD CONSTRAINT reglas_contables_concepto_check CHECK (concepto IN (
+  'FV_CXC', 'FV_INGRESO', 'FV_DESCUENTO', 'FV_IVA', 'FV_RETEFUENTE', 'FV_RETEIVA',
+  'FV_AUTORRET_DB', 'FV_AUTORRET_CR',
+  'NC_CXC', 'NC_DEVOLUCION', 'NC_DESCUENTO', 'NC_IVA', 'NC_RETEFUENTE', 'NC_RETEIVA',
+  'CP_CXP', 'CP_CXP_HONORARIOS', 'CP_IVA_DESCONTABLE', 'CE_ANTICIPO',
+  'DS_COSTO', 'DS_CXP'));
+
 -- Pantalla «Documentos soporte»: el mismo reparto que Facturación.
 INSERT INTO sst.permisos_rol (rol, vista, permitido) VALUES
   ('admin',          'documentos_soporte', TRUE),

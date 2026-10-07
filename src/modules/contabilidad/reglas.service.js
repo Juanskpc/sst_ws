@@ -32,6 +32,11 @@ export const CONCEPTOS = [
   { concepto: 'CP_CXP_HONORARIOS', documento: 'COMPRA', nombre: 'Honorarios por pagar (servicios profesionales)', lado: 'C' },
   { concepto: 'CP_IVA_DESCONTABLE', documento: 'COMPRA', nombre: 'IVA descontable de la compra', lado: 'D' },
   { concepto: 'CE_ANTICIPO', documento: 'COMPRA', nombre: 'Anticipos a proveedores', lado: 'D' },
+  // A4-01 · Documento soporte (DS-1-1316 de Siigo). El costo depende de QUIÉN PAGA la
+  // orden: una regla por tercero pagador (cada ARL o cliente particular tiene su
+  // «Honorarios-…» en el 730505); la general, si existe, es el respaldo.
+  { concepto: 'DS_COSTO', documento: 'DOC_SOPORTE', nombre: 'Costo de honorarios (una regla por pagador de la orden)', lado: 'D' },
+  { concepto: 'DS_CXP', documento: 'DOC_SOPORTE', nombre: 'Honorarios por pagar al asesor', lado: 'C' },
 ];
 const CONCEPTOS_VALIDOS = new Set(CONCEPTOS.map((c) => c.concepto));
 
@@ -49,7 +54,20 @@ const CUENTAS_SIIGO = {
   NC_RETEIVA: '13551701', NC_DESCUENTO: '53053501',
   // FC-1-10 (23359501 Otros), DS-1-1316 (23352501 Honorarios), RP-1-2 (13300501 A proveedores).
   CP_CXP: '23359501', CP_CXP_HONORARIOS: '23352501', CP_IVA_DESCONTABLE: '24081001', CE_ANTICIPO: '13300501',
+  DS_CXP: '23352501',
 };
+
+/**
+ * Costo del documento soporte por ARL, como en el auxiliar de Siigo (DS-1-1316..1327).
+ * Se busca la ARL por su nombre y la regla se cuelga de su tercero (el pagador).
+ * Los clientes particulares (Transporte de Sandoná 73050507, Kamentsa 73050508…) los
+ * enlaza la contadora en Reglas: el nombre del tercero no basta para adivinarlos.
+ */
+const COSTO_DS_POR_ARL = [
+  { patron: /bol[ií]var/i, codigo: '73050501' },
+  { patron: /axa|colpatria/i, codigo: '73050503' },
+  { patron: /colmena/i, codigo: '73050516' },
+];
 
 /** Cuentas "Rete Ica N" del auxiliar de Siigo, por tarifa en porcentaje (5 ‰ = 0,5 %). */
 const RETEICA_POR_TARIFA = {
@@ -156,6 +174,21 @@ export async function sembrarReglasSiigo(usuarioId = null, db = null) {
       if (!cuenta) continue;
       await client.query(`UPDATE sst.retenciones SET cuenta_id = $2 WHERE id = $1`, [r.id, cuenta.id]);
       retencionesConCuenta.push(`${r.codigo} → ${codigo}`);
+    }
+    // A4-01 · El costo del documento soporte de cada ARL, colgado de su tercero.
+    const arls = (await client.query(`SELECT nombre, tercero_id FROM sst.arls WHERE tercero_id IS NOT NULL`)).rows;
+    for (const arl of arls) {
+      const codigo = COSTO_DS_POR_ARL.find((c) => c.patron.test(arl.nombre))?.codigo;
+      const cuenta = codigo && (await client.query(
+        `SELECT id FROM sst.cuentas_contables WHERE codigo = $1 AND acepta_movimiento AND activa`, [codigo],
+      )).rows[0];
+      if (!cuenta) continue;
+      const r = await client.query(
+        `INSERT INTO sst.reglas_contables (concepto, cuenta_id, tercero_id, actualizado_por) VALUES ('DS_COSTO', $1, $2, $3)
+         ON CONFLICT DO NOTHING RETURNING id`,
+        [cuenta.id, arl.tercero_id, usuarioId],
+      );
+      if (r.rows[0]) creadas.push(`DS_COSTO · ${arl.nombre}`);
     }
     return { creadas, sin_cuenta: sinCuenta, retenciones: retencionesConCuenta };
   });
