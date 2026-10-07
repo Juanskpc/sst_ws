@@ -401,7 +401,9 @@ export async function crearNotaAjuste(soporteId, { causal, lineas, observaciones
         WHERE d.documento_referencia_id = $1 AND d.tipo = 'NOTA_AJUSTE_DS' AND d.estado = 'VALIDADO'
         GROUP BY 1, 2`, [soporteId],
     )).rows;
-    const yaAjustado = (it) => Number(ajustado.find((a) => a.orden_id === it.orden_id && a.descripcion === it.descripcion)?.cantidad ?? 0);
+    // Se compara sin el tramo de horas: la nota parcial lo reescribe con las horas ajustadas.
+    const clave = (x) => `${x.orden_id ?? ''}|${String(x.descripcion).replace(/ · [\d.,]+ h a \$/, ' · h a $')}`;
+    const yaAjustado = (it) => ajustado.filter((a) => clave(a) === clave(it)).reduce((s, a) => s + Number(a.cantidad), 0);
 
     let items;
     if (codigo === ANULACION || !lineas?.length) {
@@ -415,7 +417,12 @@ export async function crearNotaAjuste(soporteId, { causal, lineas, observaciones
         const disponible = Number(it.cantidad) - yaAjustado(it);
         if (!(cantidad > 0)) throw badRequest(`La cantidad de «${it.descripcion}» debe ser mayor que cero.`);
         if (cantidad > disponible + 1e-9) throw badRequest(`De «${it.descripcion}» solo quedan ${disponible} por ajustar.`);
-        return { ...it, cantidad };
+        // En un ajuste parcial la descripción dice las horas que se AJUSTAN, no las del
+        // documento original («4 h a $58.000» con cantidad 1 se leía como un error).
+        const descripcion = cantidad !== Number(it.cantidad)
+          ? String(it.descripcion).replace(/ · [\d.,]+ h a \$/, ` · ${horasTexto(cantidad)} h a $`)
+          : it.descripcion;
+        return { ...it, cantidad, descripcion };
       });
     }
     const totalDe = (it) => Math.round(Number(it.cantidad) * Number(it.valor_unitario) * 100);
