@@ -184,47 +184,79 @@ export async function listarPorGenerar() {
   return r.rows.map((f) => ({ ...f, periodo_largo: periodoLargo(f.periodo) }));
 }
 
+// ─── Tipos que maneja este módulo ────────────────────────────────────────────
+// El documento soporte y su nota de ajuste (A4-03) recorren el mismo circuito:
+// BORRADOR → ENVIANDO → VALIDADO / RECHAZADO. Lo que cambia es el endpoint del
+// proveedor, la numeración y lo que pasa al validarse.
+const TIPOS = ['DOC_SOPORTE', 'NOTA_AJUSTE_DS'];
+const nombreDe = (tipo) => (tipo === 'NOTA_AJUSTE_DS' ? 'La nota de ajuste' : 'El documento soporte');
+
+/** Tabla de la DIAN para la nota de ajuste al documento soporte (tablas de referencia del proveedor, 7-oct-2026). */
+export const CAUSALES_NOTA_AJUSTE = {
+  1: 'Devolución parcial de los bienes y/o no aceptación parcial del servicio',
+  2: 'Anulación del documento soporte',
+  3: 'Rebaja o descuento parcial o total',
+  4: 'Ajuste de precio',
+  5: 'Otros',
+};
+const ANULACION = '2';
+
+async function tipoDe(id, client = pool) {
+  const r = (await client.query(`SELECT tipo FROM sst.documentos_electronicos WHERE id = $1`, [id])).rows[0];
+  if (!r || !TIPOS.includes(r.tipo)) throw notFound('Ese documento soporte no existe.');
+  return r.tipo;
+}
+
 const LISTA_SELECT = `
-  SELECT d.id, d.estado, d.reference_code, d.prefijo, d.numero, d.cufe,
+  SELECT d.id, d.tipo, d.estado, d.reference_code, d.prefijo, d.numero, d.cufe, d.causal,
          to_char(d.fecha_emision, 'YYYY-MM-DD') AS fecha_emision,
          d.total_a_pagar, d.pdf_path IS NOT NULL AS tiene_pdf, d.xml_path IS NOT NULL AS tiene_xml,
          d.tercero_id, COALESCE(t.razon_social, btrim(concat_ws(' ', t.nombres, t.apellidos))) AS tercero_nombre,
          t.numero_documento AS tercero_documento,
-         d.precuenta_id, pc.periodo, p.nombre AS profesional_nombre,
+         COALESCE(d.precuenta_id, ref.precuenta_id) AS precuenta_id, pc.periodo, p.nombre AS profesional_nombre,
          (SELECT count(*)::int FROM sst.documento_items i WHERE i.documento_id = d.id) AS total_lineas,
          d.comprobante_id IS NOT NULL AS contabilizado, cxp.saldo AS saldo_por_pagar,
+         d.documento_referencia_id, ref.prefijo AS referencia_prefijo, ref.numero AS referencia_numero,
          d.creado_en
     FROM sst.documentos_electronicos d
     JOIN sst.terceros t ON t.id = d.tercero_id
-    LEFT JOIN sst.precuentas pc ON pc.id = d.precuenta_id
+    LEFT JOIN sst.documentos_electronicos ref ON ref.id = d.documento_referencia_id
+    LEFT JOIN sst.precuentas pc ON pc.id = COALESCE(d.precuenta_id, ref.precuenta_id)
     LEFT JOIN sst.profesionales p ON p.id = pc.profesional_id
     LEFT JOIN sst.cartera_documentos cxp ON cxp.documento_id = d.id`;
 
-/** Lista por estado (varios separados por coma); `periodo` (AAAA-MM) la acota al mes de la cuenta de cobro. */
-export async function listarSoportes({ estado, periodo } = {}) {
-  const estados = String(estado || 'BORRADOR,ENVIANDO,VALIDADO,RECHAZADO')
+/**
+ * Lista por estado (varios separados por coma). `periodo` (AAAA-MM) la acota al
+ * mes de la cuenta de cobro; `tipo` es DOC_SOPORTE (por defecto) o NOTA_AJUSTE_DS.
+ */
+export async function listarSoportes({ estado, periodo, tipo = 'DOC_SOPORTE' } = {}) {
+  if (!TIPOS.includes(tipo)) throw badRequest('Tipo de documento no válido.');
+  const estados = String(estado || 'BORRADOR,ENVIANDO,VALIDADO,RECHAZADO,ANULADO')
     .split(',').map((e) => e.trim().toUpperCase()).filter(Boolean);
-  const params = [estados];
+  const params = [estados, tipo];
   let filtro = '';
   if (periodo) {
     if (!/^\d{4}-\d{2}$/.test(String(periodo))) throw badRequest('El periodo va como AAAA-MM.');
     params.push(String(periodo));
-    filtro = ` AND pc.periodo = $2`;
+    filtro = ` AND pc.periodo = $3`;
   }
   return (await pool.query(
-    `${LISTA_SELECT} WHERE d.tipo = 'DOC_SOPORTE' AND d.estado = ANY($1)${filtro} ORDER BY d.creado_en DESC LIMIT 500`,
+    `${LISTA_SELECT} WHERE d.tipo = $2 AND d.estado = ANY($1)${filtro} ORDER BY d.creado_en DESC LIMIT 500`,
     params,
   )).rows;
 }
 
-/** Detalle: el de la factura (ítems, totales, línea de tiempo) más la cuenta de cobro de origen. */
+/** Detalle: el de la factura (ítems, totales, línea de tiempo) más la cuenta de cobro de origen y el pago. */
 export async function obtenerSoporte(id, client = pool) {
   const doc = await obtenerBorrador(id, client);
-  if (doc.tipo !== 'DOC_SOPORTE') throw notFound('Ese documento soporte no existe.');
-  const origen = doc.precuenta_id ? (await client.query(
+  if (!TIPOS.includes(doc.tipo)) throw notFound('Ese documento soporte no existe.');
+  const precuentaId = doc.precuenta_id ?? (doc.documento_referencia_id ? (await client.query(
+    `SELECT precuenta_id FROM sst.documentos_electronicos WHERE id = $1`, [doc.documento_referencia_id],
+  )).rows[0]?.precuenta_id : null);
+  const origen = precuentaId ? (await client.query(
     `SELECT pc.id, pc.periodo, pc.estado, p.nombre AS profesional_nombre
        FROM sst.precuentas pc JOIN sst.profesionales p ON p.id = pc.profesional_id WHERE pc.id = $1`,
-    [doc.precuenta_id],
+    [precuentaId],
   )).rows[0] : null;
   const arls = (await client.query(
     `SELECT i.id AS item_id, a.nombre AS arl_nombre, o.codigo AS orden_codigo
@@ -235,19 +267,27 @@ export async function obtenerSoporte(id, client = pool) {
     [id],
   )).rows;
   const porItem = new Map(arls.map((a) => [a.item_id, a]));
-  // Contabilización y pago: el asiento DS y lo que falta pagarle al asesor.
+  // Contabilización y pago: el asiento y lo que falta pagarle al asesor.
   const contable = (await client.query(
     `SELECT d.comprobante_id, d.contabilizacion_error, cxp.valor AS cxp_valor, cxp.saldo AS cxp_saldo
        FROM sst.documentos_electronicos d LEFT JOIN sst.cartera_documentos cxp ON cxp.documento_id = d.id
       WHERE d.id = $1`,
     [id],
   )).rows[0];
+  // Las notas de ajuste ya hechas sobre este DS (para mostrarlas y saber si hay una en curso).
+  const notas = doc.tipo === 'DOC_SOPORTE' ? (await client.query(
+    `SELECT id, estado, prefijo, numero, reference_code, causal, total_a_pagar
+       FROM sst.documentos_electronicos WHERE documento_referencia_id = $1 AND tipo = 'NOTA_AJUSTE_DS' ORDER BY creado_en`,
+    [id],
+  )).rows : [];
   return {
     ...doc,
     comprobante_id: contable?.comprobante_id ?? null,
     contabilizacion_error: contable?.contabilizacion_error ?? null,
     cxp: contable?.cxp_valor != null ? { valor: contable.cxp_valor, saldo: contable.cxp_saldo } : null,
     precuenta: origen ? { ...origen, periodo_largo: periodoLargo(origen.periodo) } : null,
+    notas_ajuste: notas,
+    causal_nombre: doc.causal ? CAUSALES_NOTA_AJUSTE[doc.causal] ?? null : null,
     items: doc.items.map((it) => ({
       ...it,
       arl_nombre: porItem.get(it.id)?.arl_nombre ?? null,
@@ -256,31 +296,128 @@ export async function obtenerSoporte(id, client = pool) {
   };
 }
 
+// ─── A4-03 · Nota de ajuste ────────────────────────────────────────────────
+
+/**
+ * Crea la nota de ajuste en BORRADOR sobre un documento soporte VALIDADO. Sin
+ * `lineas` (o con la causal 2, anulación) ajusta el DS completo; con `lineas`
+ * ({ item_id, cantidad }) solo lo indicado. La nota baja lo que se le debe al
+ * asesor: si ya se le pagó, primero hay que anular el egreso.
+ */
+export async function crearNotaAjuste(soporteId, { causal, lineas, observaciones } = {}, usuarioId) {
+  const codigo = String(causal ?? '').trim();
+  if (!CAUSALES_NOTA_AJUSTE[codigo]) throw badRequest('Elija el motivo de la nota de ajuste (códigos 1 a 5 de la DIAN).');
+  const id = await withTransaction(async (client) => {
+    const ds = (await client.query(
+      `SELECT * FROM sst.documentos_electronicos WHERE id = $1 AND tipo = 'DOC_SOPORTE' FOR UPDATE`, [soporteId],
+    )).rows[0];
+    if (!ds) throw notFound('Ese documento soporte no existe.');
+    if (ds.estado !== 'VALIDADO') throw conflict(`Solo se ajusta un documento soporte validado (este está ${ds.estado.toLowerCase()}).`);
+    const abierta = (await client.query(
+      `SELECT reference_code FROM sst.documentos_electronicos
+        WHERE documento_referencia_id = $1 AND tipo = 'NOTA_AJUSTE_DS' AND estado IN ('BORRADOR', 'ENVIANDO', 'RECHAZADO')`,
+      [soporteId],
+    )).rows[0];
+    if (abierta) throw conflict(`Este documento soporte ya tiene una nota de ajuste en curso (${abierta.reference_code}): emítala o elimínela primero.`);
+
+    const itemsDs = (await client.query(
+      `SELECT id, orden_id, codigo, descripcion, cantidad, valor_unitario, cuenta_costo_id
+         FROM sst.documento_items WHERE documento_id = $1 ORDER BY orden`, [soporteId],
+    )).rows;
+    const ajustado = (await client.query(
+      `SELECT it.orden_id, it.descripcion, SUM(it.cantidad) AS cantidad
+         FROM sst.documento_items it JOIN sst.documentos_electronicos d ON d.id = it.documento_id
+        WHERE d.documento_referencia_id = $1 AND d.tipo = 'NOTA_AJUSTE_DS' AND d.estado = 'VALIDADO'
+        GROUP BY 1, 2`, [soporteId],
+    )).rows;
+    const yaAjustado = (it) => Number(ajustado.find((a) => a.orden_id === it.orden_id && a.descripcion === it.descripcion)?.cantidad ?? 0);
+
+    let items;
+    if (codigo === ANULACION || !lineas?.length) {
+      if (ajustado.length) throw conflict('El documento soporte ya tiene notas de ajuste parciales: una anulación total ya no cuadra. Ajuste el saldo con otra nota parcial.');
+      items = itemsDs.map((it) => ({ ...it, cantidad: Number(it.cantidad) }));
+    } else {
+      items = lineas.map((l) => {
+        const it = itemsDs.find((x) => x.id === l.item_id);
+        if (!it) throw badRequest('Alguna línea elegida no pertenece a este documento soporte.');
+        const cantidad = Number(l.cantidad);
+        const disponible = Number(it.cantidad) - yaAjustado(it);
+        if (!(cantidad > 0)) throw badRequest(`La cantidad de «${it.descripcion}» debe ser mayor que cero.`);
+        if (cantidad > disponible + 1e-9) throw badRequest(`De «${it.descripcion}» solo quedan ${disponible} por ajustar.`);
+        return { ...it, cantidad };
+      });
+    }
+    const totalDe = (it) => Math.round(Number(it.cantidad) * Number(it.valor_unitario) * 100);
+    const total = items.reduce((s, it) => s + totalDe(it), 0);
+    if (!(total > 0)) throw badRequest('La nota de ajuste no tiene valor.');
+
+    const cxp = (await client.query(`SELECT saldo FROM sst.cartera_documentos WHERE documento_id = $1`, [soporteId])).rows[0];
+    if (cxp && total > aCentavos(cxp.saldo)) {
+      throw conflict(`Al asesor ya se le pagó parte de este documento soporte (quedan ${cxp.saldo} por pagar): la nota de ${deCentavos(total)} no cabe. Anule primero el egreso.`);
+    }
+
+    const nota = (await client.query(
+      `INSERT INTO sst.documentos_electronicos
+         (tipo, reference_code, estado, tercero_id, documento_referencia_id, causal, fecha_emision, fecha_vencimiento,
+          forma_pago_id, medio_pago_id, observaciones,
+          total_bruto, total_descuento, subtotal, total_iva, total_retenciones, total_a_pagar, creado_por, actualizado_por)
+       VALUES ('NOTA_AJUSTE_DS', $1, 'BORRADOR', $2, $3, $4, $5, $11, $6, $7, $8, $9, 0, $9, 0, 0, $9, $10, $10)
+       RETURNING id`,
+      // Mismo plazo que el DS: a crédito, el proveedor exige un vencimiento posterior a hoy.
+      [`ORB-NA-${crypto.randomUUID().slice(0, 8).toUpperCase()}`, ds.tercero_id, soporteId, codigo, hoyCO(),
+        ds.forma_pago_id, ds.medio_pago_id, observaciones?.trim() || CAUSALES_NOTA_AJUSTE[codigo], deCentavos(total), usuarioId,
+        sumarDias(hoyCO(), PLAZO_DIAS)],
+    )).rows[0];
+    for (const [i, it] of items.entries()) {
+      await client.query(
+        `INSERT INTO sst.documento_items
+           (documento_id, orden_id, codigo, descripcion, cantidad, valor_unitario, descuento, base, total_linea, cuenta_costo_id, orden)
+         VALUES ($1, $2, $3, $4, $5, $6, 0, $7, $7, $8, $9)`,
+        [nota.id, it.orden_id, it.codigo, it.descripcion, it.cantidad, it.valor_unitario, deCentavos(totalDe(it)), it.cuenta_costo_id, i],
+      );
+    }
+    const numeroDs = numeroCompleto(ds.prefijo, ds.numero);
+    await client.query(
+      `INSERT INTO sst.documento_eventos (documento_id, codigo, descripcion, usuario_id) VALUES ($1, 'CREADO', $2, $3)`,
+      [nota.id, `Nota de ajuste sobre el documento soporte ${numeroDs} · motivo ${codigo}: ${CAUSALES_NOTA_AJUSTE[codigo]}.`, usuarioId],
+    );
+    await client.query(
+      `INSERT INTO sst.documento_eventos (documento_id, codigo, descripcion, usuario_id) VALUES ($1, 'NOTA_AJUSTE_CREADA', $2, $3)`,
+      [soporteId, `Se creó una nota de ajuste en borrador (motivo ${codigo}: ${CAUSALES_NOTA_AJUSTE[codigo]}).`, usuarioId],
+    );
+    return nota.id;
+  });
+  return obtenerSoporte(id);
+}
+
+// ─── Emisión (DS y nota) ─────────────────────────────────────────────────────
+
 function validarSoporte({ doc, items, resolucion }) {
+  const quien = nombreDe(doc.tipo);
   if (doc.estado !== 'BORRADOR') {
     throw conflict(doc.estado === 'ENVIANDO'
-      ? 'Este documento soporte ya se está enviando: use «Consultar estado», no lo emita de nuevo.'
-      : `Este documento soporte ya está ${doc.estado.toLowerCase()}; no se puede volver a emitir.`);
+      ? `${quien} ya se está enviando: use «Consultar estado», no lo emita de nuevo.`
+      : `${quien} ya está ${doc.estado.toLowerCase()}; no se puede volver a emitir.`);
   }
-  if (!items.length) throw badRequest('El documento soporte no tiene líneas.');
+  if (!items.length) throw badRequest(`${quien} no tiene líneas.`);
   const faltan = [];
   if (!doc.numero_documento) faltan.push('número de documento');
   if (!doc.direccion) faltan.push('dirección');
   if (!doc.municipio_id) faltan.push('municipio');
   if (faltan.length) throw badRequest(`Al tercero ${doc.nombre} le falta ${faltan.join(', ')}. Complete su ficha en Terceros.`);
   if (!resolucion) {
-    throw badRequest('No hay una resolución de numeración activa para documento soporte. Sincronícela en Parametrización → Numeración.');
+    throw badRequest(`No hay una numeración activa para ${doc.tipo === 'NOTA_AJUSTE_DS' ? 'notas de ajuste' : 'documento soporte'}. Sincronícela en Parametrización → Numeración.`);
   }
   const hoy = hoyCO();
-  if (resolucion.fecha_hasta && resolucion.fecha_hasta < hoy) throw badRequest(`La resolución del documento soporte venció el ${resolucion.fecha_hasta}.`);
+  if (resolucion.fecha_hasta && resolucion.fecha_hasta < hoy) throw badRequest(`La numeración venció el ${resolucion.fecha_hasta}.`);
   if (resolucion.hasta != null && Number(resolucion.consecutivo_actual) >= Number(resolucion.hasta)) {
-    throw badRequest('La resolución del documento soporte ya agotó su rango.');
+    throw badRequest('La numeración ya agotó su rango.');
   }
-  if (!(Number(doc.total_a_pagar) > 0)) throw badRequest('El documento soporte no tiene un total mayor que cero.');
+  if (!(Number(doc.total_a_pagar) > 0)) throw badRequest(`${quien} no tiene un total mayor que cero.`);
 }
 
-function intentarEmisionSoporte({ doc, items, formaPagoCodigo, medioPagoCodigo, resolucion }) {
-  return proveedorFE().emitirDocumentoSoporte({
+async function intentarEmision({ doc, items, formaPagoCodigo, medioPagoCodigo, resolucion }) {
+  const datos = {
     referenceCode: doc.reference_code,
     proveedor: {
       nit: doc.numero_documento,
@@ -305,37 +442,50 @@ function intentarEmisionSoporte({ doc, items, formaPagoCodigo, medioPagoCodigo, 
     montoAPagar: deCentavos(aCentavos(doc.total_a_pagar)),
     fechaVencimiento: doc.fecha_vencimiento,
     observacion: doc.observaciones,
+  };
+  if (doc.tipo !== 'NOTA_AJUSTE_DS') return proveedorFE().emitirDocumentoSoporte(datos);
+  const ds = (await pool.query(
+    `SELECT prefijo, numero, estado FROM sst.documentos_electronicos WHERE id = $1`, [doc.documento_referencia_id],
+  )).rows[0];
+  if (!ds?.numero || ds.estado !== 'VALIDADO') throw conflict('El documento soporte de esta nota ya no está validado.');
+  return proveedorFE().emitirNotaAjusteSoporte({
+    ...datos, numeroDocumentoSoporte: numeroCompleto(ds.prefijo, ds.numero), conceptoCorreccion: doc.causal,
   });
 }
 
 /**
  * VALIDADO: número, CUDS, PDF y XML en una transacción. Una descarga fallida no
- * revierte nada. Después, en su propia transacción, el asiento DS y la cuenta por
- * pagar al asesor: si falla (falta una regla, mes cerrado) el DS sigue válido ante
- * la DIAN y queda «contabilidad pendiente», como la factura.
+ * revierte nada. Una nota de anulación deja ANULADO su documento soporte (la
+ * cuenta de cobro queda libre para otro). Después, en su propia transacción, el
+ * asiento y la cuenta por pagar: si falla (falta una regla, mes cerrado) el
+ * documento sigue válido ante la DIAN y queda «contabilidad pendiente».
  */
-async function finalizarSoporteValidado(id, resultado, usuarioId) {
-  await finalizarSoporteValidadoTx(id, resultado, usuarioId);
+async function finalizarValidado(id, tipo, resultado, usuarioId) {
+  await finalizarValidadoTx(id, tipo, resultado, usuarioId);
   await contabilizarTrasValidar(id, usuarioId);
 }
 
-async function finalizarSoporteValidadoTx(id, resultado, usuarioId) {
+async function finalizarValidadoTx(id, tipo, resultado, usuarioId) {
+  const esNota = tipo === 'NOTA_AJUSTE_DS';
   return withTransaction(async (client) => {
     const avisos = [];
     const proveedor = proveedorFE();
     const [pdf, xml] = await Promise.all([
-      proveedor.descargarPdfDocumentoSoporte(resultado.numeroDocumento).catch((e) => { avisos.push(`PDF: ${e.message}`); return null; }),
-      proveedor.descargarXmlDocumentoSoporte(resultado.numeroDocumento).catch((e) => { avisos.push(`XML: ${e.message}`); return null; }),
+      (esNota ? proveedor.descargarPdfNotaAjusteSoporte(resultado.numeroDocumento) : proveedor.descargarPdfDocumentoSoporte(resultado.numeroDocumento))
+        .catch((e) => { avisos.push(`PDF: ${e.message}`); return null; }),
+      (esNota ? proveedor.descargarXmlNotaAjusteSoporte(resultado.numeroDocumento) : proveedor.descargarXmlDocumentoSoporte(resultado.numeroDocumento))
+        .catch((e) => { avisos.push(`XML: ${e.message}`); return null; }),
     ]);
     const [pdfPath, xmlPath] = await Promise.all([
       pdf ? storage.put('soporte/pdf', `${resultado.numeroDocumento}.pdf`, Buffer.from(pdf.base64, 'base64')) : null,
       xml ? storage.put('soporte/xml', `${resultado.numeroDocumento}.xml`, Buffer.from(xml.base64, 'base64')) : null,
     ]);
     const resolucion = (await client.query(
-      `SELECT prefijo FROM sst.resoluciones_numeracion WHERE tipo_documento = 'DOC_SOPORTE' AND activa
-        ORDER BY sincronizada_en DESC NULLS LAST LIMIT 1`,
+      `SELECT prefijo FROM sst.resoluciones_numeracion WHERE tipo_documento = $1 AND activa
+        ORDER BY sincronizada_en DESC NULLS LAST LIMIT 1`, [tipo],
     )).rows[0];
     const prefijo = resolucion?.prefijo ?? null;
+    const numero = numeroCompleto(prefijo, resultado.numeroDocumento);
     await client.query(
       `UPDATE sst.documentos_electronicos
           SET estado = 'VALIDADO', numero = $2, prefijo = $3, cufe = $4, qr_url = $5,
@@ -347,7 +497,7 @@ async function finalizarSoporteValidadoTx(id, resultado, usuarioId) {
     );
     await client.query(
       `INSERT INTO sst.documento_eventos (documento_id, codigo, descripcion, usuario_id) VALUES ($1, 'VALIDADO', $2, $3)`,
-      [id, `Validado por la DIAN. Número ${numeroCompleto(prefijo, resultado.numeroDocumento)}, CUDS ${resultado.cufe ?? '—'}.`, usuarioId],
+      [id, `Validado por la DIAN. Número ${numero}, CUDS ${resultado.cufe ?? '—'}.`, usuarioId],
     );
     if (avisos.length) {
       await client.query(
@@ -355,32 +505,49 @@ async function finalizarSoporteValidadoTx(id, resultado, usuarioId) {
         [id, `No se pudo descargar: ${avisos.join('; ')}`.slice(0, 2000), usuarioId],
       );
     }
+    if (esNota) {
+      const nota = (await client.query(`SELECT causal, documento_referencia_id FROM sst.documentos_electronicos WHERE id = $1`, [id])).rows[0];
+      await client.query(
+        `INSERT INTO sst.documento_eventos (documento_id, codigo, descripcion, usuario_id) VALUES ($1, 'NOTA_AJUSTE', $2, $3)`,
+        [nota.documento_referencia_id, `Nota de ajuste ${numero} validada (motivo ${nota.causal}: ${CAUSALES_NOTA_AJUSTE[nota.causal]}).`, usuarioId],
+      );
+      if (nota.causal === ANULACION) {
+        await client.query(
+          `UPDATE sst.documentos_electronicos SET estado = 'ANULADO', actualizado_por = $2 WHERE id = $1`, [nota.documento_referencia_id, usuarioId],
+        );
+        await client.query(
+          `INSERT INTO sst.documento_eventos (documento_id, codigo, descripcion, usuario_id) VALUES ($1, 'ANULADO', $2, $3)`,
+          [nota.documento_referencia_id, `Anulado con la nota de ajuste ${numero}. Su cuenta de cobro vuelve a «Por generar».`, usuarioId],
+        );
+      }
+    }
   });
 }
 
-async function resolverResultado(id, resultado, usuarioId) {
+async function resolverResultado(id, tipo, resultado, usuarioId) {
   if (resultado.eventos?.rechazos?.length) {
     await finalizarRechazado(id, resultado.eventos.rechazos.map(([, v]) => v), resultado.respuestaCruda, usuarioId);
     return { pendiente: false };
   }
   if (resultado.validado && resultado.numeroDocumento) {
-    await finalizarSoporteValidado(id, resultado, usuarioId);
+    await finalizarValidado(id, tipo, resultado, usuarioId);
     return { pendiente: false };
   }
   await registrarSinDecision(id, 'SIN_DECISION', 'Todavía no se valida ni se rechaza. Use «Consultar estado» en unos minutos.', usuarioId);
   return { pendiente: true };
 }
 
-const PENDIENTE = {
+const pendiente = (tipo) => ({
   pendiente: true,
   estado: 'ENVIANDO',
-  aviso: 'No hubo respuesta definitiva de la DIAN; el documento soporte quedó en ENVIANDO. Use «Consultar estado» en unos minutos.',
-};
+  aviso: `No hubo respuesta definitiva de la DIAN; ${nombreDe(tipo).toLowerCase()} quedó en ENVIANDO. Use «Consultar estado» en unos minutos.`,
+});
 
-/** Emite el borrador (ENVIANDO confirmado antes de llamar al proveedor). */
+/** Emite el borrador (ENVIANDO confirmado antes de llamar al proveedor). Sirve para el DS y para su nota. */
 export async function emitirSoporte(id, usuarioId) {
+  const tipo = await tipoDe(id);
   const datos = await withTransaction(async (client) => {
-    const d = await cargarDocumentoParaEmitir(id, client, 'DOC_SOPORTE');
+    const d = await cargarDocumentoParaEmitir(id, client, tipo);
     validarSoporte(d);
     await client.query(`UPDATE sst.documentos_electronicos SET estado = 'ENVIANDO', actualizado_por = $2 WHERE id = $1`, [id, usuarioId]);
     await client.query(
@@ -392,33 +559,36 @@ export async function emitirSoporte(id, usuarioId) {
 
   let resultado;
   try {
-    resultado = await intentarEmisionSoporte(datos);
+    resultado = await intentarEmision(datos);
   } catch (e) {
     if (await registrarFallaDeEnvio(id, e, usuarioId)) return obtenerSoporte(id);
-    return PENDIENTE;
+    return pendiente(tipo);
   }
-  const { pendiente } = await resolverResultado(id, resultado, usuarioId);
-  return pendiente ? PENDIENTE : obtenerSoporte(id);
+  const r = await resolverResultado(id, tipo, resultado, usuarioId);
+  return r.pendiente ? pendiente(tipo) : obtenerSoporte(id);
 }
 
-/** Reconcilia un DS que quedó ENVIANDO: con número consulta; sin número reintenta con el MISMO reference_code. */
+/** Reconcilia lo que quedó ENVIANDO: con número consulta; sin número reintenta con el MISMO reference_code. */
 export async function reconciliarSoporte(id, usuarioId) {
-  const datos = await withTransaction((client) => cargarDocumentoParaEmitir(id, client, 'DOC_SOPORTE'));
-  if (datos.doc.estado !== 'ENVIANDO') throw conflict(`Este documento soporte está ${datos.doc.estado.toLowerCase()}; no hay nada que reconciliar.`);
+  const tipo = await tipoDe(id);
+  const datos = await withTransaction((client) => cargarDocumentoParaEmitir(id, client, tipo));
+  if (datos.doc.estado !== 'ENVIANDO') throw conflict(`Este documento está ${datos.doc.estado.toLowerCase()}; no hay nada que reconciliar.`);
   if (!datos.doc.numero) {
     let resultado;
     try {
-      resultado = await intentarEmisionSoporte(datos);
+      resultado = await intentarEmision(datos);
     } catch (e) {
       if (await registrarFallaDeEnvio(id, e, usuarioId)) return obtenerSoporte(id);
-      return PENDIENTE;
+      return pendiente(tipo);
     }
-    const { pendiente } = await resolverResultado(id, resultado, usuarioId);
-    return pendiente ? PENDIENTE : obtenerSoporte(id);
+    const r = await resolverResultado(id, tipo, resultado, usuarioId);
+    return r.pendiente ? pendiente(tipo) : obtenerSoporte(id);
   }
-  const estado = await proveedorFE().consultarDocumentoSoporte(datos.doc.numero);
+  const estado = tipo === 'NOTA_AJUSTE_DS'
+    ? await proveedorFE().consultarNotaAjusteSoporte(datos.doc.numero)
+    : await proveedorFE().consultarDocumentoSoporte(datos.doc.numero);
   if (estado.estado === 'VALIDADO') {
-    await finalizarSoporteValidado(id, {
+    await finalizarValidado(id, tipo, {
       numeroDocumento: datos.doc.numero, cufe: estado.cufe, urlPublica: estado.urlPublica, respuestaCruda: estado.respuestaCruda,
     }, usuarioId);
     return obtenerSoporte(id);
@@ -428,20 +598,23 @@ export async function reconciliarSoporte(id, usuarioId) {
     return obtenerSoporte(id);
   }
   await registrarSinDecision(id, 'CONSULTA_ESTADO', 'Sigue en proceso ante la DIAN.', usuarioId);
-  return PENDIENTE;
+  return pendiente(tipo);
 }
 
 /** RECHAZADO → BORRADOR con un reference_code nuevo (el intento rechazado queda en la línea de tiempo). */
 export async function corregirSoporte(id, usuarioId) {
+  const tipo = await tipoDe(id);
   await withTransaction(async (client) => {
     const doc = (await client.query(
-      `SELECT estado, reference_code FROM sst.documentos_electronicos WHERE id = $1 AND tipo = 'DOC_SOPORTE' FOR UPDATE`, [id],
+      `SELECT estado, reference_code FROM sst.documentos_electronicos WHERE id = $1 FOR UPDATE`, [id],
     )).rows[0];
-    if (!doc) throw notFound('Ese documento soporte no existe.');
     if (doc.estado !== 'RECHAZADO') throw conflict(`Solo se corrige un documento RECHAZADO (este está ${doc.estado.toLowerCase()}).`);
+    const referencia = tipo === 'NOTA_AJUSTE_DS'
+      ? `ORB-NA-${crypto.randomUUID().slice(0, 8).toUpperCase()}`
+      : generarReferenceCodeSoporte();
     await client.query(
       `UPDATE sst.documentos_electronicos SET estado = 'BORRADOR', reference_code = $2, errores = NULL, actualizado_por = $3 WHERE id = $1`,
-      [id, generarReferenceCodeSoporte(), usuarioId],
+      [id, referencia, usuarioId],
     );
     await client.query(
       `INSERT INTO sst.documento_eventos (documento_id, codigo, descripcion, usuario_id) VALUES ($1, 'CORREGIDO', $2, $3)`,
@@ -451,11 +624,11 @@ export async function corregirSoporte(id, usuarioId) {
   return obtenerSoporte(id);
 }
 
-/** Borra un BORRADOR (la cuenta de cobro queda libre para generar otro). */
+/** Borra un BORRADOR (la cuenta de cobro, o el DS de la nota, queda libre). */
 export async function eliminarSoporte(id) {
   const r = await pool.query(
-    `DELETE FROM sst.documentos_electronicos WHERE id = $1 AND tipo = 'DOC_SOPORTE' AND estado = 'BORRADOR' RETURNING id`, [id],
+    `DELETE FROM sst.documentos_electronicos WHERE id = $1 AND tipo = ANY($2) AND estado = 'BORRADOR' RETURNING id`, [id, TIPOS],
   );
-  if (!r.rows[0]) throw conflict('Solo se puede eliminar un documento soporte en BORRADOR (o ya no existe).');
+  if (!r.rows[0]) throw conflict('Solo se puede eliminar un documento en BORRADOR (o ya no existe).');
   return { id };
 }

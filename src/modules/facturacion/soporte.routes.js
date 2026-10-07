@@ -5,7 +5,8 @@ import { authRequired, requireRole } from '../../middleware/auth.js';
 import { storage } from '../../services/storage.service.js';
 import { numeroCompleto } from './emision.service.js';
 import {
-  corregirSoporte, crearDesdePrecuenta, eliminarSoporte, emitirSoporte, listarPorGenerar, listarSoportes, obtenerSoporte, reconciliarSoporte,
+  CAUSALES_NOTA_AJUSTE, corregirSoporte, crearDesdePrecuenta, crearNotaAjuste, eliminarSoporte, emitirSoporte, listarPorGenerar,
+  listarSoportes, obtenerSoporte, reconciliarSoporte,
 } from './soporte.service.js';
 
 /**
@@ -26,8 +27,13 @@ const uuid = (v, nombre = 'id') => {
 };
 
 router.get('/', LEER, asyncHandler(async (req, res) => {
-  res.json({ data: await listarSoportes({ estado: req.query.estado, periodo: req.query.periodo }) });
+  res.json({ data: await listarSoportes({ estado: req.query.estado, periodo: req.query.periodo, tipo: req.query.tipo || undefined }) });
 }));
+
+// A4-03 · Motivos DIAN de la nota de ajuste (para el selector de la pantalla).
+router.get('/notas/causales', LEER, (_req, res) => {
+  res.json({ data: Object.entries(CAUSALES_NOTA_AJUSTE).map(([codigo, nombre]) => ({ codigo, nombre })) });
+});
 
 // Cuentas de cobro aceptadas que todavía no tienen documento soporte.
 router.get('/por-generar', LEER, asyncHandler(async (_req, res) => {
@@ -53,7 +59,7 @@ router.post('/:id/emitir', OPERAR, asyncHandler(async (req, res) => {
   if (r?.pendiente) return res.status(202).json({ message: r.aviso, data: r });
   const mensaje = r.estado === 'RECHAZADO'
     ? 'La DIAN rechazó el documento soporte. Revise el motivo, corrija y vuelva a emitir.'
-    : `Documento soporte validado: ${numeroCompleto(r.prefijo, r.numero) ?? ''}.`;
+    : `${r.tipo === 'NOTA_AJUSTE_DS' ? 'Nota de ajuste' : 'Documento soporte'} validado: ${numeroCompleto(r.prefijo, r.numero) ?? ''}.`;
   res.json({ message: mensaje, data: r });
 }));
 
@@ -61,6 +67,19 @@ router.post('/:id/consultar-estado', OPERAR, asyncHandler(async (req, res) => {
   const r = await reconciliarSoporte(uuid(req.params.id), req.user.sub);
   if (r?.pendiente) return res.status(202).json({ message: 'Sigue en proceso; inténtelo de nuevo en unos minutos.', data: r });
   res.json({ message: r.estado === 'RECHAZADO' ? 'La DIAN rechazó el documento soporte.' : 'Documento soporte validado.', data: r });
+}));
+
+/**
+ * A4-03 · Nota de ajuste (en BORRADOR) sobre un documento soporte VALIDADO. Cuerpo:
+ * { causal: '1'..'5', lineas?: [{ item_id, cantidad }], observaciones? }. Sin
+ * `lineas`, o con la causal 2 (anulación), ajusta el documento completo.
+ */
+router.post('/:id/nota-ajuste', OPERAR, asyncHandler(async (req, res) => {
+  const b = req.body || {};
+  if (b.lineas != null && !Array.isArray(b.lineas)) throw badRequest('"lineas" debe ser una lista.');
+  const lineas = (b.lineas ?? []).map((l) => ({ item_id: uuid(l?.item_id, 'item_id'), cantidad: Number(l?.cantidad) }));
+  const data = await crearNotaAjuste(uuid(req.params.id), { causal: b.causal, lineas, observaciones: b.observaciones ?? null }, req.user.sub);
+  res.status(201).json({ message: 'Nota de ajuste creada en borrador.', data });
 }));
 
 router.post('/:id/corregir', OPERAR, asyncHandler(async (req, res) => {

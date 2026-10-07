@@ -14,7 +14,9 @@
 // Uso: node --import tsx scripts/verificar-documento-soporte.mjs [--conservar]
 import { pool } from '../src/config/db.js';
 import { esSandbox } from '../src/modules/facturacion/adaptadores/factus.cliente.js';
-import { crearDesdePrecuenta, emitirSoporte, eliminarSoporte, listarSoportes } from '../src/modules/facturacion/soporte.service.js';
+import {
+  crearDesdePrecuenta, crearNotaAjuste, emitirSoporte, eliminarSoporte, listarPorGenerar, listarSoportes, obtenerSoporte,
+} from '../src/modules/facturacion/soporte.service.js';
 import { storage } from '../src/services/storage.service.js';
 import { contabilizarEn } from '../src/modules/contabilidad/contabilizacion.service.js';
 import { crearEgreso } from '../src/modules/cartera/pagos.service.js';
@@ -148,11 +150,50 @@ try {
     await eliminarSoporte(borrador.id);
     ok(false, 'un DS validado no se elimina');
   } catch (e) { ok(e.statusCode === 409, 'un DS validado no se elimina'); }
+
+  // 8 · A4-03 · Nota de ajuste de anulación, emitida en el sandbox.
+  try {
+    await crearNotaAjuste(borrador.id, { causal: '9' }, admin.id);
+    ok(false, 'motivo inválido rechazado');
+  } catch (e) { ok(e.statusCode === 400, 'motivo inválido rechazado'); }
+  const nota = await crearNotaAjuste(borrador.id, { causal: '2' }, admin.id);
+  sembrado.nota = nota.id;
+  ok(nota.tipo === 'NOTA_AJUSTE_DS' && Number(nota.total_a_pagar) === 455000 && nota.items.length === 3,
+    `nota de ajuste en borrador ${nota.reference_code} por ${nota.total_a_pagar}`);
+  const notaEmitida = await emitirSoporte(nota.id, admin.id);
+  ok(notaEmitida.estado === 'VALIDADO' && notaEmitida.cufe, `nota emitida: ${notaEmitida.estado} ${notaEmitida.numero ?? ''}`);
+  if (notaEmitida.estado !== 'VALIDADO') console.log('   motivo:', JSON.stringify(notaEmitida.errores ?? notaEmitida));
+  ok(Boolean(notaEmitida.pdf_path) && Boolean(notaEmitida.xml_path), 'la nota tiene PDF y XML');
+  const dsAnulado = await obtenerSoporte(borrador.id);
+  ok(dsAnulado.estado === 'ANULADO', `el DS queda ${dsAnulado.estado}`);
+  const libre = (await listarPorGenerar()).some((c) => c.precuenta_id === sembrado.precuenta);
+  ok(libre, 'la cuenta de cobro vuelve a «Por generar»');
+
+  // 9 · Contabilización de DS + nota con ROLLBACK: la nota deja la cuenta por pagar en cero.
+  const c2 = await pool.connect();
+  try {
+    await c2.query('BEGIN');
+    await contabilizarEn(c2, borrador.id, admin.id);
+    const compNa = await contabilizarEn(c2, nota.id, admin.id);
+    const movs = (await c2.query(
+      `SELECT c.codigo, m.debito, m.credito FROM sst.movimientos m JOIN sst.cuentas_contables c ON c.id = m.cuenta_id
+        WHERE m.comprobante_id = $1`, [compNa.id],
+    )).rows;
+    console.log('   asiento NA:', movs.map((m) => `${m.codigo} ${Number(m.debito) ? 'D ' + m.debito : 'C ' + m.credito}`).join(' | '));
+    ok(String(compNa.numero_completo ?? '').startsWith('NA'), `comprobante ${compNa.numero_completo}`);
+    ok(movs.some((m) => m.codigo === '23352501' && Number(m.debito) === 455000), 'la nota debita honorarios por pagar');
+    const saldo = (await c2.query(`SELECT saldo FROM sst.cartera_documentos WHERE documento_id = $1`, [borrador.id])).rows[0]?.saldo;
+    ok(Number(saldo) === 0, `la cuenta por pagar del DS queda en ${saldo}`);
+  } finally {
+    await c2.query('ROLLBACK');
+    c2.release();
+  }
 } finally {
   if (sembrado.reglaApagada) await q(`UPDATE sst.reglas_contables SET activa = true WHERE id = $1`, [sembrado.reglaApagada]);
   if (conservar) {
     console.log(`\nConservado para verlo en pantalla (precuenta ${sembrado.precuenta}).`);
   } else {
+    if (sembrado.nota) await q(`DELETE FROM sst.documentos_electronicos WHERE id = $1`, [sembrado.nota]);
     if (sembrado.documento) await q(`DELETE FROM sst.documentos_electronicos WHERE id = $1`, [sembrado.documento]);
     if (sembrado.profesional) await q(`DELETE FROM sst.profesionales WHERE id = $1`, [sembrado.profesional]); // la cuenta cae en cascada
     if (sembrado.tercero) await q(`DELETE FROM sst.terceros WHERE id = $1`, [sembrado.tercero]);

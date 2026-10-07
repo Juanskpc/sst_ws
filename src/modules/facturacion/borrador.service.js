@@ -422,7 +422,7 @@ export async function listarBorradores({ estado = 'BORRADOR', arlId, pagadorTerc
  */
 export async function obtenerBorrador(id, client = pool) {
   // A2-01 · el mismo detalle sirve para la nota crédito y (A4-01) el documento soporte.
-  const doc = (await client.query(`SELECT ${DOCUMENTO_SELECT}, d.respuesta_proveedor ${DOCUMENTO_FROM} WHERE d.id = $1 AND d.tipo IN ('FACTURA', 'NOTA_CREDITO', 'DOC_SOPORTE')`, [id])).rows[0];
+  const doc = (await client.query(`SELECT ${DOCUMENTO_SELECT}, d.respuesta_proveedor ${DOCUMENTO_FROM} WHERE d.id = $1 AND d.tipo IN ('FACTURA', 'NOTA_CREDITO', 'DOC_SOPORTE', 'NOTA_AJUSTE_DS')`, [id])).rows[0];
   if (!doc) throw notFound('Ese documento no existe.');
 
   // A1-07 · la línea de tiempo del documento: propios de Orbita (CREADO,

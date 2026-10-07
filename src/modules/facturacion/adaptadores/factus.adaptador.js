@@ -435,6 +435,98 @@ export class FactusAdaptador extends PuertoFacturacionElectronica {
     return { base64 };
   }
 
+  // ─── A4-03 · Nota de ajuste al documento soporte ──────────────────────────
+  // POST /v2/adjustment-notes/validate con el mismo cuerpo del DS más
+  // `support_document_number` y `correction_concept_code` (1 devolución parcial,
+  // 2 anulación, 3 rebaja, 4 ajuste de precio, 5 otros). Probado en sandbox el
+  // 7-oct-2026 (`scripts/factus-probar-nota-ajuste.mjs`): validó NA140; la
+  // respuesta trae `number` con el prefijo, `cuds` y `support_document`.
+
+  /** @param {object} datos los de `emitirDocumentoSoporte` + `numeroDocumentoSoporte` y `conceptoCorreccion`. */
+  async emitirNotaAjusteSoporte(datos) {
+    const p = datos.proveedor;
+    const juridica = p.tipoPersona !== 'NATURAL';
+    const cuerpo = {
+      reference_code: datos.referenceCode,
+      numbering_range_id: datos.numberingRangeId || undefined,
+      support_document_number: datos.numeroDocumentoSoporte,
+      correction_concept_code: String(datos.conceptoCorreccion),
+      observation: datos.observacion ? String(datos.observacion).slice(0, 500) : undefined,
+      payment_details: [{
+        payment_form: datos.formaPagoCodigo || '2',
+        payment_method_code: datos.medioPagoCodigo || 'ZZZ',
+        amount: datos.montoAPagar,
+        ...(String(datos.formaPagoCodigo || '2') === '2' ? { due_date: datos.fechaVencimiento || hoyCO() } : {}),
+      }],
+      provider: {
+        identification_document_code: '31',
+        identification: String(p.nit).replace(/\D/g, ''),
+        dv: p.dv != null ? String(p.dv) : undefined,
+        legal_organization_code: juridica ? '1' : '2',
+        names: p.razonSocial,
+        ...(juridica ? { company: p.razonSocial } : {}),
+        address: p.direccion,
+        country_code: 'CO',
+        municipality_code: p.municipioDane || undefined,
+        email: p.email || undefined,
+        phone: p.telefono || undefined,
+      },
+      items: datos.items.map((it) => ({
+        code_reference: it.codigo || 'HON',
+        name: it.descripcion,
+        quantity: dosDec(it.cantidad),
+        discount_rate: '0.00',
+        price: dosDec(it.valorUnitario),
+        unit_measure_code: '94',
+        standard_code: '999',
+        taxes: [{ code: '01', rate: '0.00', is_excluded: true }],
+      })),
+    };
+    const r = await request('POST', '/v2/adjustment-notes/validate', cuerpo);
+    const na = r.data?.adjustment_note || r.data || {};
+    const { rechazos, avisos } = clasificarErrores(na.errors);
+    return {
+      referenceCode: datos.referenceCode,
+      numeroDocumento: na.number || null,
+      validado: Boolean(na.is_validated),
+      cufe: na.cuds || na.cude || null,
+      urlPublica: na.links?.qr || na.links?.public_url || null,
+      totales: { total: na.totals?.total ?? null },
+      eventos: { rechazos, avisos },
+      respuestaCruda: r,
+    };
+  }
+
+  async consultarNotaAjusteSoporte(numeroDocumento) {
+    if (!numeroDocumento) {
+      return { estado: 'SIN_NUMERO', detalle: 'Todavía sin número asignado: reintente con la misma referencia.' };
+    }
+    const r = await request('GET', `/v2/adjustment-notes/${encodeURIComponent(numeroDocumento)}`);
+    const na = r.data?.adjustment_note || r.data || {};
+    const { rechazos } = clasificarErrores(na.errors);
+    return {
+      estado: rechazos.length ? 'RECHAZADO' : na.is_validated ? 'VALIDADO' : 'ENVIANDO',
+      detalle: rechazos.map(([, v]) => v).join('; ') || undefined,
+      cufe: na.cuds || na.cude || null,
+      urlPublica: na.links?.qr || na.links?.public_url || null,
+      respuestaCruda: r,
+    };
+  }
+
+  async descargarPdfNotaAjusteSoporte(numeroDocumento) {
+    const r = await request('GET', `/v2/adjustment-notes/${encodeURIComponent(numeroDocumento)}/download-pdf`);
+    const base64 = r.data?.pdf_base_64_encoded;
+    if (!base64) throw new Error(`El proveedor tecnológico no devolvió el PDF de ${numeroDocumento}`);
+    return { base64 };
+  }
+
+  async descargarXmlNotaAjusteSoporte(numeroDocumento) {
+    const r = await request('GET', `/v2/adjustment-notes/${encodeURIComponent(numeroDocumento)}/download-xml`);
+    const base64 = r.data?.xml_base_64_encoded;
+    if (!base64) throw new Error(`El proveedor tecnológico no devolvió el XML de ${numeroDocumento}`);
+    return { base64 };
+  }
+
   async descargarXmlDocumentoSoporte(numeroDocumento) {
     const r = await request('GET', `/v2/support-documents/${encodeURIComponent(numeroDocumento)}/download-xml`);
     const base64 = r.data?.xml_base_64_encoded;

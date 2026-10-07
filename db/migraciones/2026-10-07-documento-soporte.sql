@@ -32,6 +32,12 @@ ALTER TABLE sst.reglas_contables ADD CONSTRAINT reglas_contables_concepto_check 
   'CP_CXP', 'CP_CXP_HONORARIOS', 'CP_IVA_DESCONTABLE', 'CE_ANTICIPO',
   'DS_COSTO', 'DS_CXP'));
 
+-- A4-03 · La nota de ajuste baja la cuenta por pagar de su documento soporte,
+-- igual que la nota crédito baja la cuenta por cobrar de su factura.
+ALTER TABLE sst.cartera_aplicaciones DROP CONSTRAINT IF EXISTS cartera_aplicaciones_origen_tipo_check;
+ALTER TABLE sst.cartera_aplicaciones ADD CONSTRAINT cartera_aplicaciones_origen_tipo_check
+  CHECK (origen_tipo IN ('NOTA_CREDITO', 'RECIBO_CAJA', 'EGRESO', 'NOTA_AJUSTE'));
+
 -- Pantalla «Documentos soporte»: el mismo reparto que Facturación.
 INSERT INTO sst.permisos_rol (rol, vista, permitido) VALUES
   ('admin',          'documentos_soporte', TRUE),

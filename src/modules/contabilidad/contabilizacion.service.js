@@ -29,7 +29,7 @@ import { abrirCarteraDeFactura, aplicarNotaCredito, sincronizarCartera } from '.
  * pendiente con su motivo y se reintenta desde Contabilidad.
  */
 
-const PREFIJO_CONCEPTO = { FACTURA: 'FV', NOTA_CREDITO: 'NC', DOC_SOPORTE: 'DS' };
+const PREFIJO_CONCEPTO = { FACTURA: 'FV', NOTA_CREDITO: 'NC', DOC_SOPORTE: 'DS', NOTA_AJUSTE_DS: 'NA' };
 
 /** Número de pantalla (Factus ya trae el prefijo pegado; no se duplica). */
 function numeroDocumento(d) {
@@ -73,7 +73,7 @@ export async function construirAsiento(documentoId, db = pool) {
   if (!d) throw notFound('Ese documento no existe.');
   const pre = PREFIJO_CONCEPTO[d.tipo];
   if (!pre) throw badRequest('Ese tipo de documento no se contabiliza todavía.');
-  if (d.tipo === 'DOC_SOPORTE') return asientoSoporte(d, db);
+  if (d.tipo === 'DOC_SOPORTE' || d.tipo === 'NOTA_AJUSTE_DS') return asientoSoporte(d, db);
   const esNota = d.tipo === 'NOTA_CREDITO';
 
   const items = (await db.query(
@@ -158,8 +158,11 @@ export async function construirAsiento(documentoId, db = pool) {
  *   C  Honorarios por pagar al asesor (DS_CXP), por el total.
  *
  * Sin retención: el DS de la cuenta de cobro no la lleva (supuesto a confirmar).
+ *
+ * A4-03 · La nota de ajuste (NA) es el espejo: D honorarios por pagar / C costo.
  */
 async function asientoSoporte(d, db) {
+  const esNota = d.tipo === 'NOTA_AJUSTE_DS';
   const items = (await db.query(
     `SELECT i.id, i.descripcion, i.total_linea, i.cuenta_costo_id,
             COALESCE(a.tercero_id, o.pagador_tercero_id) AS pagador_tercero_id,
@@ -190,8 +193,8 @@ async function asientoSoporte(d, db) {
   const lineas = items.map((it) => ({
     cuenta_id: costoDe(it),
     tercero_id: d.tercero_id,
-    debito: deCentavos(aCentavos(it.total_linea)),
-    credito: null,
+    debito: esNota ? null : deCentavos(aCentavos(it.total_linea)),
+    credito: esNota ? deCentavos(aCentavos(it.total_linea)) : null,
     base: null,
     descripcion: String(it.descripcion).slice(0, 500),
     documento_cruce: numero,
@@ -200,23 +203,23 @@ async function asientoSoporte(d, db) {
   lineas.push({
     cuenta_id: cuenta('DS_CXP'),
     tercero_id: d.tercero_id,
-    debito: null,
-    credito: deCentavos(aCentavos(d.total_a_pagar)),
+    debito: esNota ? deCentavos(aCentavos(d.total_a_pagar)) : null,
+    credito: esNota ? null : deCentavos(aCentavos(d.total_a_pagar)),
     base: null,
     descripcion: null,
     documento_cruce: numero,
     documento_cruce_id: d.id,
   });
   const debitos = lineas.reduce((s, l) => s + (l.debito ? aCentavos(l.debito) : 0), 0);
-  const creditos = aCentavos(d.total_a_pagar);
+  const creditos = lineas.reduce((s, l) => s + (l.credito ? aCentavos(l.credito) : 0), 0);
   if (debitos !== creditos) {
     throw badRequest(`El asiento de ${numero} no cuadra (débitos ${deCentavos(debitos)}, créditos ${deCentavos(creditos)}): revise los totales del documento.`);
   }
   return {
     documento: { id: d.id, tipo: d.tipo, estado: d.estado, numero, tercero_nombre: d.tercero_nombre },
-    tipo_comprobante: 'DS',
+    tipo_comprobante: esNota ? 'NA' : 'DS',
     fecha: d.fecha,
-    descripcion: `Documento soporte ${numero} · ${d.tercero_nombre}`,
+    descripcion: `${esNota ? 'Nota de ajuste' : 'Documento soporte'} ${numero} · ${d.tercero_nombre}`,
     lineas,
     totales: { debito: deCentavos(debitos), credito: deCentavos(creditos) },
   };
@@ -274,6 +277,9 @@ export async function contabilizarEn(client, documentoId, usuarioId = null) {
     // se paga con un comprobante de egreso, como cualquier compra a crédito.
     const cxp = a.lineas[a.lineas.length - 1]?.credito ? a.lineas[a.lineas.length - 1].cuenta_id : null;
     if (cxp) await abrirCarteraDeFactura(client, documentoId, cxp, 'CXP');
+  } else if (d.tipo === 'NOTA_AJUSTE_DS') {
+    // A4-03 · La nota baja la cuenta por pagar de su documento soporte.
+    await aplicarNotaCredito(client, documentoId, 'NOTA_AJUSTE');
   }
   return comp;
 }
@@ -312,7 +318,7 @@ export async function listarPendientes(db = pool) {
             d.total_a_pagar, d.contabilizacion_error,
             COALESCE(t.razon_social, NULLIF(btrim(concat_ws(' ', t.nombres, t.apellidos)), '')) AS tercero_nombre
        FROM sst.documentos_electronicos d JOIN sst.terceros t ON t.id = d.tercero_id
-      WHERE d.tipo IN ('FACTURA', 'NOTA_CREDITO', 'DOC_SOPORTE') AND d.estado IN ('VALIDADO', 'ANULADO') AND d.comprobante_id IS NULL
+      WHERE d.tipo IN ('FACTURA', 'NOTA_CREDITO', 'DOC_SOPORTE', 'NOTA_AJUSTE_DS') AND d.estado IN ('VALIDADO', 'ANULADO') AND d.comprobante_id IS NULL
       ORDER BY d.fecha_emision NULLS LAST, d.creado_en`,
   );
   return r.rows.map((x) => ({ ...x, numero_completo: numeroDocumento(x) }));

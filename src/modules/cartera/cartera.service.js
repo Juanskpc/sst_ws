@@ -53,7 +53,9 @@ export async function abrirCarteraDeFactura(client, documentoId, cuentaId, tipo 
  * mismo que su asiento abonó a clientes. Si la factura todavía no tiene cartera
  * (no se ha contabilizado), falla: la nota espera a su factura.
  */
-export async function aplicarNotaCredito(client, notaId) {
+export async function aplicarNotaCredito(client, notaId, origenTipo = 'NOTA_CREDITO') {
+  // A4-03 · La nota de ajuste hace lo mismo sobre la cuenta por pagar de su DS.
+  const quien = origenTipo === 'NOTA_AJUSTE' ? 'el documento soporte' : 'la factura';
   const n = (await client.query(
     `SELECT id, documento_referencia_id, total_a_pagar, prefijo, numero,
             to_char(COALESCE(fecha_emision, creado_en::date), 'YYYY-MM-DD') AS fecha
@@ -62,21 +64,21 @@ export async function aplicarNotaCredito(client, notaId) {
   )).rows[0];
   if (!n?.documento_referencia_id || aCentavos(n.total_a_pagar) <= 0) return;
   const ya = await client.query(
-    `SELECT 1 FROM sst.cartera_aplicaciones WHERE origen_tipo = 'NOTA_CREDITO' AND origen_id = $1 AND NOT anulada`, [notaId],
+    `SELECT 1 FROM sst.cartera_aplicaciones WHERE origen_tipo = $2 AND origen_id = $1 AND NOT anulada`, [notaId, origenTipo],
   );
   if (ya.rows[0]) return;
   const cxc = (await client.query(
     `SELECT id, saldo FROM sst.cartera_documentos WHERE documento_id = $1 FOR UPDATE`, [n.documento_referencia_id],
   )).rows[0];
-  if (!cxc) throw badRequest(`La factura que corrige la nota ${numeroDocumento(n)} aún no está contabilizada: contabilícela primero.`);
+  if (!cxc) throw badRequest(`${quien === 'la factura' ? 'La factura' : 'El documento soporte'} que corrige la nota ${numeroDocumento(n)} aún no está contabilizado: contabilícelo primero.`);
   const valor = aCentavos(n.total_a_pagar);
   if (valor > aCentavos(cxc.saldo)) {
-    throw badRequest(`La nota ${numeroDocumento(n)} (${deCentavos(valor)}) supera el saldo pendiente de su factura (${cxc.saldo}): ya se recibió un pago que habría que anular primero.`);
+    throw badRequest(`La nota ${numeroDocumento(n)} (${deCentavos(valor)}) supera el saldo pendiente de ${quien} (${cxc.saldo}): ya hay un pago que habría que anular primero.`);
   }
   await client.query(
     `INSERT INTO sst.cartera_aplicaciones (cartera_documento_id, origen_tipo, origen_id, fecha, valor_pagado)
-     VALUES ($1, 'NOTA_CREDITO', $2, $3, $4)`,
-    [cxc.id, notaId, n.fecha, deCentavos(valor)],
+     VALUES ($1, $5, $2, $3, $4)`,
+    [cxc.id, notaId, n.fecha, deCentavos(valor), origenTipo],
   );
   await client.query(`UPDATE sst.cartera_documentos SET saldo = saldo - $2 WHERE id = $1`, [cxc.id, deCentavos(valor)]);
 }

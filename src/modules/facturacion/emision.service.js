@@ -50,7 +50,7 @@ export async function cargarDocumentoParaEmitir(id, client, tipo = 'FACTURA') {
     [id, tipo],
   )).rows[0];
   if (!doc) {
-    const nombre = { FACTURA: 'Esa factura', NOTA_CREDITO: 'Esa nota crédito', DOC_SOPORTE: 'Ese documento soporte' }[tipo] ?? 'Ese documento';
+    const nombre = { FACTURA: 'Esa factura', NOTA_CREDITO: 'Esa nota crédito', DOC_SOPORTE: 'Ese documento soporte', NOTA_AJUSTE_DS: 'Esa nota de ajuste' }[tipo] ?? 'Ese documento';
     throw notFound(`${nombre} no existe.`);
   }
 
