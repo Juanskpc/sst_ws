@@ -255,6 +255,9 @@ router.get('/usuarios', authRequired, requireMaestro, asyncHandler(async (_req, 
 }));
 
 // Actualización de datos básicos (nombre, correo, teléfono, especialidad, rol)
+// y, desde el 7-oct-2026, del DOCUMENTO: un número mal digitado al crear la
+// cuenta dejaba a la persona entrando con una cédula que no es la suya, y la
+// única salida era borrar el usuario. La contraseña NO cambia con el documento.
 router.put('/usuarios/:id', authRequired, requireMaestro, asyncHandler(async (req, res) => {
   const actual = (await pool.query(`SELECT * FROM sst.usuarios WHERE id=$1`, [req.params.id])).rows[0];
   if (!actual) throw notFound('Usuario no encontrado');
@@ -273,6 +276,23 @@ router.put('/usuarios/:id', authRequired, requireMaestro, asyncHandler(async (re
     ? null
     : validarTextoOpcional(req.body.especialidad, 'La especialidad');
   if (actual.es_maestro && rol && rol !== 'admin') throw badRequest('El Administrador Maestro debe conservar rol admin');
+  const documentoBruto = req.body?.documento ?? req.body?.documento_identidad;
+  const documento = documentoBruto === undefined || documentoBruto === null || String(documentoBruto).trim() === ''
+    ? null
+    : validarDocumento(documentoBruto);
+  if (documento && claveDocumento(documento) !== claveDocumento(actual.documento_identidad)) {
+    // Mismo criterio que al crear: también atrapa el documento escrito con puntos.
+    const dup = await pool.query(
+      `SELECT nombre FROM sst.usuarios
+        WHERE id <> $2
+          AND upper(regexp_replace(coalesce(documento_identidad,''), '[^0-9A-Za-z]', '', 'g')) = $1
+        LIMIT 1`,
+      [claveDocumento(documento), actual.id]
+    );
+    if (dup.rows[0]) {
+      throw conflict(`El documento ${documento} ya está registrado a nombre de ${dup.rows[0].nombre}.`);
+    }
+  }
   const r = await pool.query(
     `UPDATE sst.usuarios
         SET nombre = COALESCE($2, nombre),
@@ -280,13 +300,17 @@ router.put('/usuarios/:id', authRequired, requireMaestro, asyncHandler(async (re
             telefono = COALESCE($4, telefono),
             especialidad = COALESCE($5, especialidad),
             rol = COALESCE($6, rol),
+            documento_identidad = COALESCE($7, documento_identidad),
             actualizado_en = now()
       WHERE id = $1 RETURNING *`,
-    [actual.id, nombre, correo, telefono, especialidad, rol]
+    [actual.id, nombre, correo, telefono, especialidad, rol, documento]
   );
   await auditar({
     usuarioId: req.user.sub, correo: req.user.correo, evento: EVENTOS.USUARIO_ACTUALIZADO, exito: true, req,
-    datos: { usuario_editado_id: actual.id },
+    datos: {
+      usuario_editado_id: actual.id,
+      ...(documento && documento !== actual.documento_identidad ? { documento_cambiado: true } : {}),
+    },
   });
   res.json({ usuario: usuarioPublico(r.rows[0]) });
 }));

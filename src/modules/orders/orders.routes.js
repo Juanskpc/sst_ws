@@ -6,6 +6,7 @@ import { authRequired, requireRole } from '../../middleware/auth.js';
 import { badRequest } from '../../utils/httpError.js';
 import {
   getOrderExpanded, changeStatus, generateOrderDocuments, profesionalDeUsuario, coasesoresDeOrden,
+  asesoresSinEntregar,
 } from './orders.service.js';
 import { randomToken } from '../../utils/security.js';
 import { env } from '../../config/env.js';
@@ -163,7 +164,10 @@ function fechaCO(valor) {
   return fechaHoraCO(valor);
 }
 
-const FRANJA_COLS = `id, orden_id,
+// 7-oct-2026 · `profesional_id` dice de QUIÉN es la franja cuando la orden la
+// ejecutan varios asesores, cada uno con su horario. NULL = del asesor principal
+// (`ordenes_servicio.profesional_asignado_id`), que es el caso de siempre.
+const FRANJA_COLS = `id, orden_id, profesional_id,
   to_char(fecha, 'YYYY-MM-DD') AS fecha,
   to_char(hora_inicio, 'HH24:MI') AS hora_inicio,
   to_char(hora_fin, 'HH24:MI')    AS hora_fin`;
@@ -172,9 +176,10 @@ const FRANJA_COLS = `id, orden_id,
  * ASG-02 · Valida y ordena las franjas de una visita.
  *
  * Una visita se puede partir (mañana y tarde, o varios días), pero dos franjas
- * de la MISMA orden no pueden solaparse: sería pedirle al profesional estar dos
- * veces en el mismo rato. Tocarse en el borde (08:00–12:00 y 12:00–16:00) sí
- * vale. Devuelve [] si no se mandó nada: asignar sin fecha sigue permitido.
+ * del MISMO asesor no pueden solaparse: sería pedirle estar dos veces en el
+ * mismo rato. Tocarse en el borde (08:00–12:00 y 12:00–16:00) sí vale. Dos
+ * asesores distintos sí pueden coincidir: van juntos a la misma sesión.
+ * Devuelve [] si no se mandó nada: asignar sin fecha sigue permitido.
  */
 function normalizarFranjas(entrada) {
   if (!Array.isArray(entrada)) return [];
@@ -186,18 +191,22 @@ function normalizarFranjas(entrada) {
       throw badRequest(`Franja ${i + 1}: se esperaba fecha (YYYY-MM-DD) y horas (HH:MM).`);
     }
     if (fin <= ini) throw badRequest(`Franja ${i + 1} (${fecha}): la hora de fin debe ser mayor que la de inicio.`);
-    return { fecha, hora_inicio: ini, hora_fin: fin };
+    const profesional_id = String(f?.profesional_id ?? '').trim() || null;
+    return { fecha, hora_inicio: ini, hora_fin: fin, profesional_id };
   });
 
   franjas.sort((a, b) => (a.fecha + a.hora_inicio).localeCompare(b.fecha + b.hora_inicio));
-  for (let i = 1; i < franjas.length; i++) {
-    const prev = franjas[i - 1];
-    const act = franjas[i];
-    if (prev.fecha === act.fecha && act.hora_inicio < prev.hora_fin) {
+  // La última franja de cada asesor en cada día: contra ella se compara la siguiente.
+  const ultima = new Map();
+  for (const act of franjas) {
+    const clave = `${act.profesional_id ?? ''}|${act.fecha}`;
+    const prev = ultima.get(clave);
+    if (prev && act.hora_inicio < prev.hora_fin) {
       throw badRequest(
         `Las franjas del ${act.fecha} se cruzan (${prev.hora_inicio}–${prev.hora_fin} y ${act.hora_inicio}–${act.hora_fin}).`
       );
     }
+    if (!prev || act.hora_fin > prev.hora_fin) ultima.set(clave, act);
   }
   return franjas;
 }
@@ -347,6 +356,8 @@ router.get('/mias', asyncHandler(async (req, res) => {
                      ) ORDER BY s.subido_en DESC)
                 FROM sst.archivos_soporte s
                WHERE s.orden_id = o.id
+                 -- 7-oct-2026 · Solo los SUYOS (NULL = los del asesor principal).
+                 AND COALESCE(s.profesional_id, o.profesional_asignado_id) = $1
             ), '[]'::json) AS soportes,
             -- ASG-02 · Las franjas de la visita: al profesional le sirve más
             -- "jueves de 8 a 12 y viernes de 8 a 12" que un único instante.
@@ -359,6 +370,9 @@ router.get('/mias', asyncHandler(async (req, res) => {
                      ) ORDER BY v.fecha, v.hora_inicio)
                 FROM sst.franjas_visita v
                WHERE v.orden_id = o.id
+                 -- 7-oct-2026 · Solo las SUYAS: con varios asesores cada uno
+                 -- tiene su horario (NULL = las del asesor principal).
+                 AND COALESCE(v.profesional_id, o.profesional_asignado_id) = $1
             ), '[]'::json) AS franjas
        FROM sst.vw_ordenes_expandidas o
       WHERE (o.profesional_asignado_id = $1
@@ -676,8 +690,16 @@ router.get('/:id', asyncHandler(async (req, res) => {
        LEFT JOIN sst.usuarios u ON u.id = h.cambiado_por
        WHERE h.orden_id=$1 ORDER BY h.cambiado_en`, [req.params.id]),
     pool.query(`SELECT * FROM sst.documentos_generados WHERE orden_id=$1 ORDER BY generado_en`, [req.params.id]),
-    pool.query(`SELECT * FROM sst.archivos_soporte WHERE orden_id=$1 ORDER BY subido_en`, [req.params.id]),
-    pool.query(`SELECT * FROM sst.enlaces_publicos WHERE orden_id=$1 AND activo ORDER BY creado_en DESC LIMIT 1`, [req.params.id]),
+    // 7-oct-2026 · Con el asesor que subió cada uno (NULL = el principal).
+    pool.query(
+      `SELECT s.*, COALESCE(s.profesional_id, o.profesional_asignado_id) AS de_profesional_id,
+              p.nombre AS profesional_nombre
+         FROM sst.archivos_soporte s
+         JOIN sst.ordenes_servicio o ON o.id = s.orden_id
+         LEFT JOIN sst.profesionales p ON p.id = COALESCE(s.profesional_id, o.profesional_asignado_id)
+        WHERE s.orden_id=$1 ORDER BY s.subido_en`, [req.params.id]),
+    // El enlace que se enseña en la ficha es el del asesor principal.
+    pool.query(`SELECT * FROM sst.enlaces_publicos WHERE orden_id=$1 AND activo AND profesional_id IS NULL ORDER BY creado_en DESC LIMIT 1`, [req.params.id]),
     franjasDeOrden(req.params.id),
     // El eje de cobro lleva su propio historial, aparte del de estados: son dos
     // líneas de tiempo distintas sobre la misma orden y mezclarlas haría ilegible
@@ -1034,7 +1056,8 @@ router.post('/:id/assign/preview', requireRole('admin'), asyncHandler(async (req
     const esPdf = /\.pdf$/i.test(d._filename || '');
     formatos.push({
       clave: d._clave,
-      etiqueta: d._etiqueta || d.tipo,
+      // Con varios asesores cada uno lleva su juego: se dice de quién es.
+      etiqueta: (d._etiqueta || d.tipo) + (d._profesionalNombre ? ` · ${d._profesionalNombre}` : ''),
       nombre: d._filename,
       prediligenciado: d._prediligenciado !== false,
       admite_observaciones: !!d._admiteObservaciones,
@@ -1091,7 +1114,10 @@ async function aplicarAsignacion(req, client, { vistaPrevia = false } = {}) {
   // días). `fecha_programada` sigue siendo el INICIO de la primera: de ella
   // cuelgan el periodo de la cuenta de cobro, los reportes y el orden de
   // los listados, así que se deriva aquí en vez de confiar en el cliente.
-  const franjas = normalizarFranjas(req.body?.franjas);
+  // 7-oct-2026 · Con varios asesores cada franja dice de quién es; las del
+  // principal se guardan con NULL para que sigan siendo suyas si él cambia.
+  const franjas = normalizarFranjas(req.body?.franjas)
+    .map((f) => (f.profesional_id === profesionalId ? { ...f, profesional_id: null } : f));
   const fechaProgramada = franjas.length
     ? instanteCO(franjas[0].fecha, franjas[0].hora_inicio)
     : req.body?.fecha_programada || req.body?.scheduled_at || null;
@@ -1176,8 +1202,9 @@ async function aplicarAsignacion(req, client, { vistaPrevia = false } = {}) {
     ]
   );
 
-  // 5-oct-2026 · Asesores adicionales: van a la MISMA visita (mismas franjas) y
-  // cada uno cobra sus horas. Se reemplazan en bloque cuando el cliente manda la
+  // 5-oct-2026 · Asesores adicionales: cada uno cobra sus horas. Desde el
+  // 7-oct-2026 cada uno tiene además SU horario (franjas propias), que puede
+  // coincidir con el de los demás o no. Se reemplazan en bloque cuando el cliente manda la
   // lista; si no la manda se conservan, pero se vuelven a validar contra el
   // principal de hoy (cambiar de principal a quien ya iba de coasesor lo dejaría
   // dos veces en la misma orden).
@@ -1201,6 +1228,19 @@ async function aplicarAsignacion(req, client, { vistaPrevia = false } = {}) {
     const co = (await client.query(`SELECT * FROM sst.profesionales WHERE id=$1`, [c.profesional_id])).rows[0];
     if (!co) throw badRequest('El asesor adicional no existe.');
     if (co.estado !== 'Activo') throw badRequest(`${co.nombre} está Inactivo y no se le puede asignar la orden.`);
+    // 7-oct-2026 · Sus horas son las que tiene marcadas en la agenda: un asesor
+    // con horas pero sin horario no sabría cuándo ir, y uno con más agenda que
+    // horas cobraría menos de lo que trabaja.
+    if (franjas.length) {
+      const suyas = franjas.filter((f) => f.profesional_id === c.profesional_id);
+      if (!suyas.length) throw badRequest(`Falta marcar en la agenda las horas de ${co.nombre}.`);
+      if (minutosDeFranjas(suyas) !== Math.round(c.horas * 60)) {
+        throw badRequest(
+          `${co.nombre} tiene ${horasTexto(minutosDeFranjas(suyas) / 60)} h en la agenda y ` +
+          `${horasTexto(c.horas)} h asignadas: deben coincidir.`
+        );
+      }
+    }
     // Mismo criterio que el principal: su valor hora de HOY, congelado.
     const tarifaCo = await valorHoraDeOrden({ ordenId: req.params.id, profesional: co }, client);
     await client.query(
@@ -1215,18 +1255,27 @@ async function aplicarAsignacion(req, client, { vistaPrevia = false } = {}) {
   // decidir toda la visita, y conservar las viejas dejaría horas fantasma en
   // la agenda del profesional. Solo se tocan si el cliente mandó franjas, para
   // no borrar las de una asignación que solo cambia de profesional.
-  let franjasPrevias = 0;
+  // `franjasPrevias`: cuántas tenía CADA asesor, para cancelarle en el calendario
+  // las invitaciones que sobren (las de NULL eran del principal de antes).
+  const franjasPrevias = {};
   if (franjas.length) {
+    const ajena = franjas.find(
+      (f) => f.profesional_id && !coasesores.some((c) => c.profesional_id === f.profesional_id),
+    );
+    if (ajena) throw badRequest('Hay franjas de un asesor que no está asignado a la orden.');
     const antes = await client.query(
-      `DELETE FROM sst.franjas_visita WHERE orden_id=$1 RETURNING id`,
+      `DELETE FROM sst.franjas_visita WHERE orden_id=$1 RETURNING profesional_id`,
       [req.params.id]
     );
-    franjasPrevias = antes.rowCount;
+    for (const f of antes.rows) {
+      const de = f.profesional_id ?? actual.rows[0].profesional_asignado_id ?? profesionalId;
+      franjasPrevias[de] = (franjasPrevias[de] ?? 0) + 1;
+    }
     for (const f of franjas) {
       await client.query(
-        `INSERT INTO sst.franjas_visita (orden_id, fecha, hora_inicio, hora_fin, creado_por)
-         VALUES ($1,$2,$3,$4,$5)`,
-        [req.params.id, f.fecha, f.hora_inicio, f.hora_fin, req.user.sub]
+        `INSERT INTO sst.franjas_visita (orden_id, profesional_id, fecha, hora_inicio, hora_fin, creado_por)
+         VALUES ($1,$2,$3,$4,$5,$6)`,
+        [req.params.id, f.profesional_id, f.fecha, f.hora_inicio, f.hora_fin, req.user.sub]
       );
     }
   }
@@ -1304,7 +1353,8 @@ async function aplicarAsignacion(req, client, { vistaPrevia = false } = {}) {
   // Enlace público de soportes (M6). Al reprogramar se conserva el enlace
   // vigente: emitir uno nuevo invalidaría el que ya se le envió al profesional.
   const vigente = await client.query(
-    `SELECT token FROM sst.enlaces_publicos WHERE orden_id=$1 AND activo ORDER BY creado_en DESC LIMIT 1`,
+    `SELECT token FROM sst.enlaces_publicos
+      WHERE orden_id=$1 AND activo AND profesional_id IS NULL ORDER BY creado_en DESC LIMIT 1`,
     [req.params.id]
   );
   let token = vigente.rows[0]?.token;
@@ -1315,10 +1365,35 @@ async function aplicarAsignacion(req, client, { vistaPrevia = false } = {}) {
       [req.params.id, token]
     );
   }
+  // 7-oct-2026 · Y uno por cada asesor adicional: todos suben SUS soportes. El
+  // que ya tenía enlace lo conserva; el de quien salió del equipo se cierra.
+  const tokens = {};
+  const equipoIds = (await coasesoresDeOrden(req.params.id, client)).map((c) => c.profesional_id);
+  await client.query(
+    `UPDATE sst.enlaces_publicos SET activo = false
+      WHERE orden_id=$1 AND profesional_id IS NOT NULL AND NOT (profesional_id = ANY($2::uuid[]))`,
+    [req.params.id, equipoIds]
+  );
+  for (const id of equipoIds) {
+    const suyo = await client.query(
+      `UPDATE sst.enlaces_publicos SET activo = true
+        WHERE id = (SELECT id FROM sst.enlaces_publicos
+                     WHERE orden_id=$1 AND profesional_id=$2 ORDER BY creado_en DESC LIMIT 1)
+        RETURNING token`,
+      [req.params.id, id]
+    );
+    tokens[id] = suyo.rows[0]?.token ?? randomToken(24);
+    if (!suyo.rows[0]) {
+      await client.query(
+        `INSERT INTO sst.enlaces_publicos (orden_id, token, profesional_id) VALUES ($1,$2,$3)`,
+        [req.params.id, tokens[id], id]
+      );
+    }
+  }
 
   const orden = await getOrderExpanded(req.params.id, client);
   return {
-    orden, profesional: prof.rows[0], docs, token, esReprogramacion, completa, entrega,
+    orden, profesional: prof.rows[0], docs, token, tokens, esReprogramacion, completa, entrega,
     formatosProf,
     secuenciaCalendario: guardada.rows[0].secuencia_calendario,
     franjas: await franjasDeOrden(req.params.id, client),
@@ -1364,23 +1439,30 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
   // el administrador creería que no se asignó y lo intentaría de nuevo. Se
   // responde 200 avisando que el envío quedó pendiente.
   const supportUrl = `${env.publicAppUrl}/soporte?token=${result.token}`;
+  const urlSoportesPrincipal = supportUrl;
   const fecha = fechaCO(result.orden.fecha_programada);
 
   // ASG-05 · Invitaciones de calendario, UNA POR FRANJA. Arreglo vacío si la OS
   // se asignó sin fecha, que está permitido: se puede decidir el profesional
   // antes que el día.
-  const invitacionesPara = (profesional) => adjuntosInvitacion(construirInvitaciones({
+  // 7-oct-2026 · Las franjas de CADA asesor: las de NULL son del principal.
+  const franjasDe = (profesionalId) => result.franjas.filter(
+    (f) => (f.profesional_id ?? result.profesional.id) === profesionalId,
+  );
+  const invitacionesPara = (profesional, principal) => adjuntosInvitacion(construirInvitaciones({
     orden: result.orden,
     profesional,
     organizador: { nombre: req.user.nombre, correo: req.user.correo },
     secuencia: result.secuenciaCalendario,
-    franjas: result.franjas,
-    previas: result.franjasPrevias,
+    franjas: franjasDe(profesional.id),
+    previas: result.franjasPrevias[profesional.id] ?? 0,
+    // El administrador va en copia de todos: sin esto las invitaciones de dos
+    // asesores compartirían UID y en su calendario una pisaría a la otra.
+    sufijoUid: principal ? '' : `-${String(profesional.id).slice(0, 8)}`,
   }));
 
   const o = result.orden;
   const esRepro = result.esReprogramacion;
-  const varias = result.franjas.length > 1;
   const lugar = [o.direccion, o.ciudad_ejecucion].filter(Boolean).join(', ');
   const contacto = [o.contacto_sst_nombre, o.contacto_sst_telefono].filter(Boolean).join(' · ');
   // A3-01 · Una orden particular no lleva formatos A PROPÓSITO: no se anuncia
@@ -1404,31 +1486,39 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
   // observaciones y firmas— como si todas las órdenes llevaran lo mismo. Una
   // asistencia técnica de Bolívar lleva un PDF y un informe en Word, y de ese
   // segundo no se imprime nada. Se enumera lo que de verdad viaja.
-  const adjuntos = [];
-  for (const d of result.docs) {
-    const etiqueta = d._etiqueta || d.tipo;
-    const ya = adjuntos.find((a) => a.etiqueta === etiqueta);
-    // Los de alcance 'sesion' salen repetidos, uno por franja: se cuentan en
-    // vez de repetir la misma línea tres veces.
-    if (ya) ya.copias += 1;
-    else adjuntos.push({ etiqueta, copias: 1, prediligenciado: d._prediligenciado !== false });
-  }
-  const listaAdjuntos = adjuntos.map(
-    (a) => (a.copias > 1 ? `${a.etiqueta} · ${a.copias} juegos, uno por franja` : a.etiqueta),
+  // 7-oct-2026 · Con varios asesores cada uno recibe SU juego (su horario y sus
+  // horas): los documentos traen `_profesionalId`; los que no, son de todos.
+  const docsDe = (profesionalId) => result.docs.filter(
+    (d) => !d._profesionalId || d._profesionalId === profesionalId,
   );
-  const hayPrediligenciados = adjuntos.some((a) => a.prediligenciado);
-  const hayTalCual = adjuntos.some((a) => !a.prediligenciado);
-  // Cada frase solo aparece si le corresponde un adjunto de esa clase.
-  const queHacerConEllos = [
-    hayPrediligenciados
-      ? `Los formatos en PDF van ya diligenciados con los datos de esta orden: imprímelos y ` +
-        `completa en la sesión lo que falta (asistentes, temas desarrollados, observaciones y firmas).`
-      : null,
-    hayTalCual
-      ? `Los documentos de Word, Excel o PowerPoint no se pueden prediligenciar: los redactas tú ` +
-        `con los datos de esta orden.`
-      : null,
-  ].filter(Boolean);
+  const adjuntosDe = (docs) => {
+    const adjuntos = [];
+    for (const d of docs) {
+      const etiqueta = d._etiqueta || d.tipo;
+      const ya = adjuntos.find((a) => a.etiqueta === etiqueta);
+      // Los de alcance 'sesion' salen repetidos, uno por franja: se cuentan en
+      // vez de repetir la misma línea tres veces.
+      if (ya) ya.copias += 1;
+      else adjuntos.push({ etiqueta, copias: 1, prediligenciado: d._prediligenciado !== false });
+    }
+    const listaAdjuntos = adjuntos.map(
+      (a) => (a.copias > 1 ? `${a.etiqueta} · ${a.copias} juegos, uno por franja` : a.etiqueta),
+    );
+    const hayPrediligenciados = adjuntos.some((a) => a.prediligenciado);
+    const hayTalCual = adjuntos.some((a) => !a.prediligenciado);
+    // Cada frase solo aparece si le corresponde un adjunto de esa clase.
+    const queHacerConEllos = [
+      hayPrediligenciados
+        ? `Los formatos en PDF van ya diligenciados con los datos de esta orden: imprímelos y ` +
+          `completa en la sesión lo que falta (asistentes, temas desarrollados, observaciones y firmas).`
+        : null,
+      hayTalCual
+        ? `Los documentos de Word, Excel o PowerPoint no se pueden prediligenciar: los redactas tú ` +
+          `con los datos de esta orden.`
+        : null,
+    ].filter(Boolean);
+    return { listaAdjuntos, queHacerConEllos };
+  };
   // Los viáticos se dicen ANTES de la visita: el profesional decide cómo viaja
   // con ese dato, y descubrirlos al recibir la cuenta de cobro llega tarde.
   // Con la categoría delante: "Transporte intermunicipal · $45.000" dice qué se
@@ -1460,13 +1550,24 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
 
   /** `dest`: a quién se le escribe, cuántas horas son suyas y si es el principal. */
   const enviarCorreoA = async (dest) => {
-    const invitaciones = invitacionesPara(dest.profesional);
+    const invitaciones = invitacionesPara(dest.profesional, dest.principal);
+    // 7-oct-2026 · Cada asesor sube SUS soportes, por su propio enlace.
+    const supportUrl = dest.principal
+      ? urlSoportesPrincipal
+      : `${env.publicAppUrl}/soporte?token=${result.tokens[dest.profesional.id]}`;
+    // Su horario, sus documentos y la fecha de SU primera franja.
+    const suyas = franjasDe(dest.profesional.id);
+    const varias = suyas.length > 1;
+    const fechaDest = suyas.length ? fechaCO(instanteCO(suyas[0].fecha, suyas[0].hora_inicio)) : fecha;
+    const docsDest = docsDe(dest.profesional.id);
+    const { listaAdjuntos, queHacerConEllos } = adjuntosDe(docsDest);
     const horasDest = equipo.length ? horasTexto(dest.horas) : horasTexto(o.horas_asignadas);
     const notaEquipo = equipo.length
-      ? `Esta orden la ejecutan varios asesores en las mismas fechas y horarios. ` +
-        `De las ${horasTexto(o.horas_asignadas)} h de la orden, a usted le corresponden ${horasTexto(dest.horas)} h. ` +
-        `Va con: ${companeros(dest.profesional.id).join(', ')}.` +
-        (dest.principal ? '' : ` Los soportes firmados los sube ${result.profesional.nombre}, asesor principal de la orden.`)
+      ? `Esta orden la ejecutan varios asesores, cada uno con su horario y sus horas. ` +
+        `De las ${horasTexto(o.horas_asignadas)} h de la orden, a usted le corresponden ${horasTexto(dest.horas)} h, ` +
+        `en el horario que aparece en este correo. ` +
+        `Va con: ${companeros(dest.profesional.id).join(', ')}. ` +
+        `Cada asesor sube sus propios soportes, por el enlace de su correo.`
       : null;
     await sendEmail({
       to: dest.profesional.correo,
@@ -1486,8 +1587,8 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
         // Con la visita partida, una sola "fecha programada" se queda corta: lo
         // que el profesional necesita saber es cada franja.
         (varias
-          ? `La visita se realiza en ${result.franjas.length} franjas:\n${franjasEnTexto(result.franjas)}\n`
-          : `Fecha programada: ${fecha}\n`) +
+          ? `La visita se realiza en ${suyas.length} franjas:\n${franjasEnTexto(suyas)}\n`
+          : `Fecha programada: ${fechaDest}\n`) +
         `Horas: ${horasDest}\n` +
         (notaEquipo ? `${notaEquipo}\n` : '') +
         (lugar ? `Lugar: ${lugar}\n` : '') +
@@ -1505,10 +1606,8 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
         // La lista concreta, también en texto plano. Estaba calculada y no se
         // imprimía: quien lee el correo en texto solo veía «los soportes
         // firmados», que es justo lo que este bloque vino a quitar.
-        (dest.principal
-          ? (queDevolver ? `Al terminar tendrás que subir: ${queDevolver}.\n` : '') +
-            `Enlace para subir los soportes (sin login):\n${supportUrl}\n`
-          : '') +
+        (queDevolver ? `Al terminar tendrás que subir: ${queDevolver}.\n` : '') +
+        `Enlace para subir los soportes (sin login):\n${supportUrl}\n` +
         (invitaciones.length
           ? `\nAdjuntamos ${invitaciones.length === 1 ? 'la invitación' : `${invitaciones.length} invitaciones`} para tu calendario.\n`
           : ''),
@@ -1539,8 +1638,8 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
           // Con una sola franja el bloque igual se usa: es donde el ojo va a
           // buscar el cuándo, y mantenerlo evita dos maquetas distintas.
           bloqueLista(
-            varias ? `La visita se realiza en ${result.franjas.length} franjas` : 'Fecha de la visita',
-            result.franjas.length ? result.franjas.map(franjaEnTexto) : [fecha],
+            varias ? `La visita se realiza en ${suyas.length} franjas` : 'Fecha de la visita',
+            suyas.length ? suyas.map(franjaEnTexto) : [fechaDest],
           ),
           particular ? '' : sinFormatos
             ? bloqueAviso(
@@ -1561,23 +1660,19 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
           result.entrega.nota ? bloqueAviso(result.entrega.nota) : '',
           // Lo que tendrá que devolver, ANTES de ir a la visita: descubrir en el
           // portal que hacía falta una firma más obliga a volver a la empresa.
-          dest.principal && result.entrega.soportes.length
+          result.entrega.soportes.length
             ? bloqueLista(
                 'Al terminar tendrás que subir',
                 result.entrega.soportes.map((c) => etiquetaCategoria(c) + (esOpcional(c) ? ' (opcional)' : '')),
               )
             : '',
-          ...(dest.principal
-            ? [
-                parrafo('Cuando termines la visita, sube los soportes firmados desde aquí (no necesitas iniciar sesión):'),
-                boton('Subir soportes firmados', supportUrl),
-                enlaceCrudo(supportUrl),
-              ]
-            : []),
+          parrafo('Cuando termines la visita, sube los soportes firmados desde aquí (no necesitas iniciar sesión):'),
+          boton('Subir soportes firmados', supportUrl),
+          enlaceCrudo(supportUrl),
         ].join(''),
       }),
       attachments: [
-        ...result.docs.map((d) => ({ filename: d._filename, content: d._buffer })),
+        ...docsDest.map((d) => ({ filename: d._filename, content: d._buffer })),
         ...invitaciones,
       ],
     });
@@ -1685,15 +1780,35 @@ router.get('/:id/documents', asyncHandler(async (req, res) => {
  * profesional los fue eligiendo en el móvil y no le sirve a quien revisa.
  */
 router.get('/:id/supports', asyncHandler(async (req, res) => {
+  // 7-oct-2026 · Con varios asesores cada uno sube lo suyo: los archivos traen
+  // de quién son y salen agrupados por asesor (el principal primero).
   const r = await pool.query(
-    `SELECT * FROM sst.archivos_soporte WHERE orden_id=$1
-      ORDER BY CASE categoria
+    `SELECT s.*, COALESCE(s.profesional_id, o.profesional_asignado_id) AS de_profesional_id,
+              p.nombre AS profesional_nombre
+         FROM sst.archivos_soporte s
+         JOIN sst.ordenes_servicio o ON o.id = s.orden_id
+         LEFT JOIN sst.profesionales p ON p.id = COALESCE(s.profesional_id, o.profesional_asignado_id)
+        WHERE s.orden_id=$1
+      ORDER BY (s.profesional_id IS NOT NULL), p.nombre,
+               CASE s.categoria
                  WHEN 'acta' THEN 1 WHEN 'asistencia' THEN 2 WHEN 'evidencias' THEN 3
                  WHEN 'informe' THEN 4
                  ELSE 9 END,
-               subido_en`,
+               s.subido_en`,
     [req.params.id]
   );
+  const principal = (await pool.query(
+    `SELECT o.profesional_asignado_id AS profesional_id, p.nombre
+       FROM sst.ordenes_servicio o LEFT JOIN sst.profesionales p ON p.id = o.profesional_asignado_id
+      WHERE o.id=$1`, [req.params.id]
+  )).rows[0];
+  const sinEntregar = new Set((await asesoresSinEntregar(req.params.id)).map((x) => x.profesional_id));
+  const equipo = principal?.profesional_id
+    ? [
+        { profesional_id: principal.profesional_id, nombre: principal.nombre, principal: true },
+        ...(await coasesoresDeOrden(req.params.id)).map((x) => ({ profesional_id: x.profesional_id, nombre: x.nombre, principal: false })),
+      ].map((m) => ({ ...m, entregado: !sinEntregar.has(m.profesional_id) }))
+    : [];
   // SUP · Las casillas que se le pidieron a ESTA orden viajan con los archivos.
   //
   // Quien revisa las necesita para dos cosas: saber que falta algo que no está
@@ -1703,7 +1818,7 @@ router.get('/:id/supports', asyncHandler(async (req, res) => {
   const req_ = await pool.query(
     `SELECT soportes_requeridos FROM sst.ordenes_servicio WHERE id=$1`, [req.params.id]
   );
-  res.json({ data: r.rows, casillas: casillasDeOrden(req_.rows[0]?.soportes_requeridos) });
+  res.json({ data: r.rows, casillas: casillasDeOrden(req_.rows[0]?.soportes_requeridos), equipo });
 }));
 
 /**
@@ -1800,16 +1915,29 @@ router.post('/:id/reject', requireRole('admin'), asyncHandler(async (req, res) =
       .rows[0]?.soportes_requeridos,
   ).map((c) => c.clave);
 
+  // 7-oct-2026 · Y A QUIÉN. Con varios asesores cada uno sube lo suyo, así que el
+  // rechazo dice de quién es cada documento: `devueltos: [{ categoria,
+  // profesional_id }]`. `categorias` (el cuerpo de antes) se entiende como del
+  // asesor principal.
+  const previa = (await pool.query(
+    `SELECT profesional_asignado_id FROM sst.ordenes_servicio WHERE id=$1`, [req.params.id]
+  )).rows[0];
+  if (!previa) throw badRequest('OS no encontrada');
+  const principalId = previa.profesional_asignado_id;
+  const adicionales = await coasesoresDeOrden(req.params.id);
+
+  const devueltosBruto = Array.isArray(req.body?.devueltos) ? req.body.devueltos : null;
   const pedidas = Array.isArray(req.body?.categorias) ? req.body.categorias : null;
-  let categorias;
-  if (pedidas) {
-    const invalidas = pedidas.filter((c) => !esCategoriaValida(c));
+  let lista;
+  if (devueltosBruto || pedidas) {
+    lista = devueltosBruto
+      ? devueltosBruto.map((d) => ({ categoria: d?.categoria, profesional_id: String(d?.profesional_id ?? '').trim() || null }))
+      : pedidas.map((c) => ({ categoria: c, profesional_id: null }));
+    const invalidas = lista.filter((d) => !esCategoriaValida(d.categoria)).map((d) => d.categoria);
     if (invalidas.length) throw badRequest(`Documento desconocido: ${invalidas.join(', ')}.`);
-    categorias = [...new Set(pedidas.map((c) => normalizarCategoria(c)))];
-    if (!categorias.length) {
-      throw badRequest('Marque al menos un documento para devolver al profesional.');
-    }
-    const ajenas = categorias.filter((c) => !suyas.includes(c));
+    lista = lista.map((d) => ({ ...d, categoria: normalizarCategoria(d.categoria) }));
+    if (!lista.length) throw badRequest('Marque al menos un documento para devolver al profesional.');
+    const ajenas = [...new Set(lista.map((d) => d.categoria).filter((c) => !suyas.includes(c)))];
     if (ajenas.length) {
       throw badRequest(
         `A esta orden no se le pidió ${listaEtiquetas(ajenas)}, así que no se puede devolver. ` +
@@ -1817,18 +1945,29 @@ router.post('/:id/reject', requireRole('admin'), asyncHandler(async (req, res) =
       );
     }
   } else {
+    // Sin lista (cliente antiguo): se devuelve lo que cada uno tiene subido.
     const conArchivo = (await pool.query(
-      `SELECT DISTINCT COALESCE(categoria,'otros') AS categoria
+      `SELECT DISTINCT COALESCE(categoria,'otros') AS categoria, profesional_id
          FROM sst.archivos_soporte WHERE orden_id=$1`, [req.params.id]
-    )).rows.map((r) => normalizarCategoria(r.categoria));
-    categorias = conArchivo.length ? conArchivo : suyas;
+    )).rows.map((r) => ({ categoria: normalizarCategoria(r.categoria), profesional_id: r.profesional_id }));
+    lista = conArchivo.length ? conArchivo : suyas.map((c) => ({ categoria: c, profesional_id: null }));
   }
-  const listaDocs = listaEtiquetas(categorias);
+  // Por asesor ('' = el principal).
+  const porAsesor = new Map();
+  for (const d of lista) {
+    const de = !d.profesional_id || d.profesional_id === principalId ? '' : d.profesional_id;
+    if (de && !adicionales.some((c) => c.profesional_id === de)) {
+      throw badRequest('Se marcó un documento de un asesor que no está en esta orden.');
+    }
+    porAsesor.set(de, [...new Set([...(porAsesor.get(de) ?? []), d.categoria])]);
+  }
+  const categorias = [...new Set(lista.map((d) => d.categoria))];
+  const delPrincipal = porAsesor.get('') ?? [];
 
   const orden = await changeStatus({ orderId: req.params.id, newStatus: 'PROGRAMADA', userId: req.user.sub, motivo });
   // Reabrir enlace público para re-cargar soportes.
   await pool.query(`UPDATE sst.enlaces_publicos SET activo=true WHERE orden_id=$1`, [req.params.id]);
-  // Solo estas casillas quedan abiertas en el portal; las demás, bloqueadas.
+  // Solo estas casillas quedan abiertas en el portal de cada uno; las demás, bloqueadas.
   await pool.query(
     `UPDATE sst.ordenes_servicio
         SET soportes_rechazados     = $2,
@@ -1836,16 +1975,30 @@ router.post('/:id/reject', requireRole('admin'), asyncHandler(async (req, res) =
             soportes_rechazados_en  = now(),
             actualizado_en = now()
       WHERE id = $1`,
-    [req.params.id, categorias, motivo.trim()]
+    [req.params.id, delPrincipal.length ? delPrincipal : null, motivo.trim()]
   );
+  if (delPrincipal.length) {
+    await pool.query(
+      `UPDATE sst.enlaces_publicos SET entregado_en = NULL WHERE orden_id=$1 AND profesional_id IS NULL`,
+      [req.params.id]
+    );
+  }
+  for (const [de, suyasDevueltas] of porAsesor) {
+    if (!de) continue;
+    const upd = await pool.query(
+      `UPDATE sst.enlaces_publicos SET rechazados = $3, entregado_en = NULL, activo = true
+        WHERE orden_id=$1 AND profesional_id=$2`,
+      [req.params.id, de, suyasDevueltas]
+    );
+    if (!upd.rowCount) {
+      await pool.query(
+        `INSERT INTO sst.enlaces_publicos (orden_id, token, profesional_id, rechazados) VALUES ($1,$2,$3,$4)`,
+        [req.params.id, randomToken(24), de, suyasDevueltas]
+      );
+    }
+  }
 
   const expandida = await getOrderExpanded(req.params.id);
-  const prof = orden.profesional_asignado_id
-    ? (await pool.query(
-        `SELECT nombre, correo, usuario_id FROM sst.profesionales WHERE id=$1`,
-        [orden.profesional_asignado_id]
-      )).rows[0]
-    : null;
 
   // La campanita solo llega si la ficha del profesional está enlazada con una
   // cuenta de acceso, y muchas no lo están; además el profesional trabaja en
@@ -1853,89 +2006,98 @@ router.post('/:id/reject', requireRole('admin'), asyncHandler(async (req, res) =
   // quedarse semanas sin que se enterara nadie.
   let correoEnviado = false;
   let correoError = null;
-  if (prof?.correo) {
-    const enlace = await pool.query(
-      `SELECT token FROM sst.enlaces_publicos
-        WHERE orden_id=$1 AND activo ORDER BY creado_en DESC LIMIT 1`,
-      [req.params.id]
-    );
-    const token = enlace.rows[0]?.token;
-    const supportUrl = token ? `${env.publicAppUrl}/soporte?token=${token}` : null;
-    try {
-      await sendEmail({
-        to: prof.correo,
-        cc: req.user.correo || undefined,
-        subject: `Soportes devueltos · ${expandida.codigo} · ${expandida.empresa_nombre || ''}`,
-        text:
-          `Hola ${prof.nombre},\n\n` +
-          `Revisamos los soportes de la OS ${expandida.codigo} (${expandida.pagador_nombre ?? expandida.arl_nombre}) ` +
-          `para ${expandida.empresa_nombre} y hay algo que corregir:\n\n` +
-          `${motivo.trim()}\n\n` +
-          `Documento(s) por volver a subir: ${listaDocs}.\n` +
-          `Los demás quedaron aceptados: no hay que repetirlos.\n\n` +
-          `La orden vuelve a PROGRAMADA.\n` +
-          (supportUrl
-            ? `Sube los soportes corregidos por el mismo enlace (sin login):\n${supportUrl}\n`
-            : `Solicita un enlace nuevo al equipo administrativo para volver a subirlos.\n`),
-        html: correoHtml({
-          titulo: 'Soportes devueltos para corregir',
-          subtitulo: `${expandida.codigo} · ${expandida.empresa_nombre || ''}`,
-          pie: 'JD&D Consultores · Seguridad y Salud en el Trabajo',
-          cuerpo: [
-            parrafo(`Hola ${prof.nombre},`),
-            parrafo(
-              `Revisamos los soportes que enviaste y hay algo que corregir antes de poder ` +
-              `dar la visita por cerrada.`,
-            ),
-            // El motivo es lo único que el profesional necesita leer sí o sí:
-            // va destacado y con las palabras exactas del administrador.
-            bloqueAviso(motivo.trim()),
-            // Lo que hay que repetir va en la tabla, no diluido en el texto:
-            // es el dato que el profesional vuelve a mirar al abrir el correo.
-            tablaDatos([
-              filaDato('Orden', expandida.codigo),
-              filaDato(expandida.arl_id ? 'ARL' : 'Cliente', expandida.pagador_nombre ?? expandida.arl_nombre),
-              filaDato('Empresa', expandida.empresa_nombre),
-              filaDato('Por volver a subir', listaDocs),
-              filaDato('Estado', 'PROGRAMADA'),
-            ]),
-            parrafo(
-              'Los demás documentos quedaron aceptados. Al abrir el enlace solo ' +
-              'podrás reemplazar los que aparecen arriba: el archivo anterior de ' +
-              'cada uno se sustituye por el que subas.',
-            ),
-            supportUrl
-              ? parrafo('Sube los soportes corregidos desde aquí (no necesitas iniciar sesión):')
-              : parrafo(
-                  'Solicita un enlace nuevo al equipo administrativo para volver a subirlos.',
-                ),
-            supportUrl ? boton('Subir soportes corregidos', supportUrl) : '',
-            supportUrl ? enlaceCrudo(supportUrl) : '',
-          ].join(''),
-        }),
-      });
-      correoEnviado = true;
-    } catch (e) {
-      // El rechazo YA está guardado: si el correo falla no puede devolverse un
-      // error, o el administrador lo intentaría otra vez sobre una orden que ya
-      // volvió a PROGRAMADA.
-      correoError = e?.message || 'No fue posible entregar el correo.';
-      console.error('[reject] correo no enviado:', correoError);
+  // Se le escribe a CADA asesor al que se le devolvió algo, con su enlace y su lista.
+  for (const [de, suyasDevueltas] of porAsesor) {
+    const profId = de || principalId;
+    const prof = profId
+      ? (await pool.query(`SELECT nombre, correo, usuario_id FROM sst.profesionales WHERE id=$1`, [profId])).rows[0]
+      : null;
+    const listaDocs = listaEtiquetas(suyasDevueltas);
+    if (prof?.correo) {
+      const enlace = await pool.query(
+        `SELECT token FROM sst.enlaces_publicos
+          WHERE orden_id=$1 AND activo AND profesional_id IS NOT DISTINCT FROM $2
+          ORDER BY creado_en DESC LIMIT 1`,
+        [req.params.id, de || null]
+      );
+      const token = enlace.rows[0]?.token;
+      const supportUrl = token ? `${env.publicAppUrl}/soporte?token=${token}` : null;
+      try {
+        await sendEmail({
+          to: prof.correo,
+          cc: req.user.correo || undefined,
+          subject: `Soportes devueltos · ${expandida.codigo} · ${expandida.empresa_nombre || ''}`,
+          text:
+            `Hola ${prof.nombre},\n\n` +
+            `Revisamos los soportes de la OS ${expandida.codigo} (${expandida.pagador_nombre ?? expandida.arl_nombre}) ` +
+            `para ${expandida.empresa_nombre} y hay algo que corregir:\n\n` +
+            `${motivo.trim()}\n\n` +
+            `Documento(s) por volver a subir: ${listaDocs}.\n` +
+            `Los demás quedaron aceptados: no hay que repetirlos.\n\n` +
+            `La orden vuelve a PROGRAMADA.\n` +
+            (supportUrl
+              ? `Sube los soportes corregidos por el mismo enlace (sin login):\n${supportUrl}\n`
+              : `Solicita un enlace nuevo al equipo administrativo para volver a subirlos.\n`),
+          html: correoHtml({
+            titulo: 'Soportes devueltos para corregir',
+            subtitulo: `${expandida.codigo} · ${expandida.empresa_nombre || ''}`,
+            pie: 'JD&D Consultores · Seguridad y Salud en el Trabajo',
+            cuerpo: [
+              parrafo(`Hola ${prof.nombre},`),
+              parrafo(
+                `Revisamos los soportes que enviaste y hay algo que corregir antes de poder ` +
+                `dar la visita por cerrada.`,
+              ),
+              // El motivo es lo único que el profesional necesita leer sí o sí:
+              // va destacado y con las palabras exactas del administrador.
+              bloqueAviso(motivo.trim()),
+              // Lo que hay que repetir va en la tabla, no diluido en el texto:
+              // es el dato que el profesional vuelve a mirar al abrir el correo.
+              tablaDatos([
+                filaDato('Orden', expandida.codigo),
+                filaDato(expandida.arl_id ? 'ARL' : 'Cliente', expandida.pagador_nombre ?? expandida.arl_nombre),
+                filaDato('Empresa', expandida.empresa_nombre),
+                filaDato('Por volver a subir', listaDocs),
+                filaDato('Estado', 'PROGRAMADA'),
+              ]),
+              parrafo(
+                'Los demás documentos quedaron aceptados. Al abrir el enlace solo ' +
+                'podrás reemplazar los que aparecen arriba: el archivo anterior de ' +
+                'cada uno se sustituye por el que subas.',
+              ),
+              supportUrl
+                ? parrafo('Sube los soportes corregidos desde aquí (no necesitas iniciar sesión):')
+                : parrafo(
+                    'Solicita un enlace nuevo al equipo administrativo para volver a subirlos.',
+                  ),
+              supportUrl ? boton('Subir soportes corregidos', supportUrl) : '',
+              supportUrl ? enlaceCrudo(supportUrl) : '',
+            ].join(''),
+          }),
+        });
+        correoEnviado = true;
+      } catch (e) {
+        // El rechazo YA está guardado: si el correo falla no puede devolverse un
+        // error, o el administrador lo intentaría otra vez sobre una orden que ya
+        // volvió a PROGRAMADA.
+        correoError = `${prof.nombre}: ${e?.message || 'no fue posible entregar el correo.'}`;
+        console.error('[reject] correo no enviado:', correoError);
+      }
+    }
+
+    if (prof?.usuario_id) {
+      await notify({
+        userId: prof.usuario_id, tipo: 'RECHAZO', titulo: 'Soportes rechazados',
+        mensaje: motivo, datos: { orden_id: orden.id },
+      }).catch((e) => console.error('[reject] notificación interna no creada:', e?.message));
     }
   }
 
-  if (prof?.usuario_id) {
-    await notify({
-      userId: prof.usuario_id, tipo: 'RECHAZO', titulo: 'Soportes rechazados',
-      mensaje: motivo, datos: { orden_id: orden.id },
-    }).catch((e) => console.error('[reject] notificación interna no creada:', e?.message));
-  }
-
   res.json({
-    message: correoEnviado
+    message: correoEnviado && !correoError
       ? 'Soportes rechazados; la OS vuelve a PROGRAMADA y el profesional fue avisado por correo.'
       : 'Soportes rechazados; la OS vuelve a PROGRAMADA.',
-    correo_enviado: correoEnviado,
+    correo_enviado: correoEnviado && !correoError,
     correo_error: correoError,
     categorias_rechazadas: categorias,
     data: orden,

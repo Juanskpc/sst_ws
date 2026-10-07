@@ -6,6 +6,11 @@ import { storage } from '../../services/storage.service.js';
 import { correoHtml, parrafo, bloqueTotal, tablaDatos, filaDato } from '../../services/email-layout.service.js';
 import { enPesosCO } from '../../utils/formato.js';
 import { obtenerBorrador } from './borrador.service.js';
+import { readFile } from 'node:fs/promises';
+
+/** Copia de `public/logoFacturacion.png` del frontend: el backend no ve esa carpeta. */
+const LOGO_RUTA = new URL('../../../assets/correo/logoFacturacion.png', import.meta.url);
+const LOGO_CID = 'logo-jdd-facturacion';
 
 /**
  * A1-06 (FEL-16) · Envío de la factura al cliente. Dos canales, a propósito:
@@ -37,6 +42,9 @@ export async function reenviarAlCliente(documentoId, usuarioId, { correo } = {})
   if (!destino) throw badRequest('El tercero no tiene correo de facturación y no se indicó uno alterno.');
 
   const [pdf, xml] = await Promise.all([storage.get(doc.pdf_path), storage.get(doc.xml_path)]);
+  // 7-oct-2026 · Logo de JD&D en la cabecera del correo de la factura. Si el
+  // archivo faltara, el correo sale igual con la cabecera de texto.
+  const logo = await readFile(LOGO_RUTA).catch(() => null);
   const numeroCompleto = numeroDeDocumento(doc.prefijo, doc.numero) || doc.reference_code;
   const totalTexto = enPesosCO(doc.total_a_pagar);
 
@@ -58,6 +66,7 @@ export async function reenviarAlCliente(documentoId, usuarioId, { correo } = {})
       titulo: 'Factura electrónica',
       subtitulo: `${numeroCompleto} · ${doc.tercero_nombre}`,
       pie: 'JD&D Consultores · Seguridad y Salud en el Trabajo',
+      logoCid: logo ? LOGO_CID : null,
       cuerpo: [
         parrafo(`Estimado(a) ${doc.tercero_nombre},`),
         parrafo('Adjuntamos la factura electrónica, con su representación en PDF y el XML de la DIAN.'),
@@ -72,6 +81,9 @@ export async function reenviarAlCliente(documentoId, usuarioId, { correo } = {})
     attachments: [
       { filename: `${numeroCompleto}.pdf`, content: pdf },
       { filename: `${numeroCompleto}.xml`, content: xml },
+      // El logo va DENTRO del correo (cid) y no como enlace: así se ve sin que el
+      // cliente tenga que «mostrar imágenes».
+      ...(logo ? [{ filename: 'logo-jdd.png', content: logo, cid: LOGO_CID, contentDisposition: 'inline' }] : []),
     ],
   });
 

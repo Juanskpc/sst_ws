@@ -83,16 +83,18 @@ function fechaHoraCO(fecha, hora) {
  * @param {number} secuencia    Nº de revisión; sube en cada reprogramación.
  * @param {Array}  franjas      Franjas de la visita ([] = OS a la antigua).
  * @param {number} previas      Cuántas franjas tenía antes de reprogramar.
+ * @param {string} sufijoUid    Distingue las invitaciones de un asesor adicional
+ *                              de las del principal (misma orden, otro horario).
  * @returns {{contenido: string, nombre: string}[]}
  */
 export function construirInvitaciones({
-  orden, profesional, organizador, secuencia = 0, franjas = [], previas = 0,
+  orden, profesional, organizador, secuencia = 0, franjas = [], previas = 0, sufijoUid = '',
 }) {
   const tramos = Array.isArray(franjas) && franjas.length
     ? franjas.map((f, i) => ({
         inicio: fechaHoraCO(f.fecha, f.hora_inicio),
         fin: fechaHoraCO(f.fecha, f.hora_fin),
-        uid: `os-${orden.id}-${i + 1}@jdd-iacore`,
+        uid: `os-${orden.id}${sufijoUid}-${i + 1}@jdd-iacore`,
         etiqueta: franjas.length > 1 ? ` (${i + 1}/${franjas.length})` : '',
         cancelado: false,
       }))
@@ -108,7 +110,7 @@ export function construirInvitaciones({
     tramos.push({
       inicio,
       fin: new Date(inicio.getTime() + horas * 60 * 60 * 1000),
-      uid: `os-${orden.id}@jdd-iacore`,
+      uid: `os-${orden.id}${sufijoUid}@jdd-iacore`,
       etiqueta: '',
       cancelado: false,
     });
@@ -122,7 +124,7 @@ export function construirInvitaciones({
     tramos.push({
       inicio: ref.inicio,
       fin: ref.fin,
-      uid: `os-${orden.id}-${i + 1}@jdd-iacore`,
+      uid: `os-${orden.id}${sufijoUid}-${i + 1}@jdd-iacore`,
       etiqueta: ' (cancelada)',
       cancelado: true,
     });

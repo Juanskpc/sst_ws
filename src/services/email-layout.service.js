@@ -118,8 +118,20 @@ export function boton(texto, url) {
  * @param {string} subtitulo  Línea bajo el título, dentro de la cabecera azul.
  * @param {string} cuerpo     HTML ya compuesto con los helpers de arriba.
  * @param {string} pie        Nota final en gris pequeño.
+ * @param {string} logoCid    `cid` de un logo adjunto en línea; sin él, la cabecera azul de texto.
  */
-export function correoHtml({ titulo, subtitulo, cuerpo, pie }) {
+export function correoHtml({ titulo, subtitulo, cuerpo, pie, logoCid = null }) {
+  // 7-oct-2026 · La cabecera puede llevar un LOGO adjunto en el propio correo
+  // (`cid:`), que es la única imagen que los clientes de correo enseñan sin pedir
+  // permiso: una imagen remota la bloquean. Lo usa el correo de la factura.
+  const cabecera = logoCid
+    ? `<tr><td style="background:#ffffff;padding:20px 28px 16px">
+          <img src="cid:${esc(logoCid)}" alt="JD&amp;D Consultores" height="84" style="display:block;height:84px;width:auto;border:0;outline:none">
+        </td></tr>`
+    : `<tr><td style="background:${AZUL};padding:22px 28px">
+          <p style="margin:0;font:700 17px ${FUENTE};color:#ffffff;letter-spacing:-.01em">JD&amp;D Consultores</p>
+          <p style="margin:3px 0 0;font:400 12px ${FUENTE};color:#a9b6e8;letter-spacing:.04em">SEGURIDAD Y SALUD EN EL TRABAJO</p>
+        </td></tr>`;
   return `<!doctype html>
 <html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${esc(titulo)}</title></head>
@@ -129,10 +141,7 @@ export function correoHtml({ titulo, subtitulo, cuerpo, pie }) {
       <table role="presentation" cellpadding="0" cellspacing="0" width="600" style="width:100%;max-width:600px;background:#ffffff;border-radius:10px;overflow:hidden;border:1px solid ${BORDE}">
 
         <!-- Cabecera de marca -->
-        <tr><td style="background:${AZUL};padding:22px 28px">
-          <p style="margin:0;font:700 17px ${FUENTE};color:#ffffff;letter-spacing:-.01em">JD&amp;D Consultores</p>
-          <p style="margin:3px 0 0;font:400 12px ${FUENTE};color:#a9b6e8;letter-spacing:.04em">SEGURIDAD Y SALUD EN EL TRABAJO</p>
-        </td></tr>
+        ${cabecera}
 
         <tr><td style="height:3px;background:${AZUL_CLARO};font-size:0;line-height:0">&nbsp;</td></tr>
 

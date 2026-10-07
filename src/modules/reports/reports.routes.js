@@ -30,6 +30,116 @@ function aCelda(v) {
   return String(v);
 }
 
+/**
+ * 7-oct-2026 · Estadísticas del periodo (pantalla «Estadísticas», antes
+ * «Informes y resúmenes»): todo lo que pintan sus gráficas, en una sola consulta
+ * por bloque. El periodo se mide sobre la fecha en que la orden ENTRÓ al sistema
+ * (`fecha_carga`, en hora de Colombia): es la única fecha que toda orden tiene, y
+ * la que responde "cuánto trabajo llegó". El estado es el de HOY.
+ *
+ * La serie va por día si el rango es de hasta dos meses y por mes si es mayor:
+ * 365 puntos diarios no se leen, y un mes con 30 barras sí.
+ */
+router.get('/estadisticas', asyncHandler(async (req, res) => {
+  const esFecha = (v) => /^\d{4}-\d{2}-\d{2}$/.test(String(v ?? ''));
+  const { desde, hasta } = req.query;
+  if (!esFecha(desde) || !esFecha(hasta)) throw badRequest('Indique el rango como desde=YYYY-MM-DD&hasta=YYYY-MM-DD.');
+  if (desde > hasta) throw badRequest('La fecha inicial no puede ser posterior a la final.');
+  const dias = Math.round((Date.parse(hasta) - Date.parse(desde)) / 86400000) + 1;
+  if (dias > 366 * 3) throw badRequest('El rango máximo es de tres años.');
+  const grano = dias <= 62 ? 'day' : 'month';
+
+  // Fecha de entrada en hora de Colombia. `$1`/`$2` son siempre el rango.
+  const DIA = `(o.fecha_carga AT TIME ZONE 'America/Bogota')::date`;
+  const EN_RANGO = `${DIA} BETWEEN $1::date AND $2::date`;
+  const params = [desde, hasta];
+  const PAGADOR = `COALESCE(o.arl_nombre, 'Particulares')`;
+
+  const [kpis, serie, porArl, porEstado, porProfesional, porTipo, porCiudad, satisfaccion] = await Promise.all([
+    pool.query(
+      `SELECT count(*)::int                                                        AS ordenes,
+              COALESCE(sum(o.horas_asignadas), 0)::float                           AS horas,
+              count(*) FILTER (WHERE o.estado = 'FINALIZADA')::int                 AS finalizadas,
+              count(*) FILTER (WHERE o.estado = 'EJECUTADA')::int                  AS ejecutadas,
+              count(*) FILTER (WHERE o.estado = 'PROGRAMADA')::int                 AS programadas,
+              count(*) FILTER (WHERE o.estado = 'SIN PROGRAMAR')::int              AS sin_programar,
+              count(*) FILTER (WHERE o.fecha_vencimiento < CURRENT_DATE
+                                 AND o.estado NOT IN ('FINALIZADA', 'EJECUTADA'))::int AS vencidas,
+              count(DISTINCT COALESCE(o.empresa_id::text, o.empresa_nombre))::int  AS empresas,
+              count(DISTINCT o.profesional_asignado_id)::int                       AS profesionales,
+              COALESCE(sum(o.valor_total), 0)::float                               AS valor
+         FROM sst.vw_ordenes_expandidas o WHERE ${EN_RANGO}`, params),
+    pool.query(
+      `SELECT to_char(b.inicio, 'YYYY-MM-DD')                        AS inicio,
+              count(o.id)::int                                       AS ordenes,
+              COALESCE(sum(o.horas_asignadas), 0)::float             AS horas,
+              count(o.id) FILTER (WHERE o.estado = 'FINALIZADA')::int AS finalizadas
+         FROM generate_series(date_trunc('${grano}', $1::date), date_trunc('${grano}', $2::date), '1 ${grano}') AS b(inicio)
+         LEFT JOIN sst.vw_ordenes_expandidas o
+                ON date_trunc('${grano}', ${DIA}) = b.inicio AND ${EN_RANGO}
+        GROUP BY b.inicio ORDER BY b.inicio`, params),
+    pool.query(
+      `SELECT ${PAGADOR} AS arl, count(*)::int AS ordenes,
+              COALESCE(sum(o.horas_asignadas), 0)::float AS horas,
+              count(*) FILTER (WHERE o.estado = 'FINALIZADA')::int AS finalizadas
+         FROM sst.vw_ordenes_expandidas o WHERE ${EN_RANGO}
+        GROUP BY 1 ORDER BY ordenes DESC, 1`, params),
+    pool.query(
+      `SELECT o.estado::text AS estado, count(*)::int AS ordenes,
+              COALESCE(sum(o.horas_asignadas), 0)::float AS horas
+         FROM sst.vw_ordenes_expandidas o WHERE ${EN_RANGO}
+        GROUP BY 1`, params),
+    // Las horas de cada asesor son las SUYAS: en una orden con varios, el
+    // principal lleva las de la orden menos las de sus compañeros.
+    pool.query(
+      `WITH asignadas AS (
+         SELECT o.id, o.estado, o.profesional_asignado_id AS profesional_id,
+                GREATEST(COALESCE(o.horas_asignadas, 0)
+                  - COALESCE((SELECT sum(c.horas) FROM sst.orden_coasesores c WHERE c.orden_id = o.id), 0), 0) AS horas
+           FROM sst.vw_ordenes_expandidas o
+          WHERE ${EN_RANGO} AND o.profesional_asignado_id IS NOT NULL
+         UNION ALL
+         SELECT o.id, o.estado, c.profesional_id, c.horas
+           FROM sst.vw_ordenes_expandidas o JOIN sst.orden_coasesores c ON c.orden_id = o.id
+          WHERE ${EN_RANGO}
+       )
+       SELECT p.nombre AS profesional, count(DISTINCT a.id)::int AS ordenes,
+              COALESCE(sum(a.horas), 0)::float AS horas,
+              count(DISTINCT a.id) FILTER (WHERE a.estado = 'FINALIZADA')::int AS finalizadas
+         FROM asignadas a JOIN sst.profesionales p ON p.id = a.profesional_id
+        GROUP BY p.nombre ORDER BY horas DESC, ordenes DESC, 1`, params),
+    pool.query(
+      `SELECT COALESCE(o.tipo_orden, 'Sin tipo') AS tipo, count(*)::int AS ordenes,
+              COALESCE(sum(o.horas_asignadas), 0)::float AS horas
+         FROM sst.vw_ordenes_expandidas o WHERE ${EN_RANGO}
+        GROUP BY 1 ORDER BY ordenes DESC, 1`, params),
+    pool.query(
+      `SELECT COALESCE(NULLIF(btrim(upper(o.ciudad_ejecucion)), ''), 'SIN CIUDAD') AS ciudad,
+              count(*)::int AS ordenes, COALESCE(sum(o.horas_asignadas), 0)::float AS horas
+         FROM sst.vw_ordenes_expandidas o WHERE ${EN_RANGO}
+        GROUP BY 1 ORDER BY ordenes DESC, 1 LIMIT 8`, params),
+    // Encuestas de las órdenes del periodo que el cliente ya respondió.
+    pool.query(
+      `SELECT count(*)::int AS respuestas,
+              round(avg(e.satisfaccion)::numeric, 2)::float AS promedio
+         FROM sst.respuestas_encuesta e JOIN sst.vw_ordenes_expandidas o ON o.id = e.orden_id
+        WHERE ${EN_RANGO} AND e.satisfaccion IS NOT NULL`, params),
+  ]);
+
+  res.json({
+    data: {
+      desde, hasta, grano,
+      kpis: { ...kpis.rows[0], satisfaccion: satisfaccion.rows[0] },
+      serie: serie.rows,
+      por_arl: porArl.rows,
+      por_estado: porEstado.rows,
+      por_profesional: porProfesional.rows,
+      por_tipo: porTipo.rows,
+      por_ciudad: porCiudad.rows,
+    },
+  });
+}));
+
 // RPT-01/02 · KPIs del dashboard + distribución por ARL.
 router.get('/dashboard', asyncHandler(async (_req, res) => {
   // CFG-05 · Sin tareas programadas, el aviso del día de corte se materializa

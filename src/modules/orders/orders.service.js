@@ -34,6 +34,38 @@ export async function coasesoresDeOrden(ordenId, client = pool) {
 }
 
 /**
+ * 7-oct-2026 · Asesores de la orden que todavía NO han entregado sus soportes.
+ *
+ * Con varios asesores cada uno sube los suyos por su propio enlace
+ * (`enlaces_publicos.profesional_id`; NULL = el del principal), y la orden solo
+ * pasa a EJECUTADA cuando no falta ninguno. "Entregado" es tener el enlace con
+ * `entregado_en` y nada devuelto pendiente: lo devuelto al principal vive en la
+ * orden (`soportes_rechazados`); lo de los demás, en su enlace (`rechazados`).
+ */
+export async function asesoresSinEntregar(ordenId, client = pool) {
+  const r = await client.query(
+    `SELECT m.profesional_id, p.nombre, m.principal
+       FROM (
+         SELECT o.profesional_asignado_id AS profesional_id, true AS principal
+           FROM sst.ordenes_servicio o WHERE o.id = $1 AND o.profesional_asignado_id IS NOT NULL
+         UNION ALL
+         SELECT c.profesional_id, false FROM sst.orden_coasesores c WHERE c.orden_id = $1
+       ) m
+       JOIN sst.profesionales p ON p.id = m.profesional_id
+      WHERE NOT EXISTS (
+        SELECT 1 FROM sst.enlaces_publicos e
+         WHERE e.orden_id = $1 AND e.entregado_en IS NOT NULL
+           AND ((m.principal AND e.profesional_id IS NULL
+                 AND (SELECT soportes_rechazados FROM sst.ordenes_servicio WHERE id = $1) IS NULL)
+             OR (NOT m.principal AND e.profesional_id = m.profesional_id AND e.rechazados IS NULL))
+      )
+      ORDER BY m.principal DESC, p.nombre`,
+    [ordenId]
+  );
+  return r.rows;
+}
+
+/**
  * ASG-08 · Ficha de profesional que corresponde a una cuenta de acceso.
  *
  * Se resuelve primero por `usuario_id` —el enlace explícito, que es el que deja
@@ -129,6 +161,12 @@ async function aliadoEstrategico(client = pool) {
  * Las observaciones escritas en la vista previa llegan en
  * `ordenes_servicio.observaciones_formatos` (ya actualizada en la transacción).
  */
+/** "María Pérez Gómez" → "Maria-Perez-Gomez", apto para nombre de archivo. */
+function nombreDeArchivo(nombre) {
+  return String(nombre ?? '').normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^A-Za-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'asesor';
+}
+
 export async function generateOrderDocuments(orderId, client = pool, { guardar = true } = {}) {
   const order = await getOrderExpanded(orderId, client);
   // A3-01 · La orden de un cliente particular no lleva formatos: los que hay son
@@ -148,45 +186,78 @@ export async function generateOrderDocuments(orderId, client = pool, { guardar =
 
   // Se leen aquí y no se reciben por parámetro para que el formato salga con lo
   // que quedó guardado en esta misma transacción, no con lo que traía el body.
-  const franjas = (await client.query(
-    `SELECT fecha::text AS fecha, hora_inicio::text AS hora_inicio, hora_fin::text AS hora_fin
+  const todas = (await client.query(
+    `SELECT profesional_id, fecha::text AS fecha, hora_inicio::text AS hora_inicio, hora_fin::text AS hora_fin
        FROM sst.franjas_visita WHERE orden_id=$1 ORDER BY fecha, hora_inicio`,
     [orderId]
   )).rows;
 
-  const propios = tieneFormatosPropios(order.arl_nombre)
-    ? await generarFormatosArl({
-        orden: order, profesional: professional, franjas, aliado: await aliadoEstrategico(client),
-        original: await pdfOriginalDeColmena(orderId, order.arl_nombre, client),
-        observaciones: order.observaciones_formatos || {},
-        campos: order.campos_formatos || {},
-      })
-    : [];
+  // 7-oct-2026 · Varios asesores, cada uno con su horario: sale UN JUEGO POR
+  // ASESOR, con sus fechas y horas (las de sesión, una hoja por franja SUYA) y a
+  // su nombre. La excepción es la suplencia: si la orden lleva
+  // `profesional_formatos_id`, todos los juegos van a nombre del registrado ante
+  // la ARL, que es lo único que la ARL acepta. Con un solo asesor no cambia nada.
+  const coasesores = await coasesoresDeOrden(orderId, client);
+  const juegos = [];
+  if (!coasesores.length) {
+    juegos.push({ profesional: professional, franjas: todas, de: null });
+  } else {
+    const ejecutores = [
+      { id: order.profesional_asignado_id, nombre: order.profesional_nombre },
+      ...coasesores.map((c) => ({ id: c.profesional_id, nombre: c.nombre })),
+    ];
+    for (const e of ejecutores) {
+      const ficha = order.profesional_formatos_id
+        ? professional
+        : (await client.query(`SELECT * FROM sst.profesionales WHERE id=$1`, [e.id])).rows[0];
+      juegos.push({
+        profesional: ficha,
+        franjas: todas.filter((f) => (f.profesional_id ?? order.profesional_asignado_id) === e.id),
+        de: { id: e.id, nombre: e.nombre ?? ficha?.nombre ?? '' },
+      });
+    }
+  }
 
   const created = [];
 
-  for (const formato of propios) {
-    // `_clave` y `_admiteObservaciones` son para la vista previa: con qué clave
-    // se guardan las observaciones de este formato y si tiene dónde escribirlas.
-    const extra = {
-      _buffer: formato.buffer, _filename: formato.filename,
-      _etiqueta: formato.etiqueta, _prediligenciado: formato.prediligenciado,
-      _clave: formato.clave, _admiteObservaciones: !!formato.admiteObservaciones,
-      _editables: formato.editables || [],
-    };
-    if (!guardar) {
-      created.push({ tipo: formato.tipo, ...extra });
-      continue;
+  if (tieneFormatosPropios(order.arl_nombre)) {
+    const aliado = await aliadoEstrategico(client);
+    const original = await pdfOriginalDeColmena(orderId, order.arl_nombre, client);
+    for (const juego of juegos) {
+      const propios = await generarFormatosArl({
+        orden: order, profesional: juego.profesional, franjas: juego.franjas, aliado, original,
+        observaciones: order.observaciones_formatos || {},
+        campos: order.campos_formatos || {},
+      });
+      // El nombre del asesor va delante del archivo: dos juegos con el mismo
+      // nombre se pisarían en el almacenamiento y en el correo no se distinguirían.
+      const prefijo = juego.de ? `${nombreDeArchivo(juego.de.nombre)}_` : '';
+      for (const formato of propios) {
+        const filename = `${prefijo}${formato.filename}`;
+        // `_clave` y `_admiteObservaciones` son para la vista previa: con qué clave
+        // se guardan las observaciones de este formato y si tiene dónde escribirlas.
+        const extra = {
+          _buffer: formato.buffer, _filename: filename,
+          _etiqueta: formato.etiqueta, _prediligenciado: formato.prediligenciado,
+          _clave: formato.clave, _admiteObservaciones: !!formato.admiteObservaciones,
+          _editables: formato.editables || [],
+          _profesionalId: juego.de?.id ?? null, _profesionalNombre: juego.de?.nombre ?? null,
+        };
+        if (!guardar) {
+          created.push({ tipo: formato.tipo, ...extra });
+          continue;
+        }
+        const key = await storage.put('documents', `${order.codigo || order.id}_${filename}`, formato.buffer);
+        const doc = await client.query(
+          `INSERT INTO sst.documentos_generados (orden_id, plantilla_id, tipo, url_pdf)
+           VALUES ($1,NULL,$2,$3) RETURNING *`,
+          [orderId, formato.tipo, key]
+        );
+        // `_etiqueta` y `_prediligenciado` no van a BD: los usa el correo para
+        // enumerar lo que ESTA orden lleva adjunto, con el nombre de la ARL.
+        created.push({ ...doc.rows[0], ...extra });
+      }
     }
-    const key = await storage.put('documents', `${order.codigo || order.id}_${formato.filename}`, formato.buffer);
-    const doc = await client.query(
-      `INSERT INTO sst.documentos_generados (orden_id, plantilla_id, tipo, url_pdf)
-       VALUES ($1,NULL,$2,$3) RETURNING *`,
-      [orderId, formato.tipo, key]
-    );
-    // `_etiqueta` y `_prediligenciado` no van a BD: los usa el correo para
-    // enumerar lo que ESTA orden lleva adjunto, con el nombre de la ARL.
-    created.push({ ...doc.rows[0], ...extra });
   }
   if (created.length) return created;
 

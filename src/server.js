@@ -13,6 +13,17 @@ const server = app.listen(env.port, () => {
   console.log(`   → correo: ${env.email.driver} · storage: ${env.storage.driver}\n`);
 });
 
+// 7-oct-2026 · Conexiones reutilizadas. Node cierra una conexión keep-alive a los
+// 5 s de estar quieta, y el navegador (o nginx) puede estar justo reutilizándola
+// para la petición siguiente: esa petición muere con un corte de conexión. Un GET
+// se reintenta solo y nadie lo nota; una SUBIDA de archivo no, y es justo la que
+// llega después de varios segundos de pausa (lo que se tarda en elegir el
+// archivo). De ahí el «a veces falla y al reintentar funciona» en todas las
+// pantallas que cargan documentos. Con 65 s el servidor nunca cierra antes que el
+// cliente (los navegadores y nginx sueltan las suyas a los 60 s o antes).
+server.keepAliveTimeout = 65_000;
+server.headersTimeout = 66_000;
+
 async function shutdown(signal) {
   console.log(`\n${signal} recibido, cerrando…`);
   server.close(async () => {

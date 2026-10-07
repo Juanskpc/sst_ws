@@ -4,7 +4,7 @@ import { asyncHandler } from '../../utils/asyncHandler.js';
 import { uploadSupports } from '../../middleware/upload.js';
 import { badRequest, notFound } from '../../utils/httpError.js';
 import { storage } from '../../services/storage.service.js';
-import { changeStatus } from '../orders/orders.service.js';
+import { changeStatus, asesoresSinEntregar } from '../orders/orders.service.js';
 import { notifyAdmins } from '../../services/notification.service.js';
 import { registrarRespuesta, resolverToken as resolverEncuesta } from '../surveys/surveys.service.js';
 import {
@@ -22,7 +22,11 @@ const router = Router();
 // Resuelve un token de enlace público activo → OS asociada.
 async function resolveToken(token, client = pool) {
   const r = await client.query(
-    `SELECT pl.id AS enlace_id, pl.activo, pl.expira_en, o.*
+    // 7-oct-2026 · El enlace es de UN asesor (`profesional_id`; NULL = el
+    // principal): cada uno ve y sube solo lo suyo.
+    `SELECT pl.id AS enlace_id, pl.activo, pl.expira_en,
+            pl.profesional_id AS enlace_profesional_id, pl.rechazados AS enlace_rechazados,
+            pl.entregado_en AS enlace_entregado_en, o.*
      FROM sst.enlaces_publicos pl JOIN sst.ordenes_servicio o ON o.id = pl.orden_id
      WHERE pl.token=$1`, [token]
   );
@@ -44,6 +48,13 @@ async function resolveToken(token, client = pool) {
   return row;
 }
 
+/**
+ * 7-oct-2026 · Lo que se le devolvió a QUIEN abre el enlace. Lo del principal
+ * vive en la orden; lo de un asesor adicional, en su enlace.
+ */
+const rechazadosDe = (row) =>
+  (row.enlace_profesional_id ? row.enlace_rechazados : row.soportes_rechazados) || null;
+
 // M6 · Resumen de la OS para el portal público (SIN login).
 //
 // SUP-07 / VER-04 · Viaja también lo que YA subió y, si hubo rechazo, qué
@@ -64,10 +75,14 @@ router.get('/support/:token', asyncHandler(async (req, res) => {
       );
   const files = await pool.query(
     `SELECT id, nombre_archivo, nombre_original, categoria, mime, tamano_bytes, subido_en
-       FROM sst.archivos_soporte WHERE orden_id=$1 ORDER BY subido_en`,
-    [row.id]
+       FROM sst.archivos_soporte
+      WHERE orden_id=$1 AND profesional_id IS NOT DISTINCT FROM $2 ORDER BY subido_en`,
+    [row.id, row.enlace_profesional_id]
   );
-  const rechazados = row.soportes_rechazados || null;
+  const rechazados = rechazadosDe(row);
+  // Quien ya entregó lo suyo ve el portal "en revisión" aunque la orden siga
+  // PROGRAMADA esperando a sus compañeros: para él, su parte ya está enviada.
+  const yaEntrego = !!row.enlace_entregado_en && !rechazados && row.estado === 'PROGRAMADA';
   res.json({
     data: {
       codigo: row.codigo,
@@ -76,7 +91,7 @@ router.get('/support/:token', asyncHandler(async (req, res) => {
       actividad_economica: row.actividad_economica,
       horas_asignadas: row.horas_asignadas,
       fecha_programada: row.fecha_programada,
-      estado: row.estado,
+      estado: yaEntrego ? 'EJECUTADA' : row.estado,
       // SUP · Las casillas de ESTA orden, no las tres de siempre: dependen de la
       // ARL y del tipo de actividad, y quedaron congeladas al asignarla. Una
       // asesoría de Bolívar no pide registro fotográfico; una asistencia
@@ -107,8 +122,9 @@ router.get('/support/:token', asyncHandler(async (req, res) => {
 router.get('/support/:token/files/:fileId', asyncHandler(async (req, res) => {
   const row = await resolveToken(req.params.token);
   const r = await pool.query(
-    `SELECT * FROM sst.archivos_soporte WHERE id=$1 AND orden_id=$2`,
-    [req.params.fileId, row.id]
+    `SELECT * FROM sst.archivos_soporte
+      WHERE id=$1 AND orden_id=$2 AND profesional_id IS NOT DISTINCT FROM $3`,
+    [req.params.fileId, row.id, row.enlace_profesional_id]
   );
   const file = r.rows[0];
   if (!file) throw notFound('El archivo no pertenece a esta orden');
@@ -144,7 +160,7 @@ router.post('/support/:token/files', uploadSupports, asyncHandler(async (req, re
   const result = await withTransaction(async (client) => {
     const row = await resolveToken(req.params.token, client);
 
-    const rechazados = (row.soportes_rechazados || []).map((c) => normalizarCategoria(c));
+    const rechazados = (rechazadosDe(row) || []).map((c) => normalizarCategoria(c));
     const hayRechazo = rechazados.length > 0;
     const subidas = [...new Set(entrantes.map((e) => e.categoria))];
     // Lo que se le pidió a ESTA orden. Es lo que decide tanto qué falta como qué
@@ -169,7 +185,9 @@ router.post('/support/:token/files', uploadSupports, asyncHandler(async (req, re
     if (!['PROGRAMADA', 'EJECUTADA'].includes(row.estado)) {
       throw badRequest(`Esta orden está en estado ${row.estado} y todavía no admite soportes.`);
     }
-    if (!hayRechazo && row.estado === 'EJECUTADA') {
+    // `enlace_entregado_en`: este asesor ya envió lo suyo, aunque la orden siga
+    // PROGRAMADA porque falta el envío de algún compañero.
+    if (!hayRechazo && (row.estado === 'EJECUTADA' || row.enlace_entregado_en)) {
       throw badRequest(
         'Ya envió los soportes de esta visita y están en revisión. Si hay que corregir ' +
         'algo, el equipo administrativo se lo devolverá y este enlace volverá a abrirse.',
@@ -232,8 +250,9 @@ router.post('/support/:token/files', uploadSupports, asyncHandler(async (req, re
       const del = await client.query(
         `DELETE FROM sst.archivos_soporte
           WHERE orden_id=$1 AND COALESCE(categoria,'otros') = ANY($2::text[])
+            AND profesional_id IS NOT DISTINCT FROM $3
           RETURNING id, url_archivo, nombre_archivo, categoria`,
-        [row.id, subidas]
+        [row.id, subidas, row.enlace_profesional_id]
       );
       reemplazados = del.rows;
     }
@@ -246,7 +265,8 @@ router.post('/support/:token/files', uploadSupports, asyncHandler(async (req, re
     const previos = new Map(
       (await client.query(
         `SELECT categoria, count(*)::int AS n FROM sst.archivos_soporte
-          WHERE orden_id=$1 GROUP BY categoria`, [row.id]
+          WHERE orden_id=$1 AND profesional_id IS NOT DISTINCT FROM $2 GROUP BY categoria`,
+        [row.id, row.enlace_profesional_id]
       )).rows.map((r) => [normalizarCategoria(r.categoria), r.n]),
     );
 
@@ -275,36 +295,49 @@ router.post('/support/:token/files', uploadSupports, asyncHandler(async (req, re
       const sf = await client.query(
         `INSERT INTO sst.archivos_soporte
            (orden_id, enlace_publico_id, url_archivo, nombre_original, nombre_archivo,
-            categoria, mime, tamano_bytes, tamano_original_bytes, via_enlace_publico)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,true)
+            categoria, mime, tamano_bytes, tamano_original_bytes, via_enlace_publico, profesional_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,true,$10)
          RETURNING id, nombre_archivo, nombre_original, categoria, mime, tamano_bytes`,
         [row.id, row.enlace_id, key, nombreOriginalLegible(archivo.originalname), nombre,
-         categoria, comprimido.mime, comprimido.buffer.length, comprimido.original]
+         categoria, comprimido.mime, comprimido.buffer.length, comprimido.original,
+         row.enlace_profesional_id]
       );
       saved.push(sf.rows[0]);
     }
-    // La devolución queda cerrada: por la comprobación de arriba, si se llegó
-    // hasta aquí es porque llegaron TODOS los documentos devueltos.
+    // La devolución de ESTE asesor queda cerrada: por la comprobación de arriba,
+    // si se llegó hasta aquí es porque llegaron TODOS sus documentos devueltos.
     if (hayRechazo) {
+      if (row.enlace_profesional_id) {
+        await client.query(`UPDATE sst.enlaces_publicos SET rechazados = NULL WHERE id = $1`, [row.enlace_id]);
+      } else {
+        await client.query(
+          `UPDATE sst.ordenes_servicio SET soportes_rechazados = NULL, actualizado_en = now() WHERE id = $1`,
+          [row.id]
+        );
+      }
+      // El motivo es uno para todo el rechazo: se borra cuando ya no le queda
+      // nada pendiente a nadie (un compañero puede seguir corrigiendo lo suyo).
       await client.query(
         `UPDATE sst.ordenes_servicio
-            SET soportes_rechazados     = NULL,
-                soportes_rechazo_motivo = NULL,
-                soportes_rechazados_en  = NULL,
-                actualizado_en = now()
-          WHERE id = $1`,
+            SET soportes_rechazo_motivo = NULL, soportes_rechazados_en = NULL, actualizado_en = now()
+          WHERE id = $1 AND soportes_rechazados IS NULL
+            AND NOT EXISTS (SELECT 1 FROM sst.enlaces_publicos e
+                             WHERE e.orden_id = $1 AND e.rechazados IS NOT NULL)`,
         [row.id]
       );
     }
+    await client.query(`UPDATE sst.enlaces_publicos SET entregado_en = now() WHERE id = $1`, [row.enlace_id]);
 
-    // SUP-05 · al subir, la OS queda EJECUTADA (si estaba PROGRAMADA).
-    if (row.estado === 'PROGRAMADA') {
+    // SUP-05 · al subir, la OS queda EJECUTADA (si estaba PROGRAMADA)… cuando ya
+    // entregaron TODOS sus asesores (7-oct-2026). Con uno solo es lo de siempre.
+    const pendientes = await asesoresSinEntregar(row.id, client);
+    if (row.estado === 'PROGRAMADA' && !pendientes.length) {
       await changeStatus(
         { orderId: row.id, newStatus: 'EJECUTADA', userId: null, motivo: 'Soportes cargados por el profesional' },
         client
       );
     }
-    return { orden: row, saved, reemplazados, hayRechazo };
+    return { orden: row, saved, reemplazados, hayRechazo, pendientes };
   });
 
   // Fuera de la transacción: los binarios sustituidos. Un fallo aquí no puede
@@ -324,16 +357,21 @@ router.post('/support/:token/files', uploadSupports, asyncHandler(async (req, re
   await notifyAdmins({
     tipo: 'SOPORTE_CARGADO',
     titulo: result.hayRechazo ? 'Soportes corregidos' : 'Soportes recibidos',
-    mensaje: result.hayRechazo
-      ? `${result.orden.codigo} · ${result.orden.empresa_nombre || ''} volvió a enviar lo que se le devolvió · revíselo`
-      : `${result.orden.codigo} · ${result.orden.empresa_nombre || ''} quedó EJECUTADA · revise los soportes`,
+    mensaje: result.pendientes.length
+      ? `${result.orden.codigo} · ${result.orden.empresa_nombre || ''} · llegó un envío; falta el de ` +
+        `${result.pendientes.map((x) => x.nombre).join(', ')}`
+      : result.hayRechazo
+        ? `${result.orden.codigo} · ${result.orden.empresa_nombre || ''} volvió a enviar lo que se le devolvió · revíselo`
+        : `${result.orden.codigo} · ${result.orden.empresa_nombre || ''} quedó EJECUTADA · revise los soportes`,
     datos: { orden_id: result.orden.id },
   });
 
   res.status(201).json({
-    message: result.hayRechazo
-      ? 'Corrección enviada. La OS vuelve a quedar ejecutada.'
-      : 'Soportes cargados. La OS quedó ejecutada.',
+    message: result.pendientes.length
+      ? 'Soportes cargados. La orden quedará ejecutada cuando los demás asesores envíen los suyos.'
+      : result.hayRechazo
+        ? 'Corrección enviada. La OS vuelve a quedar ejecutada.'
+        : 'Soportes cargados. La OS quedó ejecutada.',
     data: result.saved,
   });
 }));

@@ -14,11 +14,18 @@ export const pool = new Pool({
   ssl: sslDeshabilitado ? false : { rejectUnauthorized: false },
   max: 10,
   idleTimeoutMillis: 30000,
+  // 7-oct-2026 · Latido TCP: en desarrollo la base va por un túnel SSH y en
+  // producción detrás del cortafuegos; sin latido, una conexión en reposo puede
+  // quedar cortada en silencio y la primera consulta que la use falla.
+  keepAlive: true,
+  keepAliveInitialDelayMillis: 10000,
 });
 
 // Fija el search_path al esquema del proyecto en cada conexión nueva.
 pool.on('connect', (client) => {
-  client.query(`SET search_path TO ${env.dbSchema}, public`);
+  // El fallo de esta consulta no puede quedar sin capturar: tumbaría el proceso.
+  client.query(`SET search_path TO ${env.dbSchema}, public`)
+    .catch((err) => console.error('[db] No se pudo fijar el search_path:', err.message));
 });
 
 pool.on('error', (err) => {
