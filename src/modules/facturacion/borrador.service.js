@@ -154,13 +154,72 @@ async function retencionesDeVenta(ids, client) {
   return r.rows;
 }
 
-async function formaYMedioPago(plazoDias, client) {
-  const codigoForma = plazoDias > 0 ? '2' : '1'; // crédito si hay plazo, si no, contado
-  const [forma, medio] = await Promise.all([
-    client.query(`SELECT id FROM sst.formas_pago WHERE codigo_dian = $1`, [codigoForma]),
-    client.query(`SELECT id FROM sst.medios_pago WHERE codigo_dian = 'ZZZ'`), // "Otro", como en las facturas reales (A1-02)
-  ]);
-  return { formaPagoId: forma.rows[0]?.id ?? null, medioPagoId: medio.rows[0]?.id ?? null };
+/**
+ * Forma y medio de pago del documento, y el plazo que les corresponde.
+ *
+ * Por defecto (nadie eligió nada): crédito si el pagador tiene plazo y contado si no,
+ * con el medio "Otro" de las facturas reales (A1-02). Desde el 8-oct-2026 quien factura
+ * puede ELEGIR otra forma u otro medio; entonces manda lo elegido: contado no lleva
+ * plazo (vence el día de la emisión) y crédito lo exige.
+ */
+async function resolverPago({ formaPagoId = null, medioPagoId = null, plazoDias = 0 }, client) {
+  let plazo = Number.isFinite(Number(plazoDias)) ? Math.max(0, Math.trunc(Number(plazoDias))) : 0;
+  let forma;
+  if (formaPagoId) {
+    forma = (await client.query(`SELECT id, codigo_dian FROM sst.formas_pago WHERE id = $1 AND activo`, [formaPagoId])).rows[0];
+    if (!forma) throw badRequest('Esa forma de pago no existe o está inactiva.');
+    if (forma.codigo_dian === '1') plazo = 0;
+    else if (plazo < 1) throw badRequest('Una factura a crédito necesita el plazo en días (mínimo 1).');
+  } else {
+    forma = (await client.query(`SELECT id FROM sst.formas_pago WHERE codigo_dian = $1`, [plazo > 0 ? '2' : '1'])).rows[0];
+  }
+  let medio;
+  if (medioPagoId) {
+    medio = (await client.query(`SELECT id FROM sst.medios_pago WHERE id = $1 AND activo`, [medioPagoId])).rows[0];
+    if (!medio) throw badRequest('Ese medio de pago no existe o está inactivo.');
+  } else {
+    medio = (await client.query(`SELECT id FROM sst.medios_pago WHERE codigo_dian = 'ZZZ'`)).rows[0];
+  }
+  return { formaPagoId: forma?.id ?? null, medioPagoId: medio?.id ?? null, plazoDias: plazo };
+}
+
+const sumarDias = (fecha, dias) => new Date(new Date(`${fecha}T00:00:00Z`).getTime() + dias * 86400000).toISOString().slice(0, 10);
+
+/** Una cifra como la teclea alguien: «1.200.000,50» y «1200000.50» valen lo mismo. */
+function aNumero(v) {
+  if (typeof v !== 'string') return Number(v);
+  const t = v.trim().replace(/\s|\$/g, '');
+  if (t === '') return NaN;
+  return Number(t.includes(',') ? t.replace(/\./g, '').replace(',', '.') : t);
+}
+
+/**
+ * Valida las líneas que escribe una persona (edición del borrador o factura manual) y
+ * las deja listas para `calcular` y `guardarDocumento`. `productoPorDefecto` es el que
+ * se usa cuando la línea no trae producto (solo la factura manual lo pasa).
+ */
+function normalizarItems(crudos, productos, productoPorDefecto = null) {
+  return crudos.map((raw, idx) => {
+    const cantidad = aNumero(raw?.cantidad);
+    const valorUnitario = aNumero(raw?.valor_unitario);
+    if (!Number.isFinite(cantidad) || cantidad <= 0) throw badRequest(`Ítem ${idx + 1}: la cantidad debe ser mayor que cero.`);
+    if (!Number.isFinite(valorUnitario) || valorUnitario < 0) throw badRequest(`Ítem ${idx + 1}: el valor unitario debe ser un número positivo.`);
+    const descripcion = String(raw.descripcion ?? '').trim();
+    if (!descripcion) throw badRequest(`Ítem ${idx + 1}: la descripción es obligatoria.`);
+    const producto = raw.producto_id ? productos.get(raw.producto_id) : productoPorDefecto;
+    if (raw.producto_id && !producto) throw badRequest(`Ítem ${idx + 1}: ese producto no existe.`);
+    return {
+      orden_id: raw.orden_id ?? null,
+      producto_id: producto?.id ?? null,
+      codigo: producto?.codigo ?? raw.codigo ?? null,
+      descripcion,
+      cantidad,
+      // Al centavo ANTES de calcular: es lo que se guarda y lo que se envía, y
+      // el total tiene que salir de ese mismo número (ver cantidadYValorUnitario).
+      valor_unitario: Number(deCentavos(aCentavos(valorUnitario))),
+      iva_pct: producto?.tratamiento_iva === 'GRAVADO' ? Number(producto.tarifa_iva) : Number(raw.iva_pct) || 0,
+    };
+  });
 }
 
 // ─── Cálculo común (creación y edición) ─────────────────────────────────────
@@ -184,10 +243,8 @@ function calcular(items, descuentoComercialPct, retenciones) {
  * BORRADOR: A1-05 la sobreescribe con la respuesta real de Factus al emitir, y
  * a partir de ahí ya no hace falta recalcular (el documento queda fijo).
  */
-async function guardarDocumento(client, { documentoId, pagador, prefactura, items, calculo, descuentoComercialPct, retenciones, observaciones, fechaEmision, formaPagoId, medioPagoId, plazoDias, usuarioId }) {
-  const fechaVencimiento = plazoDias > 0
-    ? new Date(new Date(`${fechaEmision}T00:00:00Z`).getTime() + plazoDias * 86400000).toISOString().slice(0, 10)
-    : fechaEmision;
+async function guardarDocumento(client, { documentoId, pagador, prefactura, items, calculo, descuentoComercialPct, retenciones, observaciones, fechaEmision, formaPagoId, medioPagoId, plazoDias, usuarioId, origen = 'Borrador creado desde la relación a facturar.' }) {
+  const fechaVencimiento = plazoDias > 0 ? sumarDias(fechaEmision, plazoDias) : fechaEmision;
 
   let docId = documentoId;
   if (!docId) {
@@ -212,8 +269,8 @@ async function guardarDocumento(client, { documentoId, pagador, prefactura, item
     docId = ins.rows[0].id;
     await client.query(
       `INSERT INTO sst.documento_eventos (documento_id, codigo, descripcion, usuario_id)
-       VALUES ($1, 'CREADO', 'Borrador creado desde la relación a facturar.', $2)`,
-      [docId, usuarioId],
+       VALUES ($1, 'CREADO', $3, $2)`,
+      [docId, usuarioId, origen],
     );
   } else {
     const doc = (await client.query(`SELECT estado, tercero_id FROM sst.documentos_electronicos WHERE id = $1`, [docId])).rows[0];
@@ -354,14 +411,103 @@ export async function crearBorrador({ arlId, pagadorTerceroId, ordenIds, prefact
     const calculo = calcular(items, descuentoComercialPct, retenciones);
 
     const fechaEmision = hoyCO();
-    const { formaPagoId, medioPagoId } = await formaYMedioPago(condicion.plazo_dias, client);
+    const { formaPagoId, medioPagoId, plazoDias } = await resolverPago({ plazoDias: condicion.plazo_dias }, client);
 
     const docId = await guardarDocumento(client, {
       documentoId: null, pagador, prefactura: seleccion.prefactura, items, calculo,
       descuentoComercialPct, retenciones, observaciones, fechaEmision,
-      formaPagoId, medioPagoId, plazoDias: condicion.plazo_dias, usuarioId,
+      formaPagoId, medioPagoId, plazoDias, usuarioId,
     });
     return obtenerBorrador(docId, client);
+  });
+}
+
+/**
+ * 8-oct-2026 (petición de JD&D) · FACTURA MANUAL: un borrador que no sale de ninguna
+ * orden del sistema de operación. Se elige el cliente y se escriben las líneas; lo
+ * demás (descuento, retenciones, plazo) se propone con las condiciones del cliente y
+ * se puede cambiar. Queda en BORRADOR como cualquier otra factura: se revisa y se emite
+ * desde «Pendientes», y al validarse no toca el cobro de ninguna orden.
+ *
+ * Cuerpo: { tercero_id, items: [{ descripcion, cantidad, valor_unitario, producto_id? }],
+ *           observaciones?, descuento_comercial_pct?, retenciones_ids?,
+ *           forma_pago_id?, medio_pago_id?, plazo_dias? }
+ */
+export async function crearBorradorManual(body, usuarioId, dbClient = null) {
+  return conTransaccion(dbClient, async (client) => {
+    if (!body?.tercero_id) throw badRequest('Elija el cliente.');
+    const tercero = (await client.query(
+      `SELECT id, activo, es_cliente, es_arl FROM sst.terceros WHERE id = $1`, [body.tercero_id],
+    )).rows[0];
+    if (!tercero) throw notFound('Ese cliente no existe en Terceros.');
+    if (!tercero.activo) throw badRequest('Ese tercero está inactivo: actívelo en Terceros antes de facturarle.');
+    if (!tercero.es_cliente && !tercero.es_arl) throw badRequest('Ese tercero no está marcado como cliente (Terceros → Roles).');
+
+    if (!Array.isArray(body.items) || !body.items.length) throw badRequest('La factura necesita al menos una línea.');
+    const [{ productoArl, productoPrivado }, condicion, todos] = await Promise.all([
+      productosPorDefecto(client),
+      condicionDelPagador(tercero.id, client),
+      client.query(`SELECT id, codigo, tratamiento_iva, tarifa_iva FROM sst.productos WHERE activo`),
+    ]);
+    const productos = new Map(todos.rows.map((p) => [p.id, p]));
+    const items = normalizarItems(body.items.map((it) => ({ ...it, orden_id: null })), productos, tercero.es_arl ? productoArl : productoPrivado);
+    const sinProducto = items.findIndex((it) => !it.producto_id);
+    if (sinProducto >= 0) throw badRequest(`Ítem ${sinProducto + 1}: elija el producto (se crean en Parametrización → Productos).`);
+
+    const descuentoComercialPct = body.descuento_comercial_pct != null && body.descuento_comercial_pct !== ''
+      ? aNumero(body.descuento_comercial_pct) : Number(condicion.descuento_comercial_pct) || 0;
+    if (!Number.isFinite(descuentoComercialPct) || descuentoComercialPct < 0 || descuentoComercialPct > 100) {
+      throw badRequest('El descuento comercial debe ser un número entre 0 y 100.');
+    }
+    if (body.retenciones_ids != null && !Array.isArray(body.retenciones_ids)) throw badRequest('"retenciones_ids" debe ser una lista.');
+    const retenciones = await retencionesDeVenta(body.retenciones_ids ?? condicion.retenciones_ids, client);
+    const calculo = calcular(items, descuentoComercialPct, retenciones);
+
+    const { formaPagoId, medioPagoId, plazoDias } = await resolverPago({
+      formaPagoId: body.forma_pago_id, medioPagoId: body.medio_pago_id,
+      plazoDias: body.plazo_dias != null && body.plazo_dias !== '' ? body.plazo_dias : condicion.plazo_dias,
+    }, client);
+
+    const docId = await guardarDocumento(client, {
+      documentoId: null, pagador: { tercero_id: tercero.id }, prefactura: null, items, calculo,
+      descuentoComercialPct, retenciones, observaciones: String(body.observaciones ?? '').trim() || null,
+      fechaEmision: hoyCO(), formaPagoId, medioPagoId, plazoDias, usuarioId,
+      origen: 'Factura manual: borrador creado sin órdenes de servicio.',
+    });
+    return obtenerBorrador(docId, client);
+  });
+}
+
+/**
+ * 8-oct-2026 (petición de JD&D) · Cambia la forma de pago, el medio y el plazo de un
+ * borrador. El sistema los propone al armar la factura; quien factura los corrige aquí
+ * sin tocar las líneas ni el cálculo. Cuerpo: { forma_pago_id, medio_pago_id?, plazo_dias? }.
+ */
+export async function cambiarPagoBorrador(documentoId, body, usuarioId, dbClient = null) {
+  return conTransaccion(dbClient, async (client) => {
+    const doc = (await client.query(
+      `SELECT estado, medio_pago_id, to_char(fecha_emision, 'YYYY-MM-DD') AS fecha_emision
+         FROM sst.documentos_electronicos WHERE id = $1 AND tipo = 'FACTURA' FOR UPDATE`, [documentoId],
+    )).rows[0];
+    if (!doc) throw notFound('Esa factura no existe.');
+    if (doc.estado !== 'BORRADOR') throw conflict('La forma de pago solo se cambia mientras la factura está en borrador.');
+    if (!body?.forma_pago_id) throw badRequest('Elija la forma de pago.');
+    const { formaPagoId, medioPagoId, plazoDias } = await resolverPago({
+      formaPagoId: body.forma_pago_id, medioPagoId: body.medio_pago_id ?? doc.medio_pago_id, plazoDias: body.plazo_dias,
+    }, client);
+    const fechaEmision = doc.fecha_emision ?? hoyCO();
+    await client.query(
+      `UPDATE sst.documentos_electronicos
+          SET forma_pago_id = $2, medio_pago_id = $3, fecha_vencimiento = $4, actualizado_por = $5
+        WHERE id = $1`,
+      [documentoId, formaPagoId, medioPagoId, plazoDias > 0 ? sumarDias(fechaEmision, plazoDias) : fechaEmision, usuarioId],
+    );
+    await client.query(
+      `INSERT INTO sst.documento_eventos (documento_id, codigo, descripcion, usuario_id)
+       VALUES ($1, 'EDITADO', 'Forma o medio de pago cambiados.', $2)`,
+      [documentoId, usuarioId],
+    );
+    return obtenerBorrador(documentoId, client);
   });
 }
 
@@ -371,7 +517,7 @@ const DOCUMENTO_SELECT = `
   d.prefactura_id, pf.numero_prefactura,
   to_char(d.fecha_emision, 'YYYY-MM-DD') AS fecha_emision,
   to_char(d.fecha_vencimiento, 'YYYY-MM-DD') AS fecha_vencimiento,
-  d.forma_pago_id, fp.nombre AS forma_pago_nombre, d.medio_pago_id, mp.nombre AS medio_pago_nombre,
+  d.forma_pago_id, fp.nombre AS forma_pago_nombre, fp.codigo_dian AS forma_pago_codigo, d.medio_pago_id, mp.nombre AS medio_pago_nombre,
   d.observaciones,
   d.total_bruto, d.total_descuento, d.subtotal, d.total_iva, d.total_retenciones, d.total_a_pagar,
   -- A1-05: se añaden aquí (no solo se escriben al validar) porque este SELECT
@@ -497,27 +643,7 @@ export async function actualizarBorrador(id, body, usuarioId, dbClient = null) {
 
     if (!Array.isArray(body.items) || !body.items.length) throw badRequest('El borrador necesita al menos un ítem.');
     const productos = new Map((await client.query(`SELECT id, codigo, tratamiento_iva, tarifa_iva FROM sst.productos`)).rows.map((p) => [p.id, p]));
-    const items = body.items.map((raw, idx) => {
-      const cantidad = Number(raw.cantidad);
-      const valorUnitario = Number(raw.valor_unitario);
-      if (!Number.isFinite(cantidad) || cantidad <= 0) throw badRequest(`Ítem ${idx + 1}: la cantidad debe ser mayor que cero.`);
-      if (!Number.isFinite(valorUnitario) || valorUnitario < 0) throw badRequest(`Ítem ${idx + 1}: el valor unitario debe ser un número positivo.`);
-      const descripcion = String(raw.descripcion ?? '').trim();
-      if (!descripcion) throw badRequest(`Ítem ${idx + 1}: la descripción es obligatoria.`);
-      const producto = raw.producto_id ? productos.get(raw.producto_id) : null;
-      if (raw.producto_id && !producto) throw badRequest(`Ítem ${idx + 1}: ese producto no existe.`);
-      return {
-        orden_id: raw.orden_id ?? null,
-        producto_id: producto?.id ?? null,
-        codigo: producto?.codigo ?? raw.codigo ?? null,
-        descripcion,
-        cantidad,
-        // Al centavo ANTES de calcular: es lo que se guarda y lo que se envía, y
-        // el total tiene que salir de ese mismo número (ver cantidadYValorUnitario).
-        valor_unitario: Number(deCentavos(aCentavos(valorUnitario))),
-        iva_pct: producto?.tratamiento_iva === 'GRAVADO' ? Number(producto.tarifa_iva) : Number(raw.iva_pct) || 0,
-      };
-    });
+    const items = normalizarItems(body.items, productos);
 
     // Nada impide, por la forma del cuerpo, que alguien edite un borrador
     // metiéndole el orden_id de OTRA orden que ya está en un documento ajeno
@@ -549,8 +675,9 @@ export async function actualizarBorrador(id, body, usuarioId, dbClient = null) {
     const calculo = calcular(items, descuentoComercialPct, retenciones);
 
     const fechaEmision = /^\d{4}-\d{2}-\d{2}$/.test(body.fecha_emision) ? body.fecha_emision : hoyCO();
-    const plazoDias = Number.isFinite(Number(body.plazo_dias)) ? Number(body.plazo_dias) : 0;
-    const { formaPagoId, medioPagoId } = await formaYMedioPago(plazoDias, client);
+    const { formaPagoId, medioPagoId, plazoDias } = await resolverPago({
+      formaPagoId: body.forma_pago_id, medioPagoId: body.medio_pago_id, plazoDias: body.plazo_dias,
+    }, client);
 
     const pagador = { tercero_id: actual.tercero_id };
     const prefactura = actual.prefactura_id ? { id: actual.prefactura_id } : null;

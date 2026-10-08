@@ -29,7 +29,7 @@ export const TERCERO_SELECT = `
   m.nombre AS municipio_nombre, m.codigo_dian AS municipio_codigo,
   dp.nombre AS departamento_nombre,
   t.telefono, t.correo_facturacion, t.responsabilidades_fiscales, t.regimen,
-  t.es_cliente, t.es_proveedor, t.es_empleado, t.es_arl, t.activo,
+  t.es_cliente, t.es_proveedor, t.es_empleado, t.es_arl, t.es_acreedor, t.activo,
   t.creado_en, t.actualizado_en,
   (SELECT COALESCE(jsonb_agg(a.nombre ORDER BY a.nombre), '[]'::jsonb) FROM sst.arls a WHERE a.tercero_id = t.id) AS arls_enlazadas,
   (SELECT count(*)::int FROM sst.empresas e WHERE e.tercero_id = t.id) AS empresas_enlazadas,
@@ -105,7 +105,9 @@ export function resolverDocumento(tipoCodigo, valor) {
   return { numero, dv: null };
 }
 
-const ROLES = ['es_cliente', 'es_proveedor', 'es_empleado', 'es_arl'];
+// 8-oct-2026 · El formulario ofrece «Acreedor» en vez de «ARL». `es_arl` sigue viajando en
+// la ficha (la pantalla lo devuelve tal como lo recibió) para no quitárselo a las ARL.
+const ROLES = ['es_cliente', 'es_proveedor', 'es_empleado', 'es_acreedor', 'es_arl'];
 const REGIMENES = ['RESPONSABLE_IVA', 'NO_RESPONSABLE'];
 
 /**
@@ -169,7 +171,7 @@ export async function validarTercero(b = {}, client = pool) {
 
   const roles = Object.fromEntries(ROLES.map((r) => [r, b[r] === true]));
   if (!ROLES.some((r) => roles[r])) {
-    throw badRequest('Marque al menos un rol: cliente, proveedor, empleado o ARL.');
+    throw badRequest('Marque al menos un rol: cliente, proveedor, empleado o acreedor.');
   }
 
   return {
@@ -198,7 +200,7 @@ export const CAMPOS_TERCERO = [
   'razon_social', 'nombres', 'apellidos', 'nombre_comercial',
   'direccion', 'municipio_id', 'codigo_postal', 'telefono', 'correo_facturacion',
   'responsabilidades_fiscales', 'regimen',
-  'es_cliente', 'es_proveedor', 'es_empleado', 'es_arl',
+  'es_cliente', 'es_proveedor', 'es_empleado', 'es_arl', 'es_acreedor',
 ];
 
 /** ¿Ya hay OTRO tercero con ese documento? Devuelve su nombre, o null. */

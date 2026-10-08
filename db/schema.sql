@@ -1928,7 +1928,7 @@ CREATE TABLE IF NOT EXISTS sst.responsabilidades_fiscales (
 -- `empresas` (dónde se EJECUTA el servicio) ni a `profesionales`: se enlaza con
 -- ellas por `tercero_id` y no se fusionan.
 --
--- Los cuatro booleanos de rol NO son excluyentes: una ARL es cliente Y ARL, y
+-- Los booleanos de rol NO son excluyentes: una ARL es cliente Y ARL, y
 -- un asesor puede ser proveedor (documento soporte) y empleado.
 CREATE TABLE IF NOT EXISTS sst.terceros (
   id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1956,6 +1956,8 @@ CREATE TABLE IF NOT EXISTS sst.terceros (
   es_proveedor       BOOLEAN NOT NULL DEFAULT false,
   es_empleado        BOOLEAN NOT NULL DEFAULT false,
   es_arl             BOOLEAN NOT NULL DEFAULT false,
+  -- 8-oct-2026 · Sustituye a «ARL» en el formulario (migración 2026-10-08-tercero-acreedor.sql).
+  es_acreedor        BOOLEAN NOT NULL DEFAULT false,
   activo             BOOLEAN NOT NULL DEFAULT true,
   creado_por         UUID REFERENCES sst.usuarios(id) ON DELETE SET NULL,
   actualizado_por    UUID REFERENCES sst.usuarios(id) ON DELETE SET NULL,

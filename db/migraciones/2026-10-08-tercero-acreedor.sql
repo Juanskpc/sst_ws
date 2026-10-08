@@ -1,0 +1,11 @@
+-- 8-oct-2026 · Petición de JD&D: en el formulario de terceros el rol «ARL» se cambia
+-- por «Acreedor» (a quien se le debe sin ser proveedor de un documento soporte).
+--
+-- `es_arl` NO se borra: lo usan Facturación (producto exento), Cartera y el alta de
+-- órdenes particulares, y lo conservan las ARL que ya existen. Solo deja de ofrecerse
+-- como casilla; el rol nuevo es una columna aparte.
+--
+-- Aditivo e idempotente.
+--
+--   psql "$DATABASE_URL" -f db/migraciones/2026-10-08-tercero-acreedor.sql
+ALTER TABLE sst.terceros ADD COLUMN IF NOT EXISTS es_acreedor BOOLEAN NOT NULL DEFAULT false;

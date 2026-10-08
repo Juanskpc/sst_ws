@@ -4,7 +4,10 @@ import { asyncHandler } from '../../utils/asyncHandler.js';
 import { badRequest } from '../../utils/httpError.js';
 import { authRequired, requireRole } from '../../middleware/auth.js';
 import { esBolivar, relacionPorFacturar, resolverSeleccion } from './relacion.service.js';
-import { actualizarBorrador, cambiarDescripcionItem, crearBorrador, eliminarBorrador, listarBorradores, obtenerBorrador } from './borrador.service.js';
+import {
+  actualizarBorrador, cambiarDescripcionItem, cambiarPagoBorrador, crearBorrador, crearBorradorManual, eliminarBorrador,
+  listarBorradores, obtenerBorrador,
+} from './borrador.service.js';
 import { corregirDocumento, emitirDocumento, numeroCompleto, reconciliarDocumento } from './emision.service.js';
 import { reenviarAlCliente } from './envio.service.js';
 import { storage } from '../../services/storage.service.js';
@@ -166,6 +169,24 @@ router.post('/borradores', OPERAR, asyncHandler(async (req, res) => {
   res.status(201).json({ message: 'Borrador de factura creado.', data });
 }));
 
+/**
+ * 8-oct-2026 · Factura MANUAL: sin órdenes del sistema de operación. Cuerpo:
+ * { tercero_id, items: [{ descripcion, cantidad, valor_unitario, producto_id? }], observaciones?,
+ *   descuento_comercial_pct?, retenciones_ids?, forma_pago_id?, medio_pago_id?, plazo_dias? }.
+ */
+router.post('/borradores/manual', OPERAR, asyncHandler(async (req, res) => {
+  const b = req.body || {};
+  const data = await crearBorradorManual({
+    ...b,
+    tercero_id: uuidOpcional(b.tercero_id, 'tercero_id'),
+    forma_pago_id: uuidOpcional(b.forma_pago_id, 'forma_pago_id'),
+    medio_pago_id: uuidOpcional(b.medio_pago_id, 'medio_pago_id'),
+    retenciones_ids: Array.isArray(b.retenciones_ids) ? b.retenciones_ids.map((id) => uuidOpcional(id, 'retenciones_ids')) : b.retenciones_ids,
+    items: Array.isArray(b.items) ? b.items.map((it) => ({ ...it, producto_id: uuidOpcional(it?.producto_id, 'producto_id') })) : b.items,
+  }, req.user.sub);
+  res.status(201).json({ message: 'Borrador de factura creado.', data });
+}));
+
 router.get('/borradores/:id', LEER, asyncHandler(async (req, res) => {
   res.json({ data: await obtenerBorrador(uuidOpcional(req.params.id, 'id')) });
 }));
@@ -174,6 +195,17 @@ router.get('/borradores/:id', LEER, asyncHandler(async (req, res) => {
 router.put('/borradores/:id', OPERAR, asyncHandler(async (req, res) => {
   const data = await actualizarBorrador(uuidOpcional(req.params.id, 'id'), req.body || {}, req.user.sub);
   res.json({ message: 'Borrador actualizado.', data });
+}));
+
+// 8-oct-2026 · Forma de pago, medio y plazo del borrador. Cuerpo: { forma_pago_id, medio_pago_id?, plazo_dias? }.
+router.patch('/borradores/:id/pago', OPERAR, asyncHandler(async (req, res) => {
+  const b = req.body || {};
+  const data = await cambiarPagoBorrador(uuidOpcional(req.params.id, 'id'), {
+    forma_pago_id: uuidOpcional(b.forma_pago_id, 'forma_pago_id'),
+    medio_pago_id: uuidOpcional(b.medio_pago_id, 'medio_pago_id'),
+    plazo_dias: b.plazo_dias,
+  }, req.user.sub);
+  res.json({ message: 'Forma de pago actualizada.', data });
 }));
 
 // 7-oct-2026 · Solo el texto de una línea del borrador. Cuerpo: { descripcion }.

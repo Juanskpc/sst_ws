@@ -24,7 +24,7 @@ router.use(authRequired);
 const LEER = requireRole('admin', 'contador', 'auditor');
 const ESCRIBIR = requireRole('admin', 'contador');
 
-const ROLES_FILTRO = { cliente: 'es_cliente', proveedor: 'es_proveedor', empleado: 'es_empleado', arl: 'es_arl' };
+const ROLES_FILTRO = { cliente: 'es_cliente', proveedor: 'es_proveedor', empleado: 'es_empleado', acreedor: 'es_acreedor', arl: 'es_arl' };
 
 async function cargar(client, id) {
   const r = await client.query(`SELECT ${TERCERO_SELECT} ${TERCERO_FROM} WHERE t.id = $1`, [id]);
@@ -32,7 +32,7 @@ async function cargar(client, id) {
 }
 
 // Listado. ?q= busca por documento (con o sin puntos/DV) o por nombre;
-// ?rol=cliente|proveedor|empleado|arl; ?activo=true|false; ?page= y ?limit= son
+// ?rol=cliente|proveedor|empleado|acreedor|arl; ?activo=true|false; ?page= y ?limit= son
 // opcionales (sin ellos devuelve todo: la pantalla pagina en el cliente).
 router.get('/', LEER, asyncHandler(async (req, res) => {
   const { q, rol, activo } = req.query;

@@ -207,7 +207,7 @@ function aCuerpo(r, cat, rolPorDefecto) {
       telefono,
       correo_facturacion: r.correo || '',
       regimen: /no responsable/.test(normalizar(r.regimen)) ? 'NO_RESPONSABLE' : 'RESPONSABLE_IVA',
-      ...roles, es_arl: false,
+      ...roles, es_arl: false, es_acreedor: false,
     },
     avisos,
     municipio: m.nombre ?? null,
