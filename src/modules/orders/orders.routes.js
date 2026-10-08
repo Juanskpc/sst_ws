@@ -1,5 +1,6 @@
 import { PDFDocument } from 'pdf-lib';
 import { actualizarRadicado, crearRadicado, eliminarRadicado, listarRadicados } from './radicados.service.js';
+import { ordenesProximas } from './proximas.service.js';
 import { Router } from 'express';
 import { pool, withTransaction } from '../../config/db.js';
 import { asyncHandler } from '../../utils/asyncHandler.js';
@@ -325,6 +326,14 @@ router.get('/', asyncHandler(async (req, res) => {
  * acepta cualquier id, así que un profesional podría listar las órdenes de un
  * compañero cambiando el parámetro. Aquí el id sale de la sesión.
  */
+/**
+ * 7-oct-2026 · Recordatorio: visitas programadas que vienen (y las ya pasadas sin
+ * soportes). ?dias=7 hacia adelante. Va antes de `/:id`, igual que `/mias`.
+ */
+router.get('/proximas', requireRole('admin', 'administrativo', 'contador', 'auditor'), asyncHandler(async (req, res) => {
+  res.json({ data: await ordenesProximas({ dias: req.query.dias }) });
+}));
+
 router.get('/mias', asyncHandler(async (req, res) => {
   const profesional = await profesionalDeUsuario(req.user);
   if (!profesional) {
