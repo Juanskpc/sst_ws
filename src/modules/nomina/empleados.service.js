@@ -81,8 +81,8 @@ export function validarEmpleado(b = {}) {
   const conCuenta = METODOS_PAGO.find((m) => m.codigo === metodoPago).conCuenta;
   const banco = conCuenta ? texto(b.banco, 80) : null;
   const numeroCuenta = conCuenta ? String(b.numero_cuenta ?? '').replace(/\D/g, '') || null : null;
-  const tipoCuenta = conCuenta ? uno(TIPOS_CUENTA, b.tipo_cuenta, 'El tipo de cuenta') : null;
   if (conCuenta && (!banco || !numeroCuenta)) throw badRequest('Para pagar por transferencia o consignación indique el banco y el número de cuenta.');
+  const tipoCuenta = conCuenta ? uno(TIPOS_CUENTA, b.tipo_cuenta, 'El tipo de cuenta') : null;
 
   return {
     cargo: texto(b.cargo),

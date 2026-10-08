@@ -16,6 +16,9 @@ import { faltantesParaNomina, obtenerEmpleado } from './empleados.service.js';
  * futuro, que el empleado ya hubiera ingresado y que no haya dos nóminas del mismo mes.
  */
 
+/** El estado como lo lee una persona, en femenino («la nómina está validada»). */
+const ESTADO_LEGIBLE = { BORRADOR: 'en borrador', ENVIANDO: 'enviándose a la DIAN', VALIDADO: 'validada', RECHAZADO: 'rechazada: corríjala antes de volver a emitir', ANULADO: 'anulada' };
+
 const generarReferencia = (prefijo) => `ORB-${prefijo}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
 const espera = (ms) => new Promise((ok) => setTimeout(ok, ms));
 
@@ -173,7 +176,7 @@ export async function crearLiquidacion(body, usuarioId) {
     `SELECT estado FROM sst.nomina_liquidaciones WHERE empleado_id = $1 AND anio = $2 AND mes = $3 AND estado <> 'ANULADO'`,
     [empleado.id, d.periodo.anio, d.periodo.mes],
   );
-  if (viva.rowCount) throw conflict(`${empleado.nombre} ya tiene una nómina de ese mes (${viva.rows[0].estado.toLowerCase()}). Ábrala desde la lista.`);
+  if (viva.rowCount) throw conflict(`${empleado.nombre} ya tiene una nómina de ese mes (${ESTADO_LEGIBLE[viva.rows[0].estado].split(':')[0]}). Ábrala desde la lista.`);
   const r = await pool.query(
     `INSERT INTO sst.nomina_liquidaciones
        (empleado_id, anio, mes, salario, salario_integral, novedades, liquidacion, dias_trabajados,
@@ -241,7 +244,7 @@ export async function emitirLiquidacion(id, usuarioId) {
   const liq = await withTransaction(async (client) => {
     const l = (await client.query(`SELECT id, estado, reference_code FROM sst.nomina_liquidaciones WHERE id = $1 FOR UPDATE`, [id])).rows[0];
     if (!l) throw notFound('Esa liquidación no existe.');
-    if (!['BORRADOR', 'ENVIANDO'].includes(l.estado)) throw conflict(`Esta nómina está ${l.estado.toLowerCase()}; no se puede emitir.`);
+    if (!['BORRADOR', 'ENVIANDO'].includes(l.estado)) throw conflict(`Esta nómina está ${ESTADO_LEGIBLE[l.estado]}; no se puede emitir.`);
     const referencia = l.reference_code ?? generarReferencia('NOMINA');
     await client.query(`UPDATE sst.nomina_liquidaciones SET estado = 'ENVIANDO', reference_code = $2, errores = NULL, actualizado_por = $3 WHERE id = $1`, [id, referencia, usuarioId]);
     return obtenerLiquidacion(id, client);

@@ -3,6 +3,7 @@ import { asyncHandler } from '../../utils/asyncHandler.js';
 import { badRequest } from '../../utils/httpError.js';
 import { authRequired, requireRole } from '../../middleware/auth.js';
 import { catalogosNomina } from './catalogos.js';
+import { pdfDesprendible } from './desprendible.service.js';
 import { actualizarEmpleado, cambiarEstadoEmpleado, crearEmpleado, listarEmpleados, obtenerEmpleado } from './empleados.service.js';
 import {
   actualizarLiquidacion, anularLiquidacion, crearLiquidacion, eliminarLiquidacion, emitirLiquidacion,
@@ -58,6 +59,13 @@ router.get('/liquidaciones', LEER, asyncHandler(async (req, res) => {
 }));
 router.get('/liquidaciones/:id', LEER, asyncHandler(async (req, res) => {
   res.json({ data: await obtenerLiquidacion(uuid(req.params.id)) });
+}));
+// El desprendible en PDF, para entregárselo al empleado. Pasa por la API porque exige sesión.
+router.get('/liquidaciones/:id/desprendible', LEER, asyncHandler(async (req, res) => {
+  const { nombre, buffer } = await pdfDesprendible(uuid(req.params.id));
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `inline; filename="${nombre}"`);
+  res.send(buffer);
 }));
 router.post('/liquidaciones', OPERAR, asyncHandler(async (req, res) => {
   const b = req.body || {};
