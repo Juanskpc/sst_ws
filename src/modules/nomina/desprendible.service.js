@@ -4,6 +4,10 @@ import { fileURLToPath } from 'node:url';
 import QRCode from 'qrcode';
 import { PDFDocument, StandardFonts, degrees, rgb } from 'pdf-lib';
 import { pool } from '../../config/db.js';
+import { badRequest } from '../../utils/httpError.js';
+import { validarCorreo } from '../../utils/personas.js';
+import { sendEmail } from '../../services/email.service.js';
+import { bloqueTotal, correoHtml, filaDato, parrafo, tablaDatos } from '../../services/email-layout.service.js';
 import { OTRAS_DEDUCCIONES, OTROS_DEVENGADOS, TIPOS_HORA, TIPOS_LICENCIA } from './calculo.js';
 import { obtenerEmpleado } from './empleados.service.js';
 import { obtenerLiquidacion } from './liquidaciones.service.js';
@@ -153,4 +157,49 @@ export async function pdfDesprendible(liquidacionId) {
 
   const archivo = `nomina-${liq.anio}-${String(liq.mes).padStart(2, '0')}-${emp.numero_documento}.pdf`;
   return { nombre: archivo, buffer: Buffer.from(await pdf.save()) };
+}
+
+/**
+ * Le envía el desprendible por correo al empleado, con el PDF adjunto. Solo de una nómina
+ * validada: un borrador puede cambiar y no debe llegarle como si fuera el pago en firme.
+ * Devuelve la dirección a la que salió.
+ */
+export async function enviarDesprendible(liquidacionId, correoAlterno) {
+  const liq = await obtenerLiquidacion(liquidacionId);
+  if (liq.estado !== 'VALIDADO') throw badRequest('El desprendible se envía cuando la nómina ya está validada por la DIAN.');
+  const emp = await obtenerEmpleado(liq.empleado_id);
+  const destino = validarCorreo(correoAlterno || emp.correo, { obligatorio: false });
+  if (!destino) throw badRequest(`${emp.nombre} no tiene correo en su ficha de empleado. Escríbalo o agréguelo en Nómina → Empleados.`);
+
+  const { nombre, buffer } = await pdfDesprendible(liquidacionId);
+  const periodo = `${MESES[liq.mes - 1]} de ${liq.anio}`;
+  const neto = pesos(liq.neto);
+  await sendEmail({
+    to: destino,
+    subject: `Comprobante de nómina de ${periodo} — JD&D Consultores`,
+    text:
+      `Hola, ${emp.nombre}:\n\n` +
+      `Adjuntamos su comprobante de pago de nómina de ${periodo}.\n\n` +
+      `  · Neto pagado: ${neto}\n` +
+      `  · Fecha de pago: ${fechaCO(liq.fecha_pago)}\n` +
+      `  · Nómina electrónica: ${liq.numero}\n\n` +
+      `JD&D Consultores en Sistemas de Gestión\n`,
+    html: correoHtml({
+      titulo: 'Comprobante de nómina',
+      subtitulo: `${periodo} · ${emp.nombre}`,
+      pie: 'JD&D Consultores · Seguridad y Salud en el Trabajo',
+      cuerpo: [
+        parrafo(`Hola, ${emp.nombre}:`),
+        parrafo(`Adjuntamos su comprobante de pago de nómina de ${periodo}.`),
+        bloqueTotal('Neto pagado', neto, `Pagado el ${fechaCO(liq.fecha_pago)}`),
+        tablaDatos([
+          filaDato('Total devengado', pesos(liq.total_devengado)),
+          filaDato('Total deducciones', pesos(liq.total_deducido)),
+          filaDato('Nómina electrónica', liq.numero),
+        ]),
+      ].join(''),
+    }),
+    attachments: [{ filename: nombre, content: buffer }],
+  });
+  return destino;
 }

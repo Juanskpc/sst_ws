@@ -13,7 +13,11 @@
  * porque el documento electrónico informa concepto por concepto y la DIAN suma esos.
  */
 
-/** Cifras del año. Se cambian cada enero con el decreto del salario mínimo. */
+/**
+ * Cifras del año. Desde el 8-oct-2026 las que valen están en la base (`sst.nomina_parametros`,
+ * editables desde la pantalla) y `liquidar` las recibe en `parametros`; estas quedan como
+ * respaldo para los scripts que no tocan la base.
+ */
 export const PARAMETROS = {
   2026: {
     // Decretos de diciembre de 2025. El auxilio coincide con el del ejemplo oficial
@@ -125,6 +129,7 @@ export function porcentajeFondoSolidaridad(ibc, smmlv) {
  * @param {object} e
  * @param {number} e.salario            salario básico mensual
  * @param {{anio:number, mes:number}} e.periodo
+ * @param {{smmlv:number, auxilioTransporte:number}} [e.parametros]  cifras del año; si faltan, las de respaldo de este archivo
  * @param {boolean} [e.salarioIntegral] el integral no tiene auxilio, prima ni cesantías, y cotiza sobre el 70 %
  * @param {object} [e.novedades]
  * @param {{tipo:string, cantidad:number, inicio?:string, fin?:string}[]} [e.novedades.horas]  tipo: clave de TIPOS_HORA
@@ -138,8 +143,8 @@ export function porcentajeFondoSolidaridad(ibc, smmlv) {
  * @param {{tipo:string, valor:number, descripcion?:string}[]} [e.novedades.otrosDevengados]   tipo: clave de OTROS_DEVENGADOS
  * @param {{tipo:string, valor:number, descripcion?:string}[]} [e.novedades.otrasDeducciones]  tipo: clave de OTRAS_DEDUCCIONES
  */
-export function liquidar({ salario, periodo, salarioIntegral = false, novedades = {} }) {
-  const { smmlv, auxilioTransporte } = parametrosDe(periodo.anio);
+export function liquidar({ salario, periodo, salarioIntegral = false, novedades = {}, parametros = null }) {
+  const { smmlv, auxilioTransporte } = parametros ?? parametrosDe(periodo.anio);
   const sal = Number(salario);
   if (!(sal > 0)) throw new Error('El salario debe ser mayor que cero.');
   const dia = sal / 30; // el mes laboral tiene 30 días, también febrero y los de 31

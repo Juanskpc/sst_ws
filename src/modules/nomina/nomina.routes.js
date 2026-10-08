@@ -3,7 +3,8 @@ import { asyncHandler } from '../../utils/asyncHandler.js';
 import { badRequest } from '../../utils/httpError.js';
 import { authRequired, requireRole } from '../../middleware/auth.js';
 import { catalogosNomina } from './catalogos.js';
-import { pdfDesprendible } from './desprendible.service.js';
+import { enviarDesprendible, pdfDesprendible } from './desprendible.service.js';
+import { guardarParametros, listarParametros } from './parametros.service.js';
 import { actualizarEmpleado, cambiarEstadoEmpleado, crearEmpleado, listarEmpleados, obtenerEmpleado } from './empleados.service.js';
 import {
   actualizarLiquidacion, anularLiquidacion, crearLiquidacion, eliminarLiquidacion, emitirLiquidacion,
@@ -27,7 +28,13 @@ const uuid = (v, nombre = 'id') => {
 };
 
 // Tablas para los selectores (tipos de contrato, de hora extra, de licencia…) y las cifras del año.
-router.get('/catalogos', LEER, (_req, res) => res.json({ data: catalogosNomina() }));
+router.get('/catalogos', LEER, asyncHandler(async (_req, res) => res.json({ data: await catalogosNomina() })));
+
+// Salario mínimo y auxilio de transporte de cada año. Cuerpo del PUT: { anio, smmlv, auxilio_transporte }.
+router.get('/parametros', LEER, asyncHandler(async (_req, res) => res.json({ data: await listarParametros() })));
+router.put('/parametros', OPERAR, asyncHandler(async (req, res) => {
+  res.json({ message: 'Parámetros guardados.', data: await guardarParametros(req.body || {}, req.user.sub) });
+}));
 
 // ─── Empleados ──────────────────────────────────────────────────────────────
 router.get('/empleados', LEER, asyncHandler(async (_req, res) => {
@@ -66,6 +73,11 @@ router.get('/liquidaciones/:id/desprendible', LEER, asyncHandler(async (req, res
   res.setHeader('Content-Type', 'application/pdf');
   res.setHeader('Content-Disposition', `inline; filename="${nombre}"`);
   res.send(buffer);
+}));
+// Le manda el desprendible por correo al empleado. Cuerpo: { correo? } (por defecto, el de su ficha).
+router.post('/liquidaciones/:id/enviar', OPERAR, asyncHandler(async (req, res) => {
+  const destino = await enviarDesprendible(uuid(req.params.id), req.body?.correo);
+  res.json({ message: `Desprendible enviado a ${destino}.` });
 }));
 router.post('/liquidaciones', OPERAR, asyncHandler(async (req, res) => {
   const b = req.body || {};

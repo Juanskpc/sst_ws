@@ -3,7 +3,8 @@
 // simulado que reproduce lo que se vio en el ambiente de pruebas (validada a la primera,
 // 500 y luego validada, rechazo de la DIAN, sin respuesta, negativa 403).
 //
-//   node --import tsx scripts/verificar-nomina.mjs
+//   EMAIL_DRIVER=console SMTP_HOST= node --import tsx scripts/verificar-nomina.mjs [carpetaParaLosPdf]
+//   (sin EMAIL_DRIVER=console se salta la prueba del correo, para no enviar nada de verdad)
 //
 // Crea un tercero, un empleado y sus liquidaciones de prueba y los BORRA al terminar.
 // No envía nada a ningún sitio.
@@ -11,7 +12,8 @@ import { pool } from '../src/config/db.js';
 import { proveedorFE } from '../src/modules/facturacion/index.js';
 import { FactusError } from '../src/modules/facturacion/adaptadores/factus.cliente.js';
 import fs from 'node:fs';
-import { pdfDesprendible } from '../src/modules/nomina/desprendible.service.js';
+import { enviarDesprendible, pdfDesprendible } from '../src/modules/nomina/desprendible.service.js';
+import { guardarParametros, parametrosDelAnio } from '../src/modules/nomina/parametros.service.js';
 import { actualizarEmpleado, crearEmpleado, listarEmpleados } from '../src/modules/nomina/empleados.service.js';
 import {
   actualizarLiquidacion, anularLiquidacion, crearLiquidacion, eliminarLiquidacion, emitirLiquidacion, obtenerLiquidacion, previaLiquidacion,
@@ -152,6 +154,19 @@ try {
     comprobar(buffer.subarray(0, 4).toString() === '%PDF' && /^nomina-2026-\d\d-\d+\.pdf$/.test(nombre), `desprendible de la ${sufijo}: ${nombre} (${buffer.length} bytes)`);
     if (process.argv[2]) { fs.mkdirSync(process.argv[2], { recursive: true }); fs.writeFileSync(`${process.argv[2]}/desprendible-${sufijo}.pdf`, buffer); }
   }
+
+  // ── Envío del desprendible al empleado (solo con el correo en modo consola)
+  await debeFallar(() => enviarDesprendible(l5.id), 'enviar el desprendible de un borrador');
+  await debeFallar(() => enviarDesprendible(v2.id), 'enviar sin correo en la ficha');
+  if (process.env.EMAIL_DRIVER === 'console') {
+    comprobar(await enviarDesprendible(v2.id, 'Empleada@Prueba.com') === 'empleada@prueba.com', 'desprendible enviado a un correo alterno');
+  } else console.log('· (correo: se salta; correr con EMAIL_DRIVER=console para probarlo)');
+
+  // ── Cifras del año: se editan sin tocar el código
+  await debeFallar(() => guardarParametros({ anio: 2099, smmlv: 5, auxilio_transporte: 1 }, usuario), 'salario mínimo absurdo');
+  await guardarParametros({ anio: 2099, smmlv: 3_000_000, auxilio_transporte: 400_000 }, usuario);
+  comprobar((await parametrosDelAnio(2099))?.auxilioTransporte === 400000, 'se agregan las cifras de un año nuevo');
+  await pool.query(`DELETE FROM sst.nomina_parametros WHERE anio = 2099`);
 
   // ── Anulación
   const a1 = await anularLiquidacion(v1.id, usuario);

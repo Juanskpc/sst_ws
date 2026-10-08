@@ -98,6 +98,24 @@ DO $$ BEGIN
     FOR EACH ROW EXECUTE FUNCTION sst.fn_tocar_actualizado_en();
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
+-- Cifras del año (salario mínimo y auxilio de transporte): se editan desde la pantalla para
+-- que el decreto de cada diciembre no obligue a desplegar. Las dos filas iniciales son las
+-- de los decretos de 2024 y 2025; la contadora las confirma.
+CREATE TABLE IF NOT EXISTS sst.nomina_parametros (
+  anio               SMALLINT PRIMARY KEY CHECK (anio BETWEEN 2020 AND 2100),
+  smmlv              NUMERIC(14,2) NOT NULL CHECK (smmlv > 0),
+  auxilio_transporte NUMERIC(14,2) NOT NULL CHECK (auxilio_transporte >= 0),
+  actualizado_por    UUID REFERENCES sst.usuarios(id) ON DELETE SET NULL,
+  actualizado_en     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+INSERT INTO sst.nomina_parametros (anio, smmlv, auxilio_transporte) VALUES
+  (2025, 1423500, 200000),
+  (2026, 1750905, 249095)
+ON CONFLICT (anio) DO NOTHING;
+
+-- A dónde se le envía el desprendible al empleado (no es el correo de facturación del tercero).
+ALTER TABLE sst.empleados ADD COLUMN IF NOT EXISTS correo TEXT;
+
 -- Vista «Nómina» del menú de Finanzas, con el mismo reparto que Facturación.
 INSERT INTO sst.permisos_rol (rol, vista, permitido) VALUES
   ('admin',          'nomina', TRUE),

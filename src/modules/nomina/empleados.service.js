@@ -1,5 +1,6 @@
 import { pool, withTransaction } from '../../config/db.js';
 import { badRequest, conflict, notFound } from '../../utils/httpError.js';
+import { validarCorreo } from '../../utils/personas.js';
 import { METODOS_PAGO, SUBTIPOS_TRABAJADOR, TIPOS_CONTRATO, TIPOS_CUENTA, TIPOS_TRABAJADOR } from './catalogos.js';
 
 /**
@@ -11,7 +12,7 @@ import { METODOS_PAGO, SUBTIPOS_TRABAJADOR, TIPOS_CONTRATO, TIPOS_CUENTA, TIPOS_
  */
 
 const EMPLEADO_SELECT = `
-  e.id, e.tercero_id, e.cargo, e.salario, e.salario_integral, e.tipo_contrato, e.tipo_trabajador,
+  e.id, e.tercero_id, e.cargo, e.correo, e.salario, e.salario_integral, e.tipo_contrato, e.tipo_trabajador,
   e.subtipo_trabajador, e.alto_riesgo,
   to_char(e.fecha_ingreso, 'YYYY-MM-DD') AS fecha_ingreso, to_char(e.fecha_retiro, 'YYYY-MM-DD') AS fecha_retiro,
   e.metodo_pago, e.banco, e.tipo_cuenta, e.numero_cuenta,
@@ -86,6 +87,7 @@ export function validarEmpleado(b = {}) {
 
   return {
     cargo: texto(b.cargo),
+    correo: validarCorreo(b.correo, { obligatorio: false }),
     salario: Math.round(salario * 100) / 100,
     salario_integral: b.salario_integral === true,
     tipo_contrato: uno(TIPOS_CONTRATO, b.tipo_contrato ?? '2', 'El tipo de contrato'),
@@ -107,7 +109,7 @@ export function validarEmpleado(b = {}) {
 }
 
 const CAMPOS = [
-  'cargo', 'salario', 'salario_integral', 'tipo_contrato', 'tipo_trabajador', 'subtipo_trabajador', 'alto_riesgo',
+  'cargo', 'correo', 'salario', 'salario_integral', 'tipo_contrato', 'tipo_trabajador', 'subtipo_trabajador', 'alto_riesgo',
   'fecha_ingreso', 'fecha_retiro', 'metodo_pago', 'banco', 'tipo_cuenta', 'numero_cuenta',
   'eps', 'fondo_pension', 'fondo_cesantias', 'arl', 'caja_compensacion',
 ];

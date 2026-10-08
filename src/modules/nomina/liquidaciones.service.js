@@ -3,7 +3,8 @@ import { pool, withTransaction } from '../../config/db.js';
 import { badRequest, conflict, notFound } from '../../utils/httpError.js';
 import { hoyCO } from '../../utils/formato.js';
 import { proveedorFE } from '../facturacion/index.js';
-import { liquidar, OTRAS_DEDUCCIONES, OTROS_DEVENGADOS, PARAMETROS, TIPOS_HORA, TIPOS_LICENCIA } from './calculo.js';
+import { liquidar, OTRAS_DEDUCCIONES, OTROS_DEVENGADOS, TIPOS_HORA, TIPOS_LICENCIA } from './calculo.js';
+import { parametrosDelAnio } from './parametros.service.js';
 import { faltantesParaNomina, obtenerEmpleado } from './empleados.service.js';
 
 /**
@@ -117,21 +118,22 @@ export function normalizarNovedades(raw = {}) {
 
 const ultimoDia = (anio, mes) => new Date(Date.UTC(anio, mes, 0)).toISOString().slice(0, 10);
 
-function validarPeriodo(anio, mes, empleado) {
+async function validarPeriodo(anio, mes, empleado) {
   const a = Number(anio);
   const m = Number(mes);
   if (!Number.isInteger(a) || !Number.isInteger(m) || m < 1 || m > 12) throw badRequest('Indique el año y el mes de la nómina.');
-  if (!PARAMETROS[a]) throw badRequest(`No están cargados el salario mínimo y el auxilio de transporte de ${a}.`);
+  const parametros = await parametrosDelAnio(a);
+  if (!parametros) throw badRequest(`No están cargados el salario mínimo y el auxilio de transporte de ${a}. Agréguelos en Nómina → Parámetros.`);
   const [hoyAnio, hoyMes] = hoyCO().split('-').map(Number);
   if (a > hoyAnio || (a === hoyAnio && m > hoyMes)) throw badRequest('No se puede liquidar un mes que todavía no ha empezado.');
   if (empleado.fecha_ingreso > ultimoDia(a, m)) throw badRequest(`${empleado.nombre} ingresó el ${empleado.fecha_ingreso}: no trabajó en ese mes.`);
   if (empleado.fecha_retiro && empleado.fecha_retiro < `${a}-${String(m).padStart(2, '0')}-01`) throw badRequest(`${empleado.nombre} se retiró el ${empleado.fecha_retiro}: no trabajó en ese mes.`);
-  return { anio: a, mes: m };
+  return { anio: a, mes: m, parametros };
 }
 
 function calcular(empleado, periodo, novedades) {
   try {
-    return liquidar({ salario: Number(empleado.salario), periodo, salarioIntegral: empleado.salario_integral, novedades });
+    return liquidar({ salario: Number(empleado.salario), periodo, salarioIntegral: empleado.salario_integral, novedades, parametros: periodo.parametros });
   } catch (err) {
     // Los errores de calculo.js son de datos (más de 30 días de novedades, tipo desconocido…), no del servidor.
     throw badRequest(err.message);
@@ -141,9 +143,9 @@ function calcular(empleado, periodo, novedades) {
 /** Vista previa: liquida sin guardar nada. */
 export async function previaLiquidacion({ empleado_id: empleadoId, anio, mes, novedades }) {
   const empleado = await obtenerEmpleado(empleadoId);
-  const periodo = validarPeriodo(anio, mes, empleado);
+  const periodo = await validarPeriodo(anio, mes, empleado);
   const limpias = normalizarNovedades(novedades);
-  return { empleado, periodo, novedades: limpias, liquidacion: calcular(empleado, periodo, limpias) };
+  return { empleado, periodo: { anio: periodo.anio, mes: periodo.mes }, novedades: limpias, liquidacion: calcular(empleado, periodo, limpias) };
 }
 
 // ─── Lectura ────────────────────────────────────────────────────────────────
@@ -168,8 +170,8 @@ export async function obtenerLiquidacion(id, client = pool) {
 
 // ─── Borrador ───────────────────────────────────────────────────────────────
 
-function datosDeGuardado(body, empleado) {
-  const periodo = validarPeriodo(body.anio, body.mes, empleado);
+async function datosDeGuardado(body, empleado) {
+  const periodo = await validarPeriodo(body.anio, body.mes, empleado);
   const novedades = normalizarNovedades(body.novedades);
   const liquidacion = calcular(empleado, periodo, novedades);
   // El proveedor exige al menos 1 día laborado y un sueldo mayor que cero (visto el 8-oct-2026):
@@ -184,7 +186,7 @@ function datosDeGuardado(body, empleado) {
 export async function crearLiquidacion(body, usuarioId) {
   const empleado = await obtenerEmpleado(body.empleado_id);
   if (!empleado.activo) throw badRequest('Ese empleado está inactivo.');
-  const d = datosDeGuardado(body, empleado);
+  const d = await datosDeGuardado(body, empleado);
   const viva = await pool.query(
     `SELECT estado FROM sst.nomina_liquidaciones WHERE empleado_id = $1 AND anio = $2 AND mes = $3 AND estado <> 'ANULADO'`,
     [empleado.id, d.periodo.anio, d.periodo.mes],
@@ -208,7 +210,7 @@ export async function actualizarLiquidacion(id, body, usuarioId) {
   if (!['BORRADOR', 'RECHAZADO'].includes(actual.estado)) throw conflict('Solo se puede cambiar una nómina en borrador o rechazada.');
   const empleado = await obtenerEmpleado(actual.empleado_id);
   // El periodo no se cambia: para otro mes se crea otra liquidación.
-  const d = datosDeGuardado({ ...body, anio: actual.anio, mes: actual.mes }, empleado);
+  const d = await datosDeGuardado({ ...body, anio: actual.anio, mes: actual.mes }, empleado);
   await pool.query(
     `UPDATE sst.nomina_liquidaciones
         SET estado = 'BORRADOR', salario = $2, salario_integral = $3, novedades = $4, liquidacion = $5, dias_trabajados = $6,
