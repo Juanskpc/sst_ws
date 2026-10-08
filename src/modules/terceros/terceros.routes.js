@@ -7,6 +7,8 @@ import {
   CAMPOS_TERCERO, CODIGO_CEDULA, TERCERO_FROM, TERCERO_SELECT,
   conFaltantes, documentoOcupado, validarTercero,
 } from './terceros.service.js';
+import { importarTerceros, plantillaTerceros } from './importar.service.js';
+import { uploadImport } from '../../middleware/upload.js';
 
 const router = Router();
 router.use(authRequired);
@@ -81,6 +83,25 @@ router.get('/', LEER, asyncHandler(async (req, res) => {
 
 // Datos con los que se propone crear el tercero de un profesional. Va ANTES de
 // `/:id` para que "desde-profesional" no se lea como un id.
+// 7-oct-2026 · Cargue por Excel (antes de /:id, que si no capturaría «plantilla.xlsx»).
+router.get('/plantilla.xlsx', LEER, asyncHandler(async (_req, res) => {
+  const buf = await plantillaTerceros();
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', 'attachment; filename="plantilla-terceros.xlsx"');
+  res.send(Buffer.from(buf));
+}));
+
+// ?simular=true revisa sin guardar. ?rol=AUTO|CLIENTE|PROVEEDOR|AMBOS para las filas sin roles
+// (la exportación de Siigo no los trae). Carga las filas válidas; las que ya existen no se tocan.
+router.post('/importar', ESCRIBIR, uploadImport.single('file'), asyncHandler(async (req, res) => {
+  if (!req.file) throw badRequest('Adjunte el Excel de terceros.');
+  res.json({
+    data: await importarTerceros(req.file.buffer, {
+      usuarioId: req.user.sub, simular: req.query.simular === 'true', rolPorDefecto: req.query.rol || 'AUTO',
+    }),
+  });
+}));
+
 router.get('/desde-profesional/:profesionalId', LEER, asyncHandler(async (req, res) => {
   const r = await pool.query(
     `SELECT p.id, p.nombre, p.correo, p.telefono, p.tercero_id, u.documento_identidad
