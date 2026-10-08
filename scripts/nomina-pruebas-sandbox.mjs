@@ -6,7 +6,7 @@
 //   node --import tsx scripts/nomina-pruebas-sandbox.mjs                 → SIMULA: arma y revisa las 20, no envía nada
 //   node --import tsx scripts/nomina-pruebas-sandbox.mjs --enviar --solo=1   → envía solo la n.º 1 (para probar el formato)
 //   node --import tsx scripts/nomina-pruebas-sandbox.mjs --enviar            → envía las 20
-//   opciones: --rango=<id del rango de nómina>   --fecha-hora=T (por defecto, con espacio, como el ejemplo oficial)
+//   opciones: --desde=<n> (retoma desde esa prueba)   --rango=<id del rango de nómina>   --fecha-hora=T (por defecto, con espacio, como el ejemplo oficial)
 //
 // Solo corre contra el ambiente de PRUEBAS y, para enviar, exige las credenciales de
 // pruebas propias del NIT (FACTUS_NOMINA_* en .env): con las genéricas las pruebas no
@@ -23,6 +23,7 @@ const args = process.argv.slice(2);
 const opcion = (n) => args.find((a) => a.startsWith(`--${n}=`))?.split('=')[1];
 const ENVIAR = args.includes('--enviar');
 const SOLO = opcion('solo') ? Number(opcion('solo')) : null;
+const DESDE = opcion('desde') ? Number(opcion('desde')) : 1;
 const SEPARADOR = opcion('fecha-hora') === 'T' ? 'T' : ' ';
 const SMMLV = parametrosDe(2026).smmlv;
 
@@ -115,7 +116,7 @@ const cobertura = {
 
 const DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '2-pruebas', 'nomina', `sandbox-${sello}`);
 fs.mkdirSync(DIR, { recursive: true });
-const elegidas = pruebas.filter((p) => !SOLO || p.n === SOLO);
+const elegidas = pruebas.filter((p) => (SOLO ? p.n === SOLO : p.n >= DESDE));
 
 console.log(`Nómina · ${env.factusNomina.url || '(sin URL)'} · usuario ${env.factusNomina.username || '(sin usuario)'}${env.factusNomina.propias ? '' : ' (credenciales de FACTURACIÓN, no propias de nómina)'}\n`);
 for (const p of elegidas) {
@@ -144,11 +145,32 @@ const rango = opcion('rango') ?? (() => {
   return deNomina.length === 1 ? null : deNomina[0]?.proveedorId; // con uno solo el proveedor lo elige
 })();
 
+/**
+ * Hallazgo del 8-oct-2026 (primera prueba): el proveedor crea la nómina, le pone número y
+ * CUNE, y a veces responde 500 antes de que la DIAN la valide. Queda «pendiente por
+ * enviar a la DIAN» y bloquea las siguientes (409); no se puede eliminar. Lo que la
+ * destraba es REPETIR EL MISMO ENVÍO CON LA MISMA REFERENCIA: no crea otra, devuelve la
+ * misma ya validada.
+ */
+async function emitirConReintento(datos) {
+  for (let intento = 1; ; intento++) {
+    try {
+      const r = await fe.emitirNominaElectronica(datos);
+      if (r.validado || intento >= 4) return r;
+    } catch (err) {
+      const reintentable = err.status === 500 || err.status === 0 || (err.status === 409 && /pendiente/i.test(err.message));
+      if (!reintentable || intento >= 4) throw err;
+      console.log(`     (intento ${intento}: HTTP ${err.status}; se repite con la misma referencia)`);
+    }
+    await new Promise((ok) => setTimeout(ok, 4000));
+  }
+}
+
 const resultados = [];
 for (const p of elegidas) {
   const datos = { ...p.datos, rangoId: rango ?? undefined };
   try {
-    const r = await fe.emitirNominaElectronica(datos);
+    const r = await emitirConReintento(datos);
     fs.writeFileSync(path.join(DIR, `${String(p.n).padStart(2, '0')}-respuesta.json`), JSON.stringify(r.respuestaCruda, null, 2));
     const avisos = [...r.eventos.rechazos, ...r.eventos.avisos].map(([k, v]) => `${k}: ${v}`);
     console.log(`${r.validado ? '✓' : '✗'} ${String(p.n).padStart(2)}. ${r.numeroDocumento ?? 'sin número'} · ${r.validado ? `VALIDADA · CUNE ${String(r.cufe).slice(0, 16)}…` : 'NO validada'}${avisos.length ? `\n     ${avisos.join('\n     ')}` : ''}`);

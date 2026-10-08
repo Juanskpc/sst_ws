@@ -585,8 +585,17 @@ export class FactusAdaptador extends PuertoFacturacionElectronica {
       salu: { amount: dosDec(x.salud.valor), percentage: dosDec(x.salud.porcentaje) },
       pens: { amount: dosDec(x.pension.valor), percentage: dosDec(x.pension.porcentaje) },
     };
-    // Fondo de solidaridad pensional: obligatorio desde 4 salarios mínimos (tipo 1 = solidaridad).
-    if (x.fondoSolidaridad) deductions.dedu = { amount: dosDec(x.fondoSolidaridad.valor), percentage: dosDec(x.fondoSolidaridad.porcentaje), deduction_type_code: 1 };
+    // Fondo de solidaridad pensional: obligatorio desde 4 salarios mínimos. El proveedor lo
+    // exige como LISTA (el 8-oct-2026 rechazó un objeto: «debe ser una lista»), una fila por
+    // subcuenta: 0,5 % a solidaridad (tipo 1) y el resto a subsistencia (tipo 2).
+    if (x.fondoSolidaridad) {
+      const { valor, porcentaje } = x.fondoSolidaridad;
+      const solidaridad = Math.round(valor * 0.5 / porcentaje * 100) / 100;
+      deductions.dedu = [
+        { amount: dosDec(solidaridad), percentage: dosDec(0.5), deduction_type_code: 1 },
+        { amount: dosDec(valor - solidaridad), percentage: dosDec(porcentaje - 0.5), deduction_type_code: 2 },
+      ];
+    }
 
     // Banco y cuenta solo cuando el pago es por consignación (42), transferencia (47) o
     // ilimitada (98): con otro medio el proveedor no los espera.
