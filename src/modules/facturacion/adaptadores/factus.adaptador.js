@@ -654,6 +654,14 @@ export class FactusAdaptador extends PuertoFacturacionElectronica {
   }
 
   /**
+   * DELETE /v2/payrolls/reference/:reference_code · quita una nómina que el proveedor creó
+   * pero la DIAN no validó. Mientras exista, bloquea la creación de cualquier otra (409).
+   */
+  async eliminarNominaNoValidada(referenceCode) {
+    await request('DELETE', `/v2/payrolls/reference/${encodeURIComponent(referenceCode)}`, undefined, { perfil: 'nomina' });
+  }
+
+  /**
    * Nota de ajuste de ELIMINACIÓN: anula una nómina ya validada (para corregirla se elimina
    * y se emite otra). POST /v2/adjustment-payrolls, probado en el ambiente de pruebas el
    * 8-oct-2026 (NAN1…NAN4). Una nómina solo admite una nota: la segunda responde 422.
