@@ -43,6 +43,17 @@ if (opcion === 'modelo') {
   });
   cliente = { nombre: 'COMPAÑIA DE SEGUROS BOLIVAR S A TAMBIEN PODRA GIRAR BAJO LA DENOMINACION SEGUROS BOLIVAR S A', documento: '860.002.503-2', direccion: 'AV EL DORADO 68B 31', telefono: '(000) 3410077', ciudad: 'Bogotá - Colombia' };
   resolucion = { numero_resolucion: '18764081426622', fecha_desde: '2024-10-11', fecha_hasta: '2026-10-11', prefijo: 'FE', desde: 401, hasta: 1000 };
+} else if (opcion === 'descuento') {
+  // La FE 756 del cliente (AXA, con descuento comercial): Total Bruto, Descuentos, Subtotal, Retefuente y Total a Pagar.
+  Object.assign(doc, {
+    prefijo: 'FE', numero: 'FE756', fecha_emision: '2026-05-08', fecha_vencimiento: '2026-05-08', actualizado_en: '2026-05-08T23:10:00Z',
+    forma_pago_nombre: 'Crédito', medio_pago_nombre: 'Otro', observaciones: null,
+    items: [{ codigo: '2', descripcion: '71-0001049906 CAP SG-SST PROF', cantidad: '4', valor_unitario: '58856', base: '230715.52', total_linea: '230715.52', iva_valor: '0' }],
+    retenciones: [{ codigo: 'RF-HON', tipo: 'RETEFUENTE', tarifa: '11', valor: '25378.71' }],
+    totales: { total_bruto: '235424', total_descuento: '4708.48', subtotal: '230715.52', total_iva: '0', total_retenciones: '25378.71', total_a_pagar: '205336.81' },
+  });
+  cliente = { nombre: 'AXA COLPATRIA SEGUROS DE VIDA SA', documento: '860.002.183-9', direccion: 'CR 7 24 89 P 7', telefono: '(000) 3422576', ciudad: 'Bogotá - Colombia' };
+  resolucion = { numero_resolucion: '18764081426622', fecha_desde: '2024-10-11', fecha_hasta: '2026-10-11', prefijo: 'FE', desde: 401, hasta: 1000 };
 } else if (Number(opcion) > 0) {
   // Para ver cómo se comporta con muchas líneas (una factura de Bolívar puede traer 30 órdenes).
   const base = doc.items[0];
