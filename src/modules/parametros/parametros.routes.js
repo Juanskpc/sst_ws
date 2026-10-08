@@ -67,7 +67,7 @@ router.get('/catalogos/:nombre', CONSULTAR, asyncHandler(async (req, res) => {
 
   const r = await pool.query(
     `SELECT c.id, c.codigo_dian, c.nombre, c.factus_id, c.activo
-            ${esMunicipio ? ', c.departamento_id, d.nombre AS departamento_nombre, d.codigo_dian AS departamento_codigo' : ''}
+            ${esMunicipio ? ', c.departamento_id, c.codigo_postal, d.nombre AS departamento_nombre, d.codigo_dian AS departamento_codigo' : ''}
        FROM sst.${tabla} c
        ${esMunicipio ? 'JOIN sst.departamentos d ON d.id = c.departamento_id' : ''}
       ${filtros.length ? `WHERE ${filtros.join(' AND ')}` : ''}

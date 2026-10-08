@@ -16,7 +16,7 @@ import { proveedorConfigurado, proveedorEsSandbox } from '../facturacion/index.j
 
 const EMISOR_SELECT = `
   e.tipo_persona, e.nit, e.dv, e.razon_social, e.nombre_comercial, e.direccion,
-  e.municipio_id, m.nombre AS municipio_nombre, m.codigo_dian AS municipio_codigo, dp.nombre AS departamento_nombre,
+  e.municipio_id, e.codigo_postal, m.nombre AS municipio_nombre, m.codigo_dian AS municipio_codigo, dp.nombre AS departamento_nombre,
   e.correo, e.telefono, e.ciiu_principal, e.ciiu_secundarias, e.responsabilidades_rut, e.ambiente,
   to_char(e.paquete_proveedor_vence, 'YYYY-MM-DD') AS paquete_proveedor_vence,
   to_char(e.documentos_certificado_enviados_en, 'YYYY-MM-DD') AS documentos_certificado_enviados_en,
@@ -73,8 +73,12 @@ export async function validarEmisor(b = {}, client = pool) {
   if (!direccion) throw badRequest('La dirección es obligatoria.');
 
   if (!b.municipio_id) throw badRequest('El municipio es obligatorio.');
-  const m = await client.query(`SELECT id FROM sst.municipios WHERE id = $1`, [b.municipio_id]);
+  const m = await client.query(`SELECT id, codigo_postal FROM sst.municipios WHERE id = $1`, [b.municipio_id]);
   if (!m.rows[0]) throw badRequest('El municipio no existe en el catálogo.');
+  // 7-oct-2026 · El código postal sale del municipio, salvo que se escriba otro.
+  let codigoPostal = String(b.codigo_postal ?? '').replace(/\D/g, '');
+  if (codigoPostal && codigoPostal.length !== 6) throw badRequest('El código postal tiene 6 dígitos.');
+  if (!codigoPostal) codigoPostal = m.rows[0].codigo_postal ?? null;
 
   const ciiuPrincipal = String(b.ciiu_principal ?? '').trim() || null;
   const ciiuSecundarias = lista(b.ciiu_secundarias);
@@ -97,6 +101,7 @@ export async function validarEmisor(b = {}, client = pool) {
     nombre_comercial: textoPersona(b.nombre_comercial) || null,
     direccion,
     municipio_id: m.rows[0].id,
+    codigo_postal: codigoPostal,
     correo: validarCorreo(b.correo),
     telefono: validarTelefono(b.telefono),
     ciiu_principal: ciiuPrincipal,
@@ -109,7 +114,7 @@ export async function validarEmisor(b = {}, client = pool) {
 }
 
 const CAMPOS = [
-  'tipo_persona', 'nit', 'dv', 'razon_social', 'nombre_comercial', 'direccion', 'municipio_id',
+  'tipo_persona', 'nit', 'dv', 'razon_social', 'nombre_comercial', 'direccion', 'municipio_id', 'codigo_postal',
   'correo', 'telefono', 'ciiu_principal', 'ciiu_secundarias', 'responsabilidades_rut', 'ambiente',
   'paquete_proveedor_vence', 'documentos_certificado_enviados_en',
 ];

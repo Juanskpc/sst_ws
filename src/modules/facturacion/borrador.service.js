@@ -562,6 +562,31 @@ export async function actualizarBorrador(id, body, usuarioId, dbClient = null) {
   });
 }
 
+/**
+ * 7-oct-2026 (reunión con JD&D) · Cambia SOLO la descripción de una línea del borrador.
+ * La contadora quiere redactar la actividad a su manera antes de emitir; las cifras,
+ * el descuento y las retenciones no se tocan (para eso está `actualizarBorrador`).
+ */
+export async function cambiarDescripcionItem(documentoId, itemId, descripcion, usuarioId) {
+  const texto = String(descripcion ?? '').replace(/\s+/g, ' ').trim();
+  if (!texto) throw badRequest('La descripción no puede quedar vacía.');
+  if (texto.length > 500) throw badRequest('La descripción no puede pasar de 500 caracteres.');
+  return withTransaction(async (client) => {
+    const doc = (await client.query(
+      `SELECT estado FROM sst.documentos_electronicos WHERE id = $1 AND tipo = 'FACTURA' FOR UPDATE`, [documentoId],
+    )).rows[0];
+    if (!doc) throw notFound('Esa factura no existe.');
+    if (doc.estado !== 'BORRADOR') throw conflict('La descripción solo se cambia mientras la factura está en borrador.');
+    const r = await client.query(
+      `UPDATE sst.documento_items SET descripcion = $3 WHERE id = $2 AND documento_id = $1 RETURNING id`,
+      [documentoId, itemId, texto],
+    );
+    if (!r.rows[0]) throw notFound('Esa línea no pertenece a esta factura.');
+    await client.query(`UPDATE sst.documentos_electronicos SET actualizado_por = $2 WHERE id = $1`, [documentoId, usuarioId]);
+    return obtenerBorrador(documentoId, client);
+  });
+}
+
 export async function eliminarBorrador(id, dbClient = null) {
   const r = await (dbClient ?? pool).query(`DELETE FROM sst.documentos_electronicos WHERE id = $1 AND tipo IN ('FACTURA', 'NOTA_CREDITO') AND estado = 'BORRADOR' RETURNING id`, [id]);
   if (!r.rows[0]) throw conflict('Solo se puede eliminar un documento en BORRADOR (o ya no existe).');

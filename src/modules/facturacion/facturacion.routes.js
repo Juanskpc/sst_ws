@@ -4,7 +4,7 @@ import { asyncHandler } from '../../utils/asyncHandler.js';
 import { badRequest } from '../../utils/httpError.js';
 import { authRequired, requireRole } from '../../middleware/auth.js';
 import { esBolivar, relacionPorFacturar, resolverSeleccion } from './relacion.service.js';
-import { actualizarBorrador, crearBorrador, eliminarBorrador, listarBorradores, obtenerBorrador } from './borrador.service.js';
+import { actualizarBorrador, cambiarDescripcionItem, crearBorrador, eliminarBorrador, listarBorradores, obtenerBorrador } from './borrador.service.js';
 import { corregirDocumento, emitirDocumento, numeroCompleto, reconciliarDocumento } from './emision.service.js';
 import { reenviarAlCliente } from './envio.service.js';
 import { storage } from '../../services/storage.service.js';
@@ -172,6 +172,14 @@ router.get('/borradores/:id', LEER, asyncHandler(async (req, res) => {
 router.put('/borradores/:id', OPERAR, asyncHandler(async (req, res) => {
   const data = await actualizarBorrador(uuidOpcional(req.params.id, 'id'), req.body || {}, req.user.sub);
   res.json({ message: 'Borrador actualizado.', data });
+}));
+
+// 7-oct-2026 · Solo el texto de una línea del borrador. Cuerpo: { descripcion }.
+router.patch('/borradores/:id/items/:itemId', OPERAR, asyncHandler(async (req, res) => {
+  const data = await cambiarDescripcionItem(
+    uuidOpcional(req.params.id, 'id'), uuidOpcional(req.params.itemId, 'itemId'), req.body?.descripcion, req.user.sub,
+  );
+  res.json({ message: 'Descripción actualizada.', data });
 }));
 
 router.delete('/borradores/:id', OPERAR, asyncHandler(async (req, res) => {

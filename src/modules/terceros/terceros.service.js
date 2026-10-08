@@ -25,7 +25,7 @@ export const TERCERO_SELECT = `
   t.numero_documento, t.dv,
   t.razon_social, t.nombres, t.apellidos, t.nombre_comercial,
   COALESCE(t.razon_social, btrim(concat_ws(' ', t.nombres, t.apellidos))) AS nombre,
-  t.direccion, t.municipio_id,
+  t.direccion, t.municipio_id, t.codigo_postal,
   m.nombre AS municipio_nombre, m.codigo_dian AS municipio_codigo,
   dp.nombre AS departamento_nombre,
   t.telefono, t.correo_facturacion, t.responsabilidades_fiscales, t.regimen,
@@ -137,10 +137,21 @@ export async function validarTercero(b = {}, client = pool) {
   }
 
   let municipioId = null;
+  let postalDelMunicipio = null;
   if (limpiar(b.municipio_id)) {
-    const m = await client.query(`SELECT id FROM sst.municipios WHERE id = $1`, [b.municipio_id]);
+    const m = await client.query(`SELECT id, codigo_postal FROM sst.municipios WHERE id = $1`, [b.municipio_id]);
     if (!m.rows[0]) throw badRequest('El municipio no existe en el catálogo.');
     municipioId = m.rows[0].id;
+    postalDelMunicipio = m.rows[0].codigo_postal;
+  }
+  // 7-oct-2026 · El código postal sale del municipio; si el formulario trae otro (la
+  // dirección cae en otra zona postal) se respeta. Seis dígitos, como los de 4-72.
+  let codigoPostal = limpiar(b.codigo_postal);
+  if (codigoPostal) {
+    codigoPostal = codigoPostal.replace(/\D/g, '');
+    if (codigoPostal.length !== 6) throw badRequest('El código postal tiene 6 dígitos.');
+  } else {
+    codigoPostal = municipioId ? postalDelMunicipio : null;
   }
 
   // Solo códigos que Factus acepta; sin esto un typo llegaría hasta la DIAN.
@@ -172,6 +183,7 @@ export async function validarTercero(b = {}, client = pool) {
     nombre_comercial: mayusculas(b.nombre_comercial, 'El nombre comercial'),
     direccion: mayusculas(b.direccion, 'La dirección', 200),
     municipio_id: municipioId,
+    codigo_postal: codigoPostal,
     telefono: validarTelefono(b.telefono),
     correo_facturacion: validarCorreo(b.correo_facturacion, { obligatorio: false }),
     responsabilidades_fiscales: responsabilidades,
@@ -184,7 +196,7 @@ export async function validarTercero(b = {}, client = pool) {
 export const CAMPOS_TERCERO = [
   'tipo_persona', 'tipo_documento_id', 'numero_documento', 'dv',
   'razon_social', 'nombres', 'apellidos', 'nombre_comercial',
-  'direccion', 'municipio_id', 'telefono', 'correo_facturacion',
+  'direccion', 'municipio_id', 'codigo_postal', 'telefono', 'correo_facturacion',
   'responsabilidades_fiscales', 'regimen',
   'es_cliente', 'es_proveedor', 'es_empleado', 'es_arl',
 ];

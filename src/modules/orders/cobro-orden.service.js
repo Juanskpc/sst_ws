@@ -32,6 +32,14 @@ export const GASTOS = [
   { clave: 'material', columna: 'cobro_material', etiqueta: 'Material', prefactura: 'material' },
 ];
 
+/**
+ * 7-oct-2026 (reunión con JD&D) · Valor por defecto de una orden que llega sin precio
+ * y cuyo pagador no tiene tarifa de venta: es el valor hora que hoy cobran (en el
+ * paquete FE 816 de Bolívar, 2 horas = 142.914). Se PROPONE igual que la tarifa: queda
+ * escrito en el campo, se puede cambiar y no cuenta hasta que alguien lo guarda.
+ */
+export const VALOR_POR_DEFECTO = 71457;
+
 /** Roles que aprueban el cobro: los de operación (decisión del 30-sep-2026). */
 export const ROLES_APRUEBAN = ['admin', 'administrativo'];
 
@@ -100,6 +108,8 @@ function calcular(o) {
   let precioSugerido = null;
   if (valorHora == null && o.tarifa_valor != null) {
     precioSugerido = { valor: Number(o.tarifa_valor), unidad: o.tarifa_unidad, origen: 'TARIFA' };
+  } else if (valorHora == null && honorarios == null) {
+    precioSugerido = { valor: VALOR_POR_DEFECTO, unidad: horas ? 'HORA' : 'UNIDAD', origen: 'POR_DEFECTO' };
   }
   return { horas, valor_hora: valorHora, honorarios, gastos, total_gastos: totalGastos, total, precio_sugerido: precioSugerido };
 }
