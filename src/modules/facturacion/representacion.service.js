@@ -29,7 +29,10 @@ const IZQ = 39;
 const DER = 543.5;
 const TABLA_ARRIBA = 191;
 const TABLA_CABECERA = 21;
-const TABLA_ABAJO = 479;
+// El modelo deja en blanco el último tramo de la hoja. JD&D pidió aprovecharla entera: el marco baja
+// hasta el margen inferior, la tabla de ítems gana ese alto y todo lo que va debajo se corre igual.
+const EXTRA = 80;
+const TABLA_ABAJO = 479 + EXTRA;
 // ítem · código · descripción · cantidad · vr. unitario · vr. bruto · impto. cargo · impto. rete. · vr. total
 const COLS = [39, 58, 86, 277.6, 311, 359.4, 407.6, 451, 494, 543.5];
 const TITULOS = [['Ítem'], ['Código'], ['Descripción'], ['Cantidad'], ['Vr. Unitario'], ['Vr. Bruto'], ['Valor', 'Impto.Cargo'], ['Valor', 'Impto.Rete.'], ['Vr. Total']];
@@ -120,10 +123,10 @@ export async function pdfFactura({ doc, emisor, cliente, resolucion = null, enla
 
   const marco = () => {
     // El marco redondeado que rodea toda la factura.
-    const [x, y, w, h, r] = [33, 33.5, 529, 695.5, 4];
+    const [x, y, w, h, r] = [33, 33.5, 529, 695.5 + EXTRA, 4];
     p.drawSvgPath(`M ${r},0 H ${w - r} Q ${w},0 ${w},${r} V ${h - r} Q ${w},${h} ${w - r},${h} H ${r} Q 0,${h} 0,${h - r} V ${r} Q 0,0 ${r},0 Z`,
       { x, y: H - y, borderColor: LINEA, borderWidth: 0.8 });
-    if (lateral) p.drawText(winAnsi(lateral), { x: 554.5, y: H - 538, size: 5.2, font: n, color: LATERAL, rotate: degrees(90) });
+    if (lateral) p.drawText(winAnsi(lateral), { x: 554.5, y: H - 538 - EXTRA, size: 5.2, font: n, color: LATERAL, rotate: degrees(90) });
   };
 
   const encabezado = () => {
@@ -210,7 +213,7 @@ export async function pdfFactura({ doc, emisor, cliente, resolucion = null, enla
   ];
   const xT = 381;
   const xTV = 462;
-  let yt = 484.7;
+  let yt = 484.7 + EXTRA;
   lineasTot.forEach(([k, v, negrita]) => {
     caja(xT, yt, DER, yt + 16.4);
     ver(xTV, yt, yt + 16.4);
@@ -219,18 +222,18 @@ export async function pdfFactura({ doc, emisor, cliente, resolucion = null, enla
     yt += 16.4;
   });
 
-  texto('Total items:', IZQ, 492, { f: b, s: 9 });
-  texto(String(filas.length), IZQ + ancho('Total items: ', { f: b, s: 9 }), 492, { s: 9 });
-  texto('Valor en Letras:', IZQ, 511, { f: b, s: 9 });
-  renglones(valorEnLetras(t.total_a_pagar), n, 6.6, 330).forEach((l, i) => texto(l, 44, 519.5 + i * 7.6, { s: 6.6 }));
-  texto('Forma de pago:', IZQ, 535.5, { f: b, s: 9 });
-  texto(doc.forma_pago_nombre || '', 44, 545.5, { s: 9 });
-  texto('Medio de pago:', IZQ, 564.5, { f: b, s: 9 });
-  texto(`${doc.medio_pago_nombre || 'Otro'} - ${doc.forma_pago_nombre || ''} - Cuota No. 001 vence el ${String(doc.fecha_vencimiento ?? '').slice(0, 10)} por`, 46, 574, { s: 6.6 });
-  texto('$', 276, 574, { s: 6.6 });
-  derecha(dinero(t.total_a_pagar), 345.5, 574, { s: 6.6 });
-  texto('Observaciones:', IZQ, 603.5, { f: b, s: 9 });
-  if (doc.observaciones) renglones(doc.observaciones, n, 6.6, 480).slice(0, 8).forEach((l, i) => texto(l, 44, 613 + i * 7.6, { s: 6.6 }));
+  texto('Total items:', IZQ, 492 + EXTRA, { f: b, s: 9 });
+  texto(String(filas.length), IZQ + ancho('Total items: ', { f: b, s: 9 }), 492 + EXTRA, { s: 9 });
+  texto('Valor en Letras:', IZQ, 511 + EXTRA, { f: b, s: 9 });
+  renglones(valorEnLetras(t.total_a_pagar), n, 6.6, 330).forEach((l, i) => texto(l, 44, 519.5 + EXTRA + i * 7.6, { s: 6.6 }));
+  texto('Forma de pago:', IZQ, 535.5 + EXTRA, { f: b, s: 9 });
+  texto(doc.forma_pago_nombre || '', 44, 545.5 + EXTRA, { s: 9 });
+  texto('Medio de pago:', IZQ, 564.5 + EXTRA, { f: b, s: 9 });
+  texto(`${doc.medio_pago_nombre || 'Otro'} - ${doc.forma_pago_nombre || ''} - Cuota No. 001 vence el ${String(doc.fecha_vencimiento ?? '').slice(0, 10)} por`, 46, 574 + EXTRA, { s: 6.6 });
+  texto('$', 276, 574 + EXTRA, { s: 6.6 });
+  derecha(dinero(t.total_a_pagar), 345.5, 574 + EXTRA, { s: 6.6 });
+  texto('Observaciones:', IZQ, 603.5 + EXTRA, { f: b, s: 9 });
+  if (doc.observaciones) renglones(doc.observaciones, n, 6.6, 480).slice(0, 8).forEach((l, i) => texto(l, 44, 613 + EXTRA + i * 7.6, { s: 6.6 }));
 
   // ── Leyenda legal, autorización de numeración y CUFE (centrados, como en el modelo)
   const cx = 297.6;
@@ -249,7 +252,7 @@ export async function pdfFactura({ doc, emisor, cliente, resolucion = null, enla
     lineas[lineas.length - 1].push([w, f]);
     wLinea += wPal;
   }
-  let yl = 688;
+  let yl = 688 + EXTRA;
   for (const linea of lineas) {
     const total = linea.reduce((a, [w, f]) => a + f.widthOfTextAtSize(winAnsi(`${w} `), 5.7), 0);
     let x = cx - total / 2;
