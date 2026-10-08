@@ -73,6 +73,39 @@ export const TIPOS_LICENCIA = {
 };
 
 /**
+ * Otros pagos al trabajador (8-oct-2026). `salarial` decide si entran a la base de
+ * cotización de salud y pensión. `concepto` y `codigo` son los de la nómina electrónica.
+ * ❓ Ley 1393 de 2010, art. 30: si lo NO salarial pasa del 40 % de la remuneración total,
+ * el exceso también cotiza. Aquí no se aplica ese tope: lo revisa la contadora.
+ */
+export const OTROS_DEVENGADOS = {
+  BONIFICACION_NO_SALARIAL: { nombre: 'Bonificación no salarial', salarial: false, concepto: 'boni', codigo: 2 },
+  AUXILIO_SALARIAL: { nombre: 'Auxilio salarial', salarial: true, concepto: 'auxi', codigo: 1 },
+  AUXILIO_NO_SALARIAL: { nombre: 'Auxilio no salarial', salarial: false, concepto: 'auxi', codigo: 2 },
+  VIATICO_SALARIAL: { nombre: 'Viáticos (manutención y alojamiento, salariales)', salarial: true, concepto: 'tra', codigo: 2 },
+  VIATICO_NO_SALARIAL: { nombre: 'Viáticos (no salariales)', salarial: false, concepto: 'tra', codigo: 3 },
+  OTRO_SALARIAL: { nombre: 'Otro pago salarial', salarial: true, concepto: 'otro', codigo: 1, conDescripcion: true },
+  OTRO_NO_SALARIAL: { nombre: 'Otro pago no salarial', salarial: false, concepto: 'otro', codigo: 2, conDescripcion: true },
+};
+
+/**
+ * Otras deducciones (las autoriza el trabajador o las ordena un juez; no las calcula
+ * ORBITA: se escribe el valor). `unica`: el documento electrónico solo admite una fila
+ * de ese concepto, así que varias del mismo tipo se suman al emitir.
+ */
+export const OTRAS_DEDUCCIONES = {
+  LIBRANZA: { nombre: 'Libranza', concepto: 'libr', conDescripcion: true },
+  RETENCION_FUENTE: { nombre: 'Retención en la fuente', concepto: 'rete', unica: true },
+  EMBARGO: { nombre: 'Embargo', concepto: 'emba', unica: true },
+  COOPERATIVA: { nombre: 'Aporte a cooperativa', concepto: 'coop', unica: true },
+  ANTICIPO: { nombre: 'Anticipo de nómina', concepto: 'anti' },
+  DEUDA_EMPRESA: { nombre: 'Deuda con la empresa', concepto: 'deud', unica: true },
+  PENSION_VOLUNTARIA: { nombre: 'Pensión voluntaria', concepto: 'pevo', unica: true },
+  AFC: { nombre: 'Ahorro AFC', concepto: 'afco', unica: true },
+  OTRA: { nombre: 'Otra deducción', concepto: 'otra' },
+};
+
+/**
  * Fondo de solidaridad pensional (Ley 797 de 2003, art. 7): lo paga el trabajador cuando
  * su ingreso base es de 4 salarios mínimos o más. 1 % hasta 16 SMMLV y sube por tramos.
  * La mitad va a solidaridad y la mitad a subsistencia; los puntos adicionales, a subsistencia.
@@ -102,6 +135,8 @@ export function porcentajeFondoSolidaridad(ibc, smmlv) {
  * @param {number} [e.novedades.bonificacion]       bonificación salarial
  * @param {{dias:number}} [e.novedades.prima]       días del semestre que se pagan (180 = semestre completo)
  * @param {{dias:number}} [e.novedades.cesantias]   días del año que se liquidan (360 = año completo); paga también los intereses
+ * @param {{tipo:string, valor:number, descripcion?:string}[]} [e.novedades.otrosDevengados]   tipo: clave de OTROS_DEVENGADOS
+ * @param {{tipo:string, valor:number, descripcion?:string}[]} [e.novedades.otrasDeducciones]  tipo: clave de OTRAS_DEDUCCIONES
  */
 export function liquidar({ salario, periodo, salarioIntegral = false, novedades = {} }) {
   const { smmlv, auxilioTransporte } = parametrosDe(periodo.anio);
@@ -152,6 +187,13 @@ export function liquidar({ salario, periodo, salarioIntegral = false, novedades 
 
   const comisiones = r2(novedades.comisiones ?? 0);
   const bonificacion = r2(novedades.bonificacion ?? 0);
+  const otros = (novedades.otrosDevengados ?? []).filter((o) => o.valor > 0).map((o) => {
+    const t = OTROS_DEVENGADOS[o.tipo];
+    if (!t) throw new Error(`Tipo de pago desconocido: ${o.tipo}.`);
+    return { tipo: o.tipo, valor: r2(o.valor), descripcion: o.descripcion ?? null, salarial: t.salarial };
+  });
+  const otrosSalariales = otros.filter((o) => o.salarial).reduce((s, o) => s + o.valor, 0);
+  const otrosNoSalariales = otros.filter((o) => !o.salarial).reduce((s, o) => s + o.valor, 0);
 
   // Auxilio de transporte (Ley 15 de 1959): para quien gana hasta 2 salarios mínimos,
   // proporcional a los días efectivamente laborados. No es salario para la seguridad
@@ -182,7 +224,7 @@ export function liquidar({ salario, periodo, salarioIntegral = false, novedades 
   // parafiscales). ❓ La incapacidad cotiza sobre lo pagado (así se deja). Mínimo 1 SMMLV
   // proporcional a los días; máximo 25 SMMLV. El salario integral cotiza sobre el 70 %.
   const compensadas = vacacionesLiq.filter((v) => v.codigo === 2).reduce((s, v) => s + v.valor, 0);
-  const salarial = sueldo + horas.reduce((s, h) => s + h.valor, 0) + comisiones + bonificacion
+  const salarial = sueldo + horas.reduce((s, h) => s + h.valor, 0) + comisiones + bonificacion + otrosSalariales
     + vacacionesLiq.reduce((s, v) => s + v.valor, 0)
     + licenciasLiq.reduce((s, l) => s + l.valor, 0)
     + incapacidadesLiq.reduce((s, i) => s + i.valor, 0);
@@ -196,14 +238,21 @@ export function liquidar({ salario, periodo, salarioIntegral = false, novedades 
     salud: { porcentaje: 4, valor: r2(ibc * 0.04) },
     pension: { porcentaje: 4, valor: r2(ibc * 0.04) },
     fondoSolidaridad: pctFsp ? { porcentaje: pctFsp, valor: r2(ibc * pctFsp / 100) } : null,
+    otras: (novedades.otrasDeducciones ?? []).filter((o) => o.valor > 0).map((o) => {
+      if (!OTRAS_DEDUCCIONES[o.tipo]) throw new Error(`Tipo de deducción desconocido: ${o.tipo}.`);
+      return { tipo: o.tipo, valor: r2(o.valor), descripcion: o.descripcion ?? null };
+    }),
   };
 
   const devengados = {
     sueldo, auxilioTransporte: auxilio, horas, comisiones, bonificacion,
-    vacaciones: vacacionesLiq, licencias: licenciasLiq, incapacidades: incapacidadesLiq, prima, cesantias,
+    vacaciones: vacacionesLiq, licencias: licenciasLiq, incapacidades: incapacidadesLiq, prima, cesantias, otros,
   };
-  const totalDevengado = r2(salarial + auxilio + (prima?.valor ?? 0) + (cesantias ? cesantias.valor + cesantias.intereses : 0));
-  const totalDeducido = r2(deducciones.salud.valor + deducciones.pension.valor + (deducciones.fondoSolidaridad?.valor ?? 0));
+  const totalDevengado = r2(salarial + otrosNoSalariales + auxilio + (prima?.valor ?? 0) + (cesantias ? cesantias.valor + cesantias.intereses : 0));
+  const totalDeducido = r2(deducciones.salud.valor + deducciones.pension.valor + (deducciones.fondoSolidaridad?.valor ?? 0)
+    + deducciones.otras.reduce((s, o) => s + o.valor, 0));
+  // No se puede pagar un neto negativo: las deducciones se reparten en varios meses.
+  if (totalDeducido > totalDevengado) throw new Error('Las deducciones superan lo devengado: el neto a pagar no puede ser negativo.');
 
   return {
     diasTrabajados, ibc, devengados, deducciones,

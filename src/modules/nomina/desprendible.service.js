@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import QRCode from 'qrcode';
 import { PDFDocument, StandardFonts, degrees, rgb } from 'pdf-lib';
 import { pool } from '../../config/db.js';
-import { TIPOS_HORA, TIPOS_LICENCIA } from './calculo.js';
+import { OTRAS_DEDUCCIONES, OTROS_DEVENGADOS, TIPOS_HORA, TIPOS_LICENCIA } from './calculo.js';
 import { obtenerEmpleado } from './empleados.service.js';
 import { obtenerLiquidacion } from './liquidaciones.service.js';
 
@@ -44,9 +44,12 @@ export function renglonesDesprendible(r) {
     devengados.push(['Cesantías', `${d.cesantias.dias} días`, d.cesantias.valor]);
     devengados.push(['Intereses a las cesantías', `${d.cesantias.porcentajeIntereses} %`, d.cesantias.intereses]);
   }
+  // `?? []`: las liquidaciones guardadas antes del 8-oct-2026 no traen estas listas.
+  for (const o of d.otros ?? []) devengados.push([o.descripcion || OTROS_DEVENGADOS[o.tipo]?.nombre || 'Otro pago', o.descripcion ? OTROS_DEVENGADOS[o.tipo]?.nombre ?? '' : (o.salarial ? '' : 'no salarial'), o.valor]);
   const x = r.deducciones;
   const deducciones = [['Salud', `${x.salud.porcentaje} %`, x.salud.valor], ['Pensión', `${x.pension.porcentaje} %`, x.pension.valor]];
   if (x.fondoSolidaridad) deducciones.push(['Fondo de solidaridad pensional', `${x.fondoSolidaridad.porcentaje} %`, x.fondoSolidaridad.valor]);
+  for (const o of x.otras ?? []) deducciones.push([OTRAS_DEDUCCIONES[o.tipo]?.nombre ?? 'Otra deducción', o.descripcion ?? '', o.valor]);
   return { devengados, deducciones };
 }
 

@@ -1,4 +1,4 @@
-import { PARAMETROS, TIPOS_HORA, TIPOS_LICENCIA } from './calculo.js';
+import { OTRAS_DEDUCCIONES, OTROS_DEVENGADOS, PARAMETROS, TIPOS_HORA, TIPOS_LICENCIA } from './calculo.js';
 
 /**
  * Tablas de la nómina electrónica que la pantalla necesita para sus selectores. Son las
@@ -46,6 +46,8 @@ export function catalogosNomina() {
     tipos_cuenta: TIPOS_CUENTA,
     tipos_hora: Object.entries(TIPOS_HORA).map(([clave, t]) => ({ clave, nombre: t.nombre, porcentaje: t.porcentaje })),
     tipos_licencia: Object.entries(TIPOS_LICENCIA).map(([clave, t]) => ({ clave, nombre: t.nombre, remunerada: t.remunerada })),
+    otros_devengados: Object.entries(OTROS_DEVENGADOS).map(([clave, t]) => ({ clave, nombre: t.nombre, salarial: t.salarial, conDescripcion: Boolean(t.conDescripcion) })),
+    otras_deducciones: Object.entries(OTRAS_DEDUCCIONES).map(([clave, t]) => ({ clave, nombre: t.nombre, conDescripcion: Boolean(t.conDescripcion) })),
     parametros: Object.entries(PARAMETROS).map(([anio, p]) => ({ anio: Number(anio), smmlv: p.smmlv, auxilio_transporte: p.auxilioTransporte })),
   };
 }

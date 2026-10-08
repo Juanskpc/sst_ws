@@ -1,6 +1,7 @@
 import { PuertoFacturacionElectronica } from '../puerto.js';
 import { request } from './factus.cliente.js';
 import { hoyCO } from '../../../utils/formato.js';
+import { OTRAS_DEDUCCIONES, OTROS_DEVENGADOS } from '../../nomina/calculo.js';
 
 /**
  * Factus nombra el documento de cada rango con un texto ("Factura de Venta",
@@ -581,6 +582,14 @@ export class FactusAdaptador extends PuertoFacturacionElectronica {
       ];
     }
 
+    // Otros pagos (8-oct-2026): cada uno va a la lista de su concepto con su código. El auxilio de
+    // transporte y los viáticos comparten la lista `tra`. ⚠️ Estos conceptos siguen la
+    // documentación del proveedor; no se alcanzaron a probar en el ambiente de pruebas.
+    for (const o of d.otros ?? []) {
+      const t = OTROS_DEVENGADOS[o.tipo];
+      (accruals[t.concepto] ??= []).push({ amount: dosDec(o.valor), ...(t.conDescripcion ? { description: String(o.descripcion || t.nombre).slice(0, 200) } : {}), accrual_type_code: t.codigo });
+    }
+
     const deductions = {
       salu: { amount: dosDec(x.salud.valor), percentage: dosDec(x.salud.porcentaje) },
       pens: { amount: dosDec(x.pension.valor), percentage: dosDec(x.pension.porcentaje) },
@@ -595,6 +604,17 @@ export class FactusAdaptador extends PuertoFacturacionElectronica {
         { amount: dosDec(solidaridad), percentage: dosDec(0.5), deduction_type_code: 1 },
         { amount: dosDec(valor - solidaridad), percentage: dosDec(porcentaje - 0.5), deduction_type_code: 2 },
       ];
+    }
+
+    // Otras deducciones: las de fila única (retención, embargo…) son un objeto y se suman; las
+    // demás (libranza, anticipo, otra) son listas. ⚠️ Mismo aviso: según la documentación.
+    for (const o of x.otras ?? []) {
+      const t = OTRAS_DEDUCCIONES[o.tipo];
+      if (t.unica) {
+        deductions[t.concepto] = { amount: dosDec(Number(deductions[t.concepto]?.amount ?? 0) + o.valor) };
+      } else {
+        (deductions[t.concepto] ??= []).push({ amount: dosDec(o.valor), ...(t.conDescripcion ? { description: String(o.descripcion || t.nombre).slice(0, 200) } : {}) });
+      }
     }
 
     // Banco y cuenta solo cuando el pago es por consignación (42), transferencia (47) o

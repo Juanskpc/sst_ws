@@ -73,6 +73,23 @@ try {
   await debeFallar(() => previaLiquidacion({ ...base, anio: 2024, mes: 1, novedades: {} }), 'año sin parámetros cargados');
   await debeFallar(() => crearLiquidacion({ ...base, mes: 9, novedades: { vacaciones: [{ dias: 30 }] } }, usuario), 'mes completo de vacaciones');
   await debeFallar(() => crearLiquidacion({ ...base, mes: 9, novedades: { horas: [{ tipo: 'HED', cantidad: 2.5 }] } }, usuario), 'horas con fracción');
+  // ── Otros pagos y otras deducciones
+  const otros = await previaLiquidacion({ ...base, mes: 9, novedades: {
+    otrosDevengados: [{ tipo: 'AUXILIO_SALARIAL', valor: 200000 }, { tipo: 'BONIFICACION_NO_SALARIAL', valor: 150000 }, { tipo: 'OTRO_NO_SALARIAL', valor: 50000, descripcion: 'Auxilio de conectividad' }],
+    otrasDeducciones: [{ tipo: 'LIBRANZA', valor: 300000, descripcion: 'Banco Popular' }, { tipo: 'EMBARGO', valor: 100000 }, { tipo: 'EMBARGO', valor: 50000 }, { tipo: 'ANTICIPO', valor: 80000 }],
+  } });
+  const lo = otros.liquidacion;
+  comprobar(lo.ibc === 2_600_000 && lo.deducciones.salud.valor === 104000, `lo salarial entra a la base (IBC ${lo.ibc}); lo no salarial no`);
+  comprobar(lo.totales.devengado === 2_400_000 + 249_095 + 400_000 && lo.totales.deducido === 208000 + 530000, `totales con otros pagos y deducciones: ${lo.totales.devengado} − ${lo.totales.deducido} = ${lo.totales.neto}`);
+  const cuerpoOtros = fe.cuerpoNomina({ referenceCode: 'X', periodo: { anio: 2026, mes: 9 }, pago: { metodoCodigo: '10', fecha: '2026-09-30' },
+    trabajador: { numeroDocumento: '1', primerNombre: 'A', primerApellido: 'B', segundoApellido: 'C', direccion: 'D', municipioDane: '52001', tipoContratoCodigo: '2', salario: 2_400_000, fechaIngreso: '2024-02-01' }, liquidacion: lo });
+  comprobar(cuerpoOtros.accruals.auxi.length === 1 && cuerpoOtros.accruals.boni[0].accrual_type_code === 2 && cuerpoOtros.accruals.otro[0].description === 'Auxilio de conectividad' && cuerpoOtros.accruals.tra.length === 1,
+    'en el documento: auxilio, bonificación no salarial y «otro» con su descripción');
+  comprobar(cuerpoOtros.deductions.emba.amount === '150000.00' && cuerpoOtros.deductions.libr[0].description === 'Banco Popular' && cuerpoOtros.deductions.anti.length === 1,
+    'en el documento: dos embargos sumados en una fila, libranza con descripción y anticipo');
+  await debeFallar(() => previaLiquidacion({ ...base, mes: 9, novedades: { otrasDeducciones: [{ tipo: 'LIBRANZA', valor: 100000 }] } }), 'libranza sin descripción');
+  await debeFallar(() => previaLiquidacion({ ...base, mes: 9, novedades: { otrasDeducciones: [{ tipo: 'OTRA', valor: 9_000_000 }] } }), 'deducciones mayores que lo devengado');
+
   const l1 = await crearLiquidacion({ ...base, mes: 9, novedades: nov }, usuario);
   comprobar(l1.estado === 'BORRADOR' && Number(l1.neto) === 2770436.32, 'borrador de septiembre guardado');
   await debeFallar(() => crearLiquidacion({ ...base, mes: 9, novedades: {} }, usuario), 'segunda nómina del mismo mes');

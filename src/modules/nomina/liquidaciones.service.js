@@ -3,7 +3,7 @@ import { pool, withTransaction } from '../../config/db.js';
 import { badRequest, conflict, notFound } from '../../utils/httpError.js';
 import { hoyCO } from '../../utils/formato.js';
 import { proveedorFE } from '../facturacion/index.js';
-import { liquidar, PARAMETROS, TIPOS_HORA, TIPOS_LICENCIA } from './calculo.js';
+import { liquidar, OTRAS_DEDUCCIONES, OTROS_DEVENGADOS, PARAMETROS, TIPOS_HORA, TIPOS_LICENCIA } from './calculo.js';
 import { faltantesParaNomina, obtenerEmpleado } from './empleados.service.js';
 
 /**
@@ -97,6 +97,19 @@ export function normalizarNovedades(raw = {}) {
   if (bonificacion) n.bonificacion = bonificacion;
   if (Number(raw.prima?.dias) > 0) n.prima = { dias: entero(raw.prima.dias, 'Los días de la prima', { max: 180 }) };
   if (Number(raw.cesantias?.dias) > 0) n.cesantias = { dias: entero(raw.cesantias.dias, 'Los días de las cesantías', { max: 360 }) };
+
+  // Otros pagos y otras deducciones: tipo, valor y, donde el documento la pide, una descripción.
+  const conValor = (filas, tabla, nombre) => lista(filas).filter((f) => f && Number(f.valor) > 0).map((f, i) => {
+    const t = tabla[f.tipo];
+    if (!t) throw badRequest(`${nombre}, fila ${i + 1}: elija el tipo.`);
+    const descripcion = String(f.descripcion ?? '').replace(/\s+/g, ' ').trim().slice(0, 200) || undefined;
+    if (t.conDescripcion && !descripcion) throw badRequest(`${nombre}, fila ${i + 1}: escriba la descripción (${t.nombre.toLowerCase()}).`);
+    return { tipo: f.tipo, valor: dinero(f.valor, `${nombre}, fila ${i + 1}: el valor`), descripcion };
+  });
+  const otrosDevengados = conValor(raw.otrosDevengados, OTROS_DEVENGADOS, 'Otros pagos');
+  if (otrosDevengados.length) n.otrosDevengados = otrosDevengados;
+  const otrasDeducciones = conValor(raw.otrasDeducciones, OTRAS_DEDUCCIONES, 'Otras deducciones');
+  if (otrasDeducciones.length) n.otrasDeducciones = otrasDeducciones;
   return n;
 }
 
