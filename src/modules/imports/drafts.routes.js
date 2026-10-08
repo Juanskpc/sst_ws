@@ -104,6 +104,9 @@ const DRAFT_SELECT = `
          o.cobro_aprobado_en AS os_cobro_aprobado_en,
          -- 1-oct-2026 · N.º de radicado ante Bolívar, bajo el botón de Cobro.
          o.numero_radicado AS os_numero_radicado,
+         -- 7-oct-2026 · Fecha y visto bueno del radicado vigente.
+         to_char(o.radicado_fecha, 'YYYY-MM-DD') AS os_radicado_fecha,
+         o.radicado_aprobado AS os_radicado_aprobado,
          -- A3-01 · Orden de un cliente particular (sin ARL): quién la paga. La
          -- vista lo enseña donde las demás llevan la ARL, y oculta lo que solo
          -- tiene sentido con una (estado ARL, prefactura, formatos).

@@ -1,4 +1,5 @@
 import { PDFDocument } from 'pdf-lib';
+import { actualizarRadicado, crearRadicado, eliminarRadicado, listarRadicados } from './radicados.service.js';
 import { Router } from 'express';
 import { pool, withTransaction } from '../../config/db.js';
 import { asyncHandler } from '../../utils/asyncHandler.js';
@@ -2187,29 +2188,23 @@ router.patch('/:id/validado-plataforma', requireRole('admin', 'administrativo', 
 }));
 
 /**
- * 1-oct-2026 · N.º de radicado ante Bolívar. Lo escribe JD&D a mano para mapear
- * la orden con lo que radicó; solo existe en Bolívar. Vacío lo borra.
+ * 7-oct-2026 · Radicados de la orden ante Bolívar: número, fecha y visto bueno, con
+ * historial (reemplaza al texto suelto del 1-oct). El vigente es el más reciente.
+ * Cada llamada devuelve la lista completa, ya ordenada.
  */
-router.patch('/:id/radicado', requireRole('admin', 'administrativo', 'contador'), asyncHandler(async (req, res) => {
-  const numero = String(req.body?.numero_radicado ?? '').trim().replace(/\s+/g, ' ') || null;
-  if (numero && numero.length > 40) throw badRequest('El n.º de radicado no puede pasar de 40 caracteres.');
-  const o = (await pool.query(
-    `SELECT a.nombre AS arl FROM sst.ordenes_servicio o JOIN sst.arls a ON a.id = o.arl_id WHERE o.id = $1`,
-    [req.params.id],
-  )).rows[0];
-  if (!o) throw badRequest('Orden no encontrada');
-  if (!esBolivar(o.arl)) throw badRequest('El n.º de radicado solo aplica a las órdenes de Bolívar.');
-  const r = await pool.query(
-    `UPDATE sst.ordenes_servicio
-        SET numero_radicado     = $2,
-            numero_radicado_en  = CASE WHEN $2::text IS NULL THEN NULL ELSE now() END,
-            numero_radicado_por = CASE WHEN $2::text IS NULL THEN NULL ELSE $3::uuid END,
-            actualizado_en = now()
-      WHERE id = $1
-      RETURNING numero_radicado`,
-    [req.params.id, numero, req.user.sub],
-  );
-  res.json({ data: { numero_radicado: r.rows[0].numero_radicado } });
+const RADICA = requireRole('admin', 'administrativo', 'contador');
+router.get('/:id/radicados', asyncHandler(async (req, res) => {
+  res.json({ data: await listarRadicados(req.params.id) });
+}));
+// Cuerpo: { numero, fecha?, aprobado? }. Pasa a ser el vigente.
+router.post('/:id/radicados', RADICA, asyncHandler(async (req, res) => {
+  res.status(201).json({ data: await crearRadicado(req.params.id, req.body || {}, req.user.sub) });
+}));
+router.patch('/:id/radicados/:radicadoId', RADICA, asyncHandler(async (req, res) => {
+  res.json({ data: await actualizarRadicado(req.params.id, req.params.radicadoId, req.body || {}) });
+}));
+router.delete('/:id/radicados/:radicadoId', RADICA, asyncHandler(async (req, res) => {
+  res.json({ data: await eliminarRadicado(req.params.id, req.params.radicadoId) });
 }));
 
 export default router;
