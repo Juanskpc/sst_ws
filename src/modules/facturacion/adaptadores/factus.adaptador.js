@@ -653,6 +653,31 @@ export class FactusAdaptador extends PuertoFacturacionElectronica {
     };
   }
 
+  /**
+   * Nota de ajuste de ELIMINACIÓN: anula una nómina ya validada (para corregirla se elimina
+   * y se emite otra). POST /v2/adjustment-payrolls, probado en el ambiente de pruebas el
+   * 8-oct-2026 (NAN1…NAN4). Una nómina solo admite una nota: la segunda responde 422.
+   * @param {{referenceCode: string, numeroNomina: string, rangoId?: string}} datos
+   */
+  async emitirNotaAjusteNomina(datos) {
+    const r = await request('POST', '/v2/adjustment-payrolls', {
+      payroll_number: datos.numeroNomina,
+      reference_code: datos.referenceCode,
+      numbering_range_id: datos.rangoId || undefined,
+    }, { perfil: 'nomina' });
+    const n = r.data?.adjustment_payroll || r.data || {};
+    const { rechazos, avisos } = clasificarErrores(n.errors);
+    return {
+      referenceCode: datos.referenceCode,
+      numeroDocumento: n.number || null,
+      validado: Boolean(n.is_validated),
+      cufe: n.cune || null,
+      urlPublica: n.qr || null,
+      eventos: { rechazos, avisos },
+      respuestaCruda: r,
+    };
+  }
+
   /** GET /v2/numbering-ranges/payrolls · rangos de nómina y de nota de ajuste de nómina. */
   async listarRangosNomina() {
     const r = await request('GET', '/v2/numbering-ranges/payrolls', undefined, { perfil: 'nomina' });
