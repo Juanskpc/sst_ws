@@ -3,6 +3,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import QRCode from 'qrcode';
 import { PDFDocument, StandardFonts, degrees, rgb } from 'pdf-lib';
+import { pool } from '../../config/db.js';
+import { storage } from '../../services/storage.service.js';
+import { obtenerBorrador } from './borrador.service.js';
 
 /**
  * 7-oct-2026 (reunión con JD&D) · REPRESENTACIÓN GRÁFICA PROPIA de la factura.
@@ -13,9 +16,9 @@ import { PDFDocument, StandardFonts, degrees, rgb } from 'pdf-lib';
  * medidas de abajo están tomadas de ese PDF (A4, en puntos, medidas desde arriba).
  * Una primera propuesta con otro diseño fue rechazada: aquí no se «mejora» nada.
  *
- * ⚠️ Todavía NO reemplaza al PDF que devuelve el proveedor tecnológico (el de
- * `pdf_path`, que es el que se envía al cliente). Solo se genera con
- * `scripts/muestra-factura-pdf.mjs` hasta que el cliente apruebe la muestra.
+ * Desde el 8-oct-2026 es el PDF que se ve, se descarga, se reenvía y va en el paquete para
+ * la ARL (`pdfDeDocumento`). El correo automático de la emisión lo sigue mandando el
+ * proveedor tecnológico con su propio PDF.
  */
 
 const ASSETS = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../assets/facturacion');
@@ -138,7 +141,8 @@ export async function pdfFactura({ doc, emisor, cliente, resolucion = null, enla
     let y = 57;
     renglones(emisor.razon_social, b, 6.6, 138).forEach((l) => { centro(l, cx, y, { f: b, s: 6.6 }); y += 7.6; });
     [`NIT ${emisor.nit}`, emisor.direccion, emisor.telefono ? `Tel: ${emisor.telefono}` : null, emisor.ciudad, emisor.correo]
-      .filter(Boolean).forEach((l) => { centro(l, cx, y, { s: 6.6 }); y += 7.5; });
+      // Cada dato se parte si no cabe entre el logo y el QR (la dirección nueva es más larga que la del modelo).
+      .filter(Boolean).flatMap((l) => renglones(l, n, 6.6, 138)).forEach((l) => { centro(l, cx, y, { s: 6.6 }); y += 7.5; });
     if (qr) p.drawImage(qr, { x: 306.5, y: H - 113, width: 71.5, height: 71.5 });
     caja(382.5, 62.5, DER, 97.5);
     centro('Factura electrónica de venta', (382.5 + DER) / 2, 78.5, { s: 9 });
@@ -266,4 +270,69 @@ export async function pdfFactura({ doc, emisor, cliente, resolucion = null, enla
   texto(doc.cufe ?? '', cx - wCufe / 2 + ancho('CUFE: ', { f: b, s: 5.7 }), yl, { s: 5.7 });
 
   return Buffer.from(await pdf.save());
+}
+
+/**
+ * La leyenda del borde derecho. JD&D factura en modo «software propio» ante la DIAN, y es
+ * la misma frase que trae el PDF que entrega el proveedor tecnológico.
+ */
+const LEYENDA_LATERAL = 'Software: ORBITA. Factura electrónica generada con software propio autorizado por la DIAN. Firma electrónica: ver en el XML.';
+
+/**
+ * 8-oct-2026 · El PDF propio de una factura ya validada, armado con lo que hay en la base.
+ * Es el que se ve, se descarga, se reenvía al cliente y va en el paquete para la ARL.
+ *
+ * Devuelve `null` cuando no se puede armar (no es una factura validada, o falta la
+ * empresa emisora en Parametrización): quien llama cae entonces al PDF guardado del
+ * proveedor (`pdf_path`). Las notas crédito y los documentos soporte siguen con ese.
+ */
+export async function pdfPropioFactura(documentoId, db = pool) {
+  const doc = await obtenerBorrador(documentoId, db);
+  if (doc.tipo !== 'FACTURA' || !['VALIDADO', 'ANULADO'].includes(doc.estado) || !doc.cufe) return null;
+
+  const e = (await db.query(
+    `SELECT e.razon_social, e.nit, e.dv, e.direccion, e.telefono, e.correo, e.ciiu_principal, e.responsabilidades_rut, m.nombre AS municipio
+       FROM sst.emisor e LEFT JOIN sst.municipios m ON m.id = e.municipio_id WHERE e.id = 1`,
+  )).rows[0];
+  if (!e) return null;
+  const t = (await db.query(
+    `SELECT COALESCE(t.razon_social, btrim(concat_ws(' ', t.nombres, t.apellidos))) AS nombre, t.numero_documento, t.dv, t.direccion, t.telefono, m.nombre AS municipio
+       FROM sst.terceros t LEFT JOIN sst.municipios m ON m.id = t.municipio_id WHERE t.id = $1`, [doc.tercero_id],
+  )).rows[0];
+  const resolucion = (await db.query(
+    `SELECT numero_resolucion, fecha_desde::text, fecha_hasta::text, prefijo, desde, hasta FROM sst.resoluciones_numeracion
+      WHERE tipo_documento = 'FACTURA' AND prefijo = $1 ORDER BY activa DESC LIMIT 1`, [doc.prefijo],
+  )).rows[0] ?? null;
+
+  const conDv = (numero, dv) => `${/^\d+$/.test(String(numero)) ? Number(numero).toLocaleString('es-CO') : numero}${dv != null ? `-${dv}` : ''}`;
+  const rut = e.responsabilidades_rut ?? [];
+  return pdfFactura({
+    doc,
+    emisor: {
+      razon_social: e.razon_social, nit: conDv(e.nit, e.dv), direccion: e.direccion, telefono: e.telefono, correo: e.correo,
+      ciudad: e.municipio ? `${e.municipio} - Colombia` : null,
+      regimen: rut.includes('48') ? 'Responsable de IVA' : rut.includes('49') ? 'No responsable de IVA' : null,
+      actividad: e.ciiu_principal,
+    },
+    cliente: {
+      nombre: t?.nombre ?? doc.tercero_nombre, documento: t ? conDv(t.numero_documento, t.dv) : '',
+      direccion: t?.direccion, telefono: t?.telefono, ciudad: t?.municipio ? `${t.municipio} - Colombia` : null,
+    },
+    resolucion,
+    enlaceQr: doc.qr_url,
+    lateral: LEYENDA_LATERAL,
+  });
+}
+
+/**
+ * El PDF que se le muestra o entrega a alguien: el propio si se puede armar y, si no, el
+ * guardado del proveedor. Un fallo al dibujarlo no debe dejar a nadie sin su factura.
+ */
+export async function pdfDeDocumento(documentoId, pdfPath, db = pool) {
+  const propio = await pdfPropioFactura(documentoId, db).catch((err) => {
+    console.error(`[facturacion] No se pudo armar el PDF propio de ${documentoId}: ${err.message}`);
+    return null;
+  });
+  if (propio) return propio;
+  return pdfPath ? storage.get(pdfPath) : null;
 }

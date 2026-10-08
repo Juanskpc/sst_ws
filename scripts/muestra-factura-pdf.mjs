@@ -65,7 +65,7 @@ const salida = `${dir}/muestra-${doc.numero}${opcion ? `-${opcion}` : ''}.pdf`;
 fs.writeFileSync(salida, await pdfFactura({
   doc, emisor, cliente, resolucion,
   enlaceQr: doc.respuesta_proveedor?.data?.links?.qr ?? doc.qr_url,
-  lateral: 'Software: ORBITA. Documento validado por la DIAN a través de proveedor tecnológico autorizado. Firma electrónica: ver en el XML.',
+  lateral: 'Software: ORBITA. Factura electrónica generada con software propio autorizado por la DIAN. Firma electrónica: ver en el XML.',
 }));
 console.log(salida);
 process.exit(0);

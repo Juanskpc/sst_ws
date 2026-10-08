@@ -8,6 +8,7 @@ import { badRequest, conflict, notFound } from '../../utils/httpError.js';
 import { esAxa, esBolivar } from '../../utils/bolivar.js';
 import { storage } from '../../services/storage.service.js';
 import { numeroCompleto } from './emision.service.js';
+import { pdfDeDocumento } from './representacion.service.js';
 
 /**
  * 7-oct-2026 (reunión con JD&D) · PAQUETE PARA LA ARL de una factura ya emitida.
@@ -331,13 +332,9 @@ export async function generarPaquete(documentoId, { ordenIds = null } = {}) {
   // Bolívar: el .zip con la factura, un PDF por orden, la relación y el paz y salvo.
   const zip = new JSZip();
   const carpeta = zip.folder(etiqueta);
-  if (factura.pdf_path) {
-    const pdf = await storage.get(factura.pdf_path).catch(() => null);
-    if (pdf) carpeta.file(`1.${factura.prefijo ?? 'FE'}-${soloNumero}.pdf`, pdf);
-    else avisos.push('No se encontró el PDF de la factura en el almacenamiento.');
-  } else {
-    avisos.push('La factura todavía no tiene su PDF guardado.');
-  }
+  const pdf = await pdfDeDocumento(factura.id, factura.pdf_path).catch(() => null);
+  if (pdf) carpeta.file(`1.${factura.prefijo ?? 'FE'}-${soloNumero}.pdf`, pdf);
+  else avisos.push('No se pudo incluir el PDF de la factura.');
   let k = 0;
   for (const o of ordenes) {
     k += 1;

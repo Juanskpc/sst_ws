@@ -11,6 +11,7 @@ import { storage } from '../../services/storage.service.js';
 import { actualizarEventosEnLote, consultarEventosDocumento, marcarAceptacionTacita } from './eventos.service.js';
 import { CAUSALES_NOTA_CREDITO, crearNotaCredito, emitirNotaCredito, reconciliarNotaCredito } from './notas.service.js';
 import { generarPaquete, infoPaquete } from './paquete.service.js';
+import { pdfDeDocumento } from './representacion.service.js';
 import { pool } from '../../config/db.js';
 import { hoyCO } from '../../utils/formato.js';
 
@@ -259,8 +260,9 @@ router.post('/documentos/:id/nota-credito', OPERAR, asyncHandler(async (req, res
 
 /**
  * El PDF (representación gráfica) o el XML (el documento que valida la DIAN) de
- * una factura ya emitida, tal como los devolvió Factus al validarla (A1-05 los
- * guarda en el almacenamiento). Pasa por la API y no por un enlace directo al
+ * una factura ya emitida. El XML es el que devolvió Factus al validarla (A1-05 lo
+ * guarda en el almacenamiento); el PDF de una factura es el propio de JD&D
+ * (8-oct-2026) y el de una nota crédito, el del proveedor. Pasa por la API y no por un enlace directo al
  * archivo porque exige sesión: es un documento con datos tributarios.
  */
 router.get('/documentos/:id/archivo/:tipo', LEER, asyncHandler(async (req, res) => {
@@ -272,7 +274,7 @@ router.get('/documentos/:id/archivo/:tipo', LEER, asyncHandler(async (req, res) 
   const nombre = `${numeroCompleto(doc.prefijo, doc.numero) ?? doc.reference_code}.${tipo}`;
   res.setHeader('Content-Type', tipo === 'pdf' ? 'application/pdf' : 'application/xml');
   res.setHeader('Content-Disposition', `inline; filename="${nombre}"`);
-  res.send(await storage.get(ruta));
+  res.send(tipo === 'pdf' ? await pdfDeDocumento(doc.id, ruta) : await storage.get(ruta));
 }));
 
 // ─── Paquete para la ARL (7-oct-2026) ────────────────────────────────────────

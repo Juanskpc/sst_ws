@@ -6,6 +6,7 @@ import { storage } from '../../services/storage.service.js';
 import { correoHtml, parrafo, bloqueTotal, tablaDatos, filaDato } from '../../services/email-layout.service.js';
 import { enPesosCO } from '../../utils/formato.js';
 import { obtenerBorrador } from './borrador.service.js';
+import { pdfDeDocumento } from './representacion.service.js';
 import { readFile } from 'node:fs/promises';
 
 /** Copia de `public/logoFacturacion.png` del frontend: el backend no ve esa carpeta. */
@@ -41,7 +42,8 @@ export async function reenviarAlCliente(documentoId, usuarioId, { correo } = {})
   const destino = String(correo ?? doc.correo_facturacion ?? '').trim();
   if (!destino) throw badRequest('El tercero no tiene correo de facturación y no se indicó uno alterno.');
 
-  const [pdf, xml] = await Promise.all([storage.get(doc.pdf_path), storage.get(doc.xml_path)]);
+  // 8-oct-2026 · El PDF que se adjunta es el propio de JD&D (mismo formato de su software contable anterior).
+  const [pdf, xml] = await Promise.all([pdfDeDocumento(doc.id, doc.pdf_path), storage.get(doc.xml_path)]);
   // 7-oct-2026 · Logo de JD&D en la cabecera del correo de la factura. Si el
   // archivo faltara, el correo sale igual con la cabecera de texto.
   const logo = await readFile(LOGO_RUTA).catch(() => null);
