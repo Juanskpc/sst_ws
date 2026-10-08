@@ -3,3 +3,7 @@ node_modules/
 storage/
 *.log
 dist/
+
+# Firma escaneada del representante legal (paquete para la ARL): no viaja por git.
+# Se copia a mano al servidor; sin ella el paz y salvo sale con el espacio para firmar.
+assets/paquete-arl/firma-representante.jpg

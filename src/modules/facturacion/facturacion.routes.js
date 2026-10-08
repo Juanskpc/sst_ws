@@ -10,6 +10,7 @@ import { reenviarAlCliente } from './envio.service.js';
 import { storage } from '../../services/storage.service.js';
 import { actualizarEventosEnLote, consultarEventosDocumento, marcarAceptacionTacita } from './eventos.service.js';
 import { CAUSALES_NOTA_CREDITO, crearNotaCredito, emitirNotaCredito, reconciliarNotaCredito } from './notas.service.js';
+import { generarPaquete, infoPaquete } from './paquete.service.js';
 import { pool } from '../../config/db.js';
 import { hoyCO } from '../../utils/formato.js';
 
@@ -272,6 +273,31 @@ router.get('/documentos/:id/archivo/:tipo', LEER, asyncHandler(async (req, res) 
   res.setHeader('Content-Type', tipo === 'pdf' ? 'application/pdf' : 'application/xml');
   res.setHeader('Content-Disposition', `inline; filename="${nombre}"`);
   res.send(await storage.get(ruta));
+}));
+
+// ─── Paquete para la ARL (7-oct-2026) ────────────────────────────────────────
+
+/**
+ * Qué paquete se puede armar para radicar esta factura ante la ARL: el formato
+ * (.zip de Bolívar o PDF único de AXA), sus órdenes y qué le falta a cada una.
+ */
+router.get('/documentos/:id/paquete', LEER, asyncHandler(async (req, res) => {
+  res.json({ data: await infoPaquete(uuidOpcional(req.params.id, 'id')) });
+}));
+
+/**
+ * Arma y descarga el paquete. `orden_ids` (opcional) lo limita a algunas órdenes.
+ * Los avisos (órdenes sin soportes, paz y salvo sin firma…) viajan en una cabecera
+ * porque el cuerpo es el archivo.
+ */
+router.post('/documentos/:id/paquete', LEER, asyncHandler(async (req, res) => {
+  const ids = Array.isArray(req.body?.orden_ids) ? req.body.orden_ids.map((x) => uuidOpcional(x, 'orden_ids')) : null;
+  const paquete = await generarPaquete(uuidOpcional(req.params.id, 'id'), { ordenIds: ids });
+  res.setHeader('Content-Type', paquete.mime);
+  res.setHeader('Content-Disposition', `attachment; filename="${paquete.nombre}"`);
+  res.setHeader('X-Paquete-Avisos', encodeURIComponent(JSON.stringify(paquete.avisos)));
+  res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition, X-Paquete-Avisos');
+  res.send(paquete.buffer);
 }));
 
 // ─── A1-06 · Envío al cliente ────────────────────────────────────────────────

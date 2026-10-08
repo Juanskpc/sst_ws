@@ -3163,3 +3163,28 @@ DO $$ BEGIN
   CREATE TRIGGER trg_activos_fijos_tocar BEFORE UPDATE ON sst.activos_fijos
     FOR EACH ROW EXECUTE FUNCTION sst.fn_tocar_actualizado_en();
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+-- ============================================================================
+-- 7-oct-2026 · Peticiones de la reunión de contabilidad con JD&D.
+-- Espejo de db/migraciones/2026-10-07-codigo-postal.sql (los 1.122 códigos son
+-- datos y viven solo en la migración) y 2026-10-07-radicados.sql.
+-- ============================================================================
+ALTER TABLE sst.municipios ADD COLUMN IF NOT EXISTS codigo_postal TEXT;
+ALTER TABLE sst.terceros   ADD COLUMN IF NOT EXISTS codigo_postal TEXT;
+ALTER TABLE sst.emisor     ADD COLUMN IF NOT EXISTS codigo_postal TEXT;
+
+-- Cada radicado de una orden es una fila; el vigente es el más reciente y la orden
+-- guarda una copia para pintarlo en la bandeja sin abrir nada.
+CREATE TABLE IF NOT EXISTS sst.orden_radicados (
+  id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  orden_id       UUID NOT NULL REFERENCES sst.ordenes_servicio(id) ON DELETE CASCADE,
+  numero         TEXT NOT NULL CHECK (btrim(numero) <> ''),
+  fecha          DATE,
+  aprobado       BOOLEAN NOT NULL DEFAULT false,
+  creado_por     UUID REFERENCES sst.usuarios(id) ON DELETE SET NULL,
+  creado_en      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  actualizado_en TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_orden_radicados_orden ON sst.orden_radicados (orden_id, creado_en DESC);
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS radicado_fecha    DATE;
+ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS radicado_aprobado BOOLEAN NOT NULL DEFAULT false;
