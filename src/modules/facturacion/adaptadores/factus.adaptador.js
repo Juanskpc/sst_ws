@@ -534,7 +534,127 @@ export class FactusAdaptador extends PuertoFacturacionElectronica {
     return { base64 };
   }
 
-  async emitirNominaElectronica() {
-    throw new Error('La emisión de nómina electrónica todavía no está disponible.');
+  // ─── A5-01 · Nómina electrónica ──────────────────────────────────────────────
+  // POST /v2/payrolls (developers.factus.com.co/nomina/crear-y-validar, leída el
+  // 8-oct-2026). Un documento por trabajador y periodo. Va por la cuenta 'nomina' del
+  // cliente (`env.factusNomina`), que en producción es la misma de facturación.
+
+  /**
+   * Arma el cuerpo de la nómina a partir de la liquidación de `nomina/calculo.js`.
+   * Separado de `emitirNominaElectronica` para poder revisarlo sin enviar nada.
+   *
+   * @param {{referenceCode: string, observacion?: string, rangoId?: string,
+   *   periodo: {anio: number, mes: number},
+   *   pago: {metodoCodigo: string, banco?: string, tipoCuenta?: string, numeroCuenta?: string, fecha: string},
+   *   trabajador: {tipoDocumentoCodigo?: string, numeroDocumento: string, primerNombre: string, otrosNombres?: string,
+   *     primerApellido: string, segundoApellido: string, direccion: string, municipioDane: string,
+   *     salarioIntegral?: boolean, altoRiesgo?: boolean, tipoTrabajadorCodigo?: string, subtipoCodigo?: string,
+   *     tipoContratoCodigo: string, codigoEmpleado?: string, salario: number, fechaIngreso: string, fechaRetiro?: string},
+   *   liquidacion: ReturnType<import('../../nomina/calculo.js').liquidar>}} datos
+   */
+  cuerpoNomina(datos) {
+    const t = datos.trabajador;
+    const { devengados: d, deducciones: x } = datos.liquidacion;
+    const fechas = (o) => ({ ...(o.inicio ? { start_date: o.inicio } : {}), ...(o.fin ? { end_date: o.fin } : {}) });
+
+    const accruals = { suel: { amount: dosDec(d.sueldo) } };
+    if (d.auxilioTransporte > 0) accruals.tra = [{ amount: dosDec(d.auxilioTransporte), accrual_type_code: 1 }];
+    if (d.comisiones > 0) accruals.comi = [{ amount: dosDec(d.comisiones) }];
+    if (d.bonificacion > 0) accruals.boni = [{ amount: dosDec(d.bonificacion), accrual_type_code: 1 }];
+    if (d.horas.length) {
+      accruals.hora = d.horas.map((h) => ({
+        quantity: String(h.cantidad), percentage: dosDec(h.porcentaje), amount: dosDec(h.valor),
+        ...fechas(h), accrual_type_code: String(h.codigo),
+      }));
+    }
+    if (d.vacaciones.length) accruals.vaca = d.vacaciones.map((v) => ({ quantity: v.dias, amount: dosDec(v.valor), ...fechas(v), accrual_type_code: v.codigo }));
+    if (d.licencias.length) {
+      // La licencia no remunerada (tipo 3) va sin valor.
+      accruals.lice = d.licencias.map((l) => ({ quantity: l.dias, ...(l.codigo === 3 ? {} : { amount: dosDec(l.valor) }), ...fechas(l), accrual_type_code: l.codigo }));
+    }
+    if (d.incapacidades.length) accruals.inca = d.incapacidades.map((i) => ({ quantity: i.dias, amount: dosDec(i.valor), ...fechas(i), accrual_type_code: i.codigo }));
+    if (d.prima) accruals.prim = { quantity: d.prima.dias, amount: dosDec(d.prima.valor), accrual_type_code: 1 };
+    if (d.cesantias) {
+      accruals.cesa = [
+        { amount: dosDec(d.cesantias.valor), accrual_type_code: 1 },
+        { amount: dosDec(d.cesantias.intereses), percentage: dosDec(d.cesantias.porcentajeIntereses), accrual_type_code: 2 },
+      ];
+    }
+
+    const deductions = {
+      salu: { amount: dosDec(x.salud.valor), percentage: dosDec(x.salud.porcentaje) },
+      pens: { amount: dosDec(x.pension.valor), percentage: dosDec(x.pension.porcentaje) },
+    };
+    // Fondo de solidaridad pensional: obligatorio desde 4 salarios mínimos (tipo 1 = solidaridad).
+    if (x.fondoSolidaridad) deductions.dedu = { amount: dosDec(x.fondoSolidaridad.valor), percentage: dosDec(x.fondoSolidaridad.porcentaje), deduction_type_code: 1 };
+
+    // Banco y cuenta solo cuando el pago es por consignación (42), transferencia (47) o
+    // ilimitada (98): con otro medio el proveedor no los espera.
+    const conCuenta = ['42', '47', '98'].includes(String(datos.pago.metodoCodigo));
+    return {
+      reference_code: datos.referenceCode,
+      observation: datos.observacion ? String(datos.observacion).slice(0, 500) : undefined,
+      numbering_range_id: datos.rangoId || undefined,
+      settlement_period: { month: String(datos.periodo.mes), year: String(datos.periodo.anio), payroll_period_code: '5' }, // 5 = mensual
+      payment: {
+        payment_method_code: String(datos.pago.metodoCodigo),
+        ...(conCuenta ? { bank_name: datos.pago.banco, account_type: String(datos.pago.tipoCuenta), account_number: String(datos.pago.numeroCuenta) } : {}),
+        payment_date: datos.pago.fecha,
+      },
+      worker: {
+        identification_document_code: t.tipoDocumentoCodigo || '13',
+        identification_number: String(t.numeroDocumento),
+        first_name: t.primerNombre,
+        ...(t.otrosNombres ? { other_names: t.otrosNombres } : {}),
+        first_surname: t.primerApellido,
+        second_surname: t.segundoApellido,
+        address: t.direccion,
+        country_code: 'CO',
+        municipality_code: t.municipioDane,
+        has_integral_salary: Boolean(t.salarioIntegral),
+        has_high_risk: Boolean(t.altoRiesgo),
+        worker_subtype: t.subtipoCodigo || '00',
+        contract_type: String(t.tipoContratoCodigo),
+        ...(t.codigoEmpleado ? { employee_code: String(t.codigoEmpleado) } : {}),
+        worker_type_code: t.tipoTrabajadorCodigo || '01',
+        salary: dosDec(t.salario),
+        entry_date: t.fechaIngreso,
+        ...(t.fechaRetiro ? { retirement_date: t.fechaRetiro } : {}),
+        days_worked: dosDec(datos.liquidacion.diasTrabajados),
+      },
+      accruals,
+      deductions,
+    };
+  }
+
+  /** Emite la nómina. Devuelve la misma forma que las demás emisiones (`cufe` lleva el CUNE). */
+  async emitirNominaElectronica(datos) {
+    const r = await request('POST', '/v2/payrolls', this.cuerpoNomina(datos), { perfil: 'nomina' });
+    const n = r.data?.payroll || r.data || {};
+    const { rechazos, avisos } = clasificarErrores(n.errors);
+    return {
+      referenceCode: datos.referenceCode,
+      numeroDocumento: n.number || null,
+      validado: Boolean(n.is_validated),
+      cufe: n.cune || null,
+      urlPublica: n.qr || null,
+      totales: { devengado: n.total_accruals ?? null, deducido: n.total_deductions ?? null, total: n.net_balance ?? null },
+      eventos: { rechazos, avisos },
+      respuestaCruda: r,
+    };
+  }
+
+  /** GET /v2/numbering-ranges/payrolls · rangos de nómina y de nota de ajuste de nómina. */
+  async listarRangosNomina() {
+    const r = await request('GET', '/v2/numbering-ranges/payrolls', undefined, { perfil: 'nomina' });
+    const filas = Array.isArray(r.data) ? r.data : (r.data?.data ?? []);
+    return filas.map((x) => ({
+      proveedorId: x.id,
+      documentoProveedor: x.document,
+      esNotaAjuste: /ajuste/i.test(String(x.document)),
+      prefijo: x.prefix ?? null,
+      actual: Number(x.current ?? 0),
+      activo: Boolean(x.is_active) && !x.deleted_at,
+    }));
   }
 }
