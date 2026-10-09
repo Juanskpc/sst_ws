@@ -70,7 +70,7 @@ try {
   const base = { empleado_id: emp.id, anio: 2026, fecha_pago: '2026-09-30' };
   const nov = { horas: [{ tipo: 'HED', cantidad: 6, inicio: '2026-09-03T17:00', fin: '2026-09-03T23:00' }], vacaciones: [{ dias: 5, inicio: '2026-09-14', fin: '2026-09-18' }], comisiones: 300000 };
   const previa = await previaLiquidacion({ ...base, mes: 9, novedades: nov });
-  comprobar(previa.liquidacion.totales.neto === 2770436.32 && previa.novedades.horas[0].inicio === '2026-09-03 17:00:00', `vista previa: neto ${previa.liquidacion.totales.neto}; la hora se guarda con espacio`);
+  comprobar(previa.liquidacion.totales.neto === 2770437 && previa.novedades.horas[0].inicio === '2026-09-03 17:00:00', `vista previa: neto ${previa.liquidacion.totales.neto}; la hora se guarda con espacio`);
   await debeFallar(() => previaLiquidacion({ ...base, mes: 12, novedades: {} }), 'mes que todavía no empieza');
   await debeFallar(() => previaLiquidacion({ ...base, anio: 2024, mes: 1, novedades: {} }), 'año sin parámetros cargados');
   await debeFallar(() => crearLiquidacion({ ...base, mes: 9, novedades: { vacaciones: [{ dias: 30 }] } }, usuario), 'mes completo de vacaciones');
@@ -93,7 +93,7 @@ try {
   await debeFallar(() => previaLiquidacion({ ...base, mes: 9, novedades: { otrasDeducciones: [{ tipo: 'OTRA', valor: 9_000_000 }] } }), 'deducciones mayores que lo devengado');
 
   const l1 = await crearLiquidacion({ ...base, mes: 9, novedades: nov }, usuario);
-  comprobar(l1.estado === 'BORRADOR' && Number(l1.neto) === 2770436.32, 'borrador de septiembre guardado');
+  comprobar(l1.estado === 'BORRADOR' && Number(l1.neto) === 2770437, 'borrador de septiembre guardado');
   await debeFallar(() => crearLiquidacion({ ...base, mes: 9, novedades: {} }, usuario), 'segunda nómina del mismo mes');
   const l1b = await actualizarLiquidacion(l1.id, { fecha_pago: '2026-09-30', novedades: { ...nov, comisiones: 0 } }, usuario);
   comprobar(Number(l1b.neto) < Number(l1.neto), 'cambiar las novedades vuelve a liquidar');

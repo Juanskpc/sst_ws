@@ -9,8 +9,9 @@
  * Están aquí juntas, con la norma al lado, para que se revisen en un solo sitio. Lo que
  * está marcado con ❓ es una interpretación nuestra que no se ha confirmado con ella.
  *
- * Importes en pesos con dos decimales; se redondea cada concepto (no solo el total)
- * porque el documento electrónico informa concepto por concepto y la DIAN suma esos.
+ * Importes en pesos enteros (9-oct-2026, confirmado por la contadora: «se redondea», como en
+ * el software anterior). Se redondea cada concepto (no solo el total) porque el documento
+ * electrónico informa concepto por concepto y la DIAN suma esos.
  */
 
 /**
@@ -28,6 +29,12 @@ export const PARAMETROS = {
 };
 
 const r2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+/**
+ * A pesos, quitando los centavos: así cuadra al peso con el comprobante de abril de 2026 del
+ * software anterior (auxilio de 27 días = 224.185,50 → ahí salió 224.185). El margen absorbe
+ * el error de coma flotante (p. ej. 8.303,1666… × 30 = 249.094,9999…).
+ */
+const r0 = (n) => Math.floor(Number(n) + 1e-6);
 const iso = (anio, mes, dia) => `${anio}-${String(mes).padStart(2, '0')}-${String(dia).padStart(2, '0')}`;
 
 export function parametrosDe(anio) {
@@ -161,41 +168,41 @@ export function liquidar({ salario, periodo, salarioIntegral = false, novedades 
   const diasTrabajados = 30 - diasAusente;
 
   // ── Devengados
-  const sueldo = r2(dia * diasTrabajados);
+  const sueldo = r0(dia * diasTrabajados);
 
   const horas = (novedades.horas ?? []).filter((h) => h.cantidad > 0).map((h) => {
     const t = TIPOS_HORA[h.tipo];
     if (!t) throw new Error(`Tipo de hora extra o recargo desconocido: ${h.tipo}.`);
     const factor = (t.extra ? 1 : 0) + t.porcentaje / 100;
-    return { tipo: h.tipo, codigo: t.codigo, cantidad: h.cantidad, porcentaje: t.porcentaje, valor: r2(hora * h.cantidad * factor), inicio: h.inicio ?? null, fin: h.fin ?? null };
+    return { tipo: h.tipo, codigo: t.codigo, cantidad: h.cantidad, porcentaje: t.porcentaje, valor: r0(hora * h.cantidad * factor), inicio: h.inicio ?? null, fin: h.fin ?? null };
   });
 
   // Vacaciones (CST art. 186 y 192): 15 días hábiles por año; se pagan con el salario
   // ordinario, sin horas extra. Las compensadas en dinero (art. 189) se pagan igual y
   // no restan días laborados.
   const vacacionesLiq = vacaciones.map((v) => ({
-    codigo: v.compensadas ? 2 : 1, dias: v.dias, valor: r2(dia * v.dias), inicio: v.inicio ?? null, fin: v.fin ?? null,
+    codigo: v.compensadas ? 2 : 1, dias: v.dias, valor: r0(dia * v.dias), inicio: v.inicio ?? null, fin: v.fin ?? null,
   }));
 
   const licenciasLiq = licencias.map((l) => {
     const t = TIPOS_LICENCIA[l.tipo];
     if (!t) throw new Error(`Tipo de licencia desconocido: ${l.tipo}.`);
-    return { tipo: l.tipo, codigo: t.codigo, dias: l.dias, valor: t.remunerada ? r2(dia * l.dias) : 0, inicio: l.inicio ?? null, fin: l.fin ?? null };
+    return { tipo: l.tipo, codigo: t.codigo, dias: l.dias, valor: t.remunerada ? r0(dia * l.dias) : 0, inicio: l.inicio ?? null, fin: l.fin ?? null };
   });
 
   // Incapacidad por enfermedad común (Ley 100, D. 1406/1999 y D. 2943/2013): 66,67 % del
   // salario, sin bajar del mínimo diario (sentencia C-543 de 2007). Los dos primeros días
   // los paga el empleador y del tercero en adelante la EPS: al trabajador le llega igual.
   const incapacidadesLiq = incapacidades.map((i) => ({
-    codigo: 1, dias: i.dias, valor: r2(Math.max(dia * 2 / 3, smmlv / 30) * i.dias), inicio: i.inicio ?? null, fin: i.fin ?? null,
+    codigo: 1, dias: i.dias, valor: r0(Math.max(dia * 2 / 3, smmlv / 30) * i.dias), inicio: i.inicio ?? null, fin: i.fin ?? null,
   }));
 
-  const comisiones = r2(novedades.comisiones ?? 0);
-  const bonificacion = r2(novedades.bonificacion ?? 0);
+  const comisiones = r0(novedades.comisiones ?? 0);
+  const bonificacion = r0(novedades.bonificacion ?? 0);
   const otros = (novedades.otrosDevengados ?? []).filter((o) => o.valor > 0).map((o) => {
     const t = OTROS_DEVENGADOS[o.tipo];
     if (!t) throw new Error(`Tipo de pago desconocido: ${o.tipo}.`);
-    return { tipo: o.tipo, valor: r2(o.valor), descripcion: o.descripcion ?? null, salarial: t.salarial };
+    return { tipo: o.tipo, valor: r0(o.valor), descripcion: o.descripcion ?? null, salarial: t.salarial };
   });
   const otrosSalariales = otros.filter((o) => o.salarial).reduce((s, o) => s + o.valor, 0);
   const otrosNoSalariales = otros.filter((o) => !o.salarial).reduce((s, o) => s + o.valor, 0);
@@ -204,13 +211,13 @@ export function liquidar({ salario, periodo, salarioIntegral = false, novedades 
   // proporcional a los días efectivamente laborados. No es salario para la seguridad
   // social, pero SÍ es base de la prima y las cesantías (Ley 1 de 1963, art. 7).
   const conAuxilio = !salarioIntegral && sal <= 2 * smmlv;
-  const auxilio = conAuxilio ? r2(auxilioTransporte / 30 * diasTrabajados) : 0;
+  const auxilio = conAuxilio ? r0(auxilioTransporte / 30 * diasTrabajados) : 0;
   const basePrestaciones = sal + (conAuxilio ? auxilioTransporte : 0);
 
   // Prima de servicios (CST art. 306): un mes de salario por año, mitad en junio y mitad
   // en diciembre → base × días del semestre / 360.
   const prima = !salarioIntegral && novedades.prima?.dias > 0
-    ? { dias: novedades.prima.dias, valor: r2(basePrestaciones * novedades.prima.dias / 360) }
+    ? { dias: novedades.prima.dias, valor: r0(basePrestaciones * novedades.prima.dias / 360) }
     : null;
 
   // Cesantías (CST art. 249): un mes de salario por año → base × días / 360.
@@ -218,8 +225,8 @@ export function liquidar({ salario, periodo, salarioIntegral = false, novedades 
   let cesantias = null;
   if (!salarioIntegral && novedades.cesantias?.dias > 0) {
     const d = novedades.cesantias.dias;
-    const valor = r2(basePrestaciones * d / 360);
-    cesantias = { dias: d, valor, intereses: r2(valor * d * 0.12 / 360), porcentajeIntereses: r2(d * 12 / 360) };
+    const valor = r0(basePrestaciones * d / 360);
+    cesantias = { dias: d, valor, intereses: r0(valor * d * 0.12 / 360), porcentajeIntereses: r2(d * 12 / 360) };
   }
 
   // ── Ingreso base de cotización (Ley 100, art. 18; Ley 1393 de 2010, art. 30): lo que
@@ -235,17 +242,17 @@ export function liquidar({ salario, periodo, salarioIntegral = false, novedades 
     + incapacidadesLiq.reduce((s, i) => s + i.valor, 0);
   const diasCotizados = 30 - licencias.filter((l) => !TIPOS_LICENCIA[l.tipo].remunerada).reduce((s, l) => s + l.dias, 0);
   const baseCotizacion = salarial - compensadas;
-  const ibc = r2(Math.min(Math.max(salarioIntegral ? baseCotizacion * 0.7 : baseCotizacion, smmlv / 30 * diasCotizados), 25 * smmlv));
+  const ibc = r0(Math.min(Math.max(salarioIntegral ? baseCotizacion * 0.7 : baseCotizacion, smmlv / 30 * diasCotizados), 25 * smmlv));
 
   // ── Deducciones del trabajador (Ley 100, art. 204 y 20): salud 4 % y pensión 4 %.
   const pctFsp = porcentajeFondoSolidaridad(ibc, smmlv);
   const deducciones = {
-    salud: { porcentaje: 4, valor: r2(ibc * 0.04) },
-    pension: { porcentaje: 4, valor: r2(ibc * 0.04) },
-    fondoSolidaridad: pctFsp ? { porcentaje: pctFsp, valor: r2(ibc * pctFsp / 100) } : null,
+    salud: { porcentaje: 4, valor: r0(ibc * 0.04) },
+    pension: { porcentaje: 4, valor: r0(ibc * 0.04) },
+    fondoSolidaridad: pctFsp ? { porcentaje: pctFsp, valor: r0(ibc * pctFsp / 100) } : null,
     otras: (novedades.otrasDeducciones ?? []).filter((o) => o.valor > 0).map((o) => {
       if (!OTRAS_DEDUCCIONES[o.tipo]) throw new Error(`Tipo de deducción desconocido: ${o.tipo}.`);
-      return { tipo: o.tipo, valor: r2(o.valor), descripcion: o.descripcion ?? null };
+      return { tipo: o.tipo, valor: r0(o.valor), descripcion: o.descripcion ?? null };
     }),
   };
 
@@ -253,14 +260,14 @@ export function liquidar({ salario, periodo, salarioIntegral = false, novedades 
     sueldo, auxilioTransporte: auxilio, horas, comisiones, bonificacion,
     vacaciones: vacacionesLiq, licencias: licenciasLiq, incapacidades: incapacidadesLiq, prima, cesantias, otros,
   };
-  const totalDevengado = r2(salarial + otrosNoSalariales + auxilio + (prima?.valor ?? 0) + (cesantias ? cesantias.valor + cesantias.intereses : 0));
-  const totalDeducido = r2(deducciones.salud.valor + deducciones.pension.valor + (deducciones.fondoSolidaridad?.valor ?? 0)
+  const totalDevengado = r0(salarial + otrosNoSalariales + auxilio + (prima?.valor ?? 0) + (cesantias ? cesantias.valor + cesantias.intereses : 0));
+  const totalDeducido = r0(deducciones.salud.valor + deducciones.pension.valor + (deducciones.fondoSolidaridad?.valor ?? 0)
     + deducciones.otras.reduce((s, o) => s + o.valor, 0));
   // No se puede pagar un neto negativo: las deducciones se reparten en varios meses.
   if (totalDeducido > totalDevengado) throw new Error('Las deducciones superan lo devengado: el neto a pagar no puede ser negativo.');
 
   return {
     diasTrabajados, ibc, devengados, deducciones,
-    totales: { devengado: totalDevengado, deducido: totalDeducido, neto: r2(totalDevengado - totalDeducido) },
+    totales: { devengado: totalDevengado, deducido: totalDeducido, neto: r0(totalDevengado - totalDeducido) },
   };
 }
