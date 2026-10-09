@@ -1,7 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import QRCode from 'qrcode';
 import { PDFDocument, StandardFonts, degrees, rgb } from 'pdf-lib';
 import { pool } from '../../config/db.js';
 import { badRequest } from '../../utils/httpError.js';
@@ -13,154 +12,211 @@ import { obtenerEmpleado } from './empleados.service.js';
 import { obtenerLiquidacion } from './liquidaciones.service.js';
 
 /**
- * A5-01 · Desprendible de nómina en PDF: lo que se le entrega al empleado.
+ * A5-01 · Comprobante de nómina en PDF: lo que se le entrega al empleado.
  *
- * Una hoja carta con los datos del empleado, los devengados, las deducciones y el neto.
- * Si la nómina ya está validada lleva el número, el CUNE y el QR de la DIAN; si no,
- * una marca «BORRADOR» (o «ANULADA») para que no se confunda con un comprobante en firme.
+ * 8-oct-2026 · MISMO FORMATO del comprobante que JD&D entregaba desde su software contable
+ * anterior (modelo enviado por la contadora: «Comprobante de Nómina», abril de 2026):
+ * marco, título centrado, logo y razón social a la izquierda, datos del periodo y del
+ * empleado a la derecha, INGRESOS y DEDUCCIONES lado a lado con Concepto · Cantidad ·
+ * Valor, y el NETO A PAGAR. Como con la factura, aquí no se «mejora» el diseño.
+ *
+ * Lo único propio: si la nómina no está validada lleva una marca «BORRADOR» (o «ANULADA»),
+ * y si lo está, una línea final con el número de la nómina electrónica y su CUNE.
  */
 
 const LOGO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../assets/facturacion/logo-jdd.jpg');
 const [W, H] = [612, 792];
-const AZUL = rgb(0, 0.043, 0.314); // #000b50, el de la identidad
-const GRIS = rgb(0.42, 0.45, 0.5);
-const LINEA = rgb(0.82, 0.85, 0.9);
-const NEGRO = rgb(0.1, 0.1, 0.12);
+const NEGRO = rgb(0, 0, 0);
+const GRIS_CABECERA = rgb(0.88, 0.88, 0.88);
+const LINEA = rgb(0.72, 0.72, 0.72);
 const MESES = ['Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio', 'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre'];
 
 const winAnsi = (t) => String(t ?? '').replace(/—/g, '-').replace(/[^\x09\x0A\x0D\x20-\x7E\xA0-\xFF‘’“”–…•€]/g, '?');
+/** «$ 1,984,500.00», como en el modelo. */
+const dinero = (v) => `$ ${(Number(v) || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+/** Para el correo: pesos a la colombiana. */
 const pesos = (v) => `$ ${(Number(v) || 0).toLocaleString('es-CO', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 const fechaCO = (f) => { const [a, m, d] = String(f ?? '').slice(0, 10).split('-'); return a && m && d ? `${d}/${m}/${a}` : '-'; };
+const cantidad = (n) => (n == null ? '0.0' : Number(n).toFixed(2));
 
-/** Los renglones del desprendible: solo los conceptos con valor. Mismo orden que la pantalla. */
+/**
+ * Los renglones del comprobante: [concepto, cantidad, valor]. Solo los conceptos con valor.
+ * Los nombres son los del comprobante anterior («Aux. de transporte/Aux. de conectividad
+ * digital», «Vacaciones disfrutadas», «Fondo de salud»…). La cantidad son días u horas; en
+ * lo que no tiene, va «0.0» como en el modelo.
+ */
 export function renglonesDesprendible(r) {
   const d = r.devengados;
-  const devengados = [['Sueldo', `${r.diasTrabajados} días`, d.sueldo]];
-  if (d.auxilioTransporte) devengados.push(['Auxilio de transporte', '', d.auxilioTransporte]);
-  for (const h of d.horas) devengados.push([TIPOS_HORA[h.tipo]?.nombre ?? 'Horas', `${h.cantidad} h · ${h.porcentaje} %`, h.valor]);
-  if (d.comisiones) devengados.push(['Comisiones', '', d.comisiones]);
-  if (d.bonificacion) devengados.push(['Bonificación', '', d.bonificacion]);
-  for (const v of d.vacaciones) devengados.push([v.codigo === 2 ? 'Vacaciones compensadas' : 'Vacaciones', `${v.dias} días`, v.valor]);
-  for (const l of d.licencias) devengados.push([TIPOS_LICENCIA[l.tipo]?.nombre ?? 'Licencia', `${l.dias} días`, l.valor]);
-  for (const i of d.incapacidades) devengados.push(['Incapacidad', `${i.dias} días`, i.valor]);
-  if (d.prima) devengados.push(['Prima de servicios', `${d.prima.dias} días`, d.prima.valor]);
+  const ingresos = [['Sueldo', r.diasTrabajados, d.sueldo]];
+  if (d.auxilioTransporte) ingresos.push(['Aux. de transporte/Aux. de conectividad digital', r.diasTrabajados, d.auxilioTransporte]);
+  for (const h of d.horas) ingresos.push([TIPOS_HORA[h.tipo]?.nombre ?? 'Horas extra', h.cantidad, h.valor]);
+  if (d.comisiones) ingresos.push(['Comisiones', null, d.comisiones]);
+  if (d.bonificacion) ingresos.push(['Bonificación', null, d.bonificacion]);
+  for (const v of d.vacaciones) ingresos.push([v.codigo === 2 ? 'Vacaciones compensadas' : 'Vacaciones disfrutadas', v.dias, v.valor]);
+  for (const l of d.licencias) ingresos.push([TIPOS_LICENCIA[l.tipo]?.nombre ?? 'Licencia', l.dias, l.valor]);
+  for (const i of d.incapacidades) ingresos.push(['Incapacidad por enfermedad general', i.dias, i.valor]);
+  if (d.prima) ingresos.push(['Prima de servicios', d.prima.dias, d.prima.valor]);
   if (d.cesantias) {
-    devengados.push(['Cesantías', `${d.cesantias.dias} días`, d.cesantias.valor]);
-    devengados.push(['Intereses a las cesantías', `${d.cesantias.porcentajeIntereses} %`, d.cesantias.intereses]);
+    ingresos.push(['Cesantías', d.cesantias.dias, d.cesantias.valor]);
+    ingresos.push(['Intereses a las cesantías', null, d.cesantias.intereses]);
   }
   // `?? []`: las liquidaciones guardadas antes del 8-oct-2026 no traen estas listas.
-  for (const o of d.otros ?? []) devengados.push([o.descripcion || OTROS_DEVENGADOS[o.tipo]?.nombre || 'Otro pago', o.descripcion ? OTROS_DEVENGADOS[o.tipo]?.nombre ?? '' : (o.salarial ? '' : 'no salarial'), o.valor]);
+  for (const o of d.otros ?? []) ingresos.push([o.descripcion || OTROS_DEVENGADOS[o.tipo]?.nombre || 'Otro pago', null, o.valor]);
+
   const x = r.deducciones;
-  const deducciones = [['Salud', `${x.salud.porcentaje} %`, x.salud.valor], ['Pensión', `${x.pension.porcentaje} %`, x.pension.valor]];
-  if (x.fondoSolidaridad) deducciones.push(['Fondo de solidaridad pensional', `${x.fondoSolidaridad.porcentaje} %`, x.fondoSolidaridad.valor]);
-  for (const o of x.otras ?? []) deducciones.push([OTRAS_DEDUCCIONES[o.tipo]?.nombre ?? 'Otra deducción', o.descripcion ?? '', o.valor]);
-  return { devengados, deducciones };
+  const deducciones = [['Fondo de salud', null, x.salud.valor], ['Fondo de pensión', null, x.pension.valor]];
+  if (x.fondoSolidaridad) deducciones.push(['Fondo de solidaridad pensional', null, x.fondoSolidaridad.valor]);
+  for (const o of x.otras ?? []) {
+    const nombre = OTRAS_DEDUCCIONES[o.tipo]?.nombre ?? 'Otra deducción';
+    deducciones.push([o.descripcion ? `${nombre}: ${o.descripcion}` : nombre, null, o.valor]);
+  }
+  return { ingresos, deducciones };
 }
 
-/** Devuelve { nombre, buffer } del desprendible de una liquidación. */
+/** Parte un texto en renglones que quepan en `ancho` puntos. */
+function renglones(texto, fuente, tam, ancho) {
+  const salida = [];
+  let linea = '';
+  for (const palabra of winAnsi(texto).split(/\s+/).filter(Boolean)) {
+    const prueba = linea ? `${linea} ${palabra}` : palabra;
+    if (fuente.widthOfTextAtSize(prueba, tam) <= ancho || !linea) linea = prueba;
+    else { salida.push(linea); linea = palabra; }
+  }
+  if (linea) salida.push(linea);
+  return salida;
+}
+
+/** Devuelve { nombre, buffer } del comprobante de una liquidación. */
 export async function pdfDesprendible(liquidacionId) {
   const liq = await obtenerLiquidacion(liquidacionId);
   const emp = await obtenerEmpleado(liq.empleado_id);
-  const e = (await pool.query(`SELECT razon_social, nit, dv FROM sst.emisor WHERE id = 1`)).rows[0];
-  // Sin empresa emisora parametrizada se usa la razón social de siempre (como el paquete de la ARL).
-  const empresa = e
-    ? { nombre: e.razon_social, nit: `${Number(e.nit).toLocaleString('es-CO')}-${e.dv}` }
-    : { nombre: 'JD&D CONSULTORES EN SISTEMAS DE GESTIÓN SAS', nit: '901.203.812-4' };
+  const e = (await pool.query(`SELECT razon_social, nit FROM sst.emisor WHERE id = 1`)).rows[0];
+  // Sin empresa emisora parametrizada: la razón social y el NIT del comprobante modelo.
+  const empresa = e ? { nombre: e.razon_social, nit: e.nit } : { nombre: 'J D Y D CONSULTORES EN SISTEMAS DE GESTION SAS', nit: '901203812' };
 
   const pdf = await PDFDocument.create();
   const [n, b] = await Promise.all([pdf.embedFont(StandardFonts.Helvetica), pdf.embedFont(StandardFonts.HelveticaBold)]);
   const p = pdf.addPage([W, H]);
-  const texto = (t, x, arriba, { f = n, s = 9, c = NEGRO } = {}) => p.drawText(winAnsi(t), { x, y: H - arriba, size: s, font: f, color: c });
-  const ancho = (t, { f = n, s = 9 } = {}) => f.widthOfTextAtSize(winAnsi(t), s);
+  // Todas las medidas van «desde arriba».
+  const texto = (t, x, arriba, { f = n, s = 8.5 } = {}) => p.drawText(winAnsi(t), { x, y: H - arriba, size: s, font: f, color: NEGRO });
+  const ancho = (t, { f = n, s = 8.5 } = {}) => f.widthOfTextAtSize(winAnsi(t), s);
   const derecha = (t, xDer, arriba, o = {}) => texto(t, xDer - ancho(t, o), arriba, o);
-  const hor = (x1, x2, arriba, color = LINEA, grosor = 0.8) => p.drawLine({ start: { x: x1, y: H - arriba }, end: { x: x2, y: H - arriba }, thickness: grosor, color });
-  const [IZQ, DER] = [48, W - 48];
+  const centro = (t, xCentro, arriba, o = {}) => texto(t, xCentro - ancho(t, o) / 2, arriba, o);
+  const caja = (x1, arriba, x2, abajo, relleno = null) => p.drawRectangle({ x: x1, y: H - abajo, width: x2 - x1, height: abajo - arriba, borderColor: LINEA, borderWidth: 0.8, ...(relleno ? { color: relleno } : {}) });
+  /** «Rótulo: valor» alineado a la derecha, con el valor en negrita, como en el modelo. */
+  const par = (rotulo, valor, xDer, arriba) => {
+    const v = winAnsi(valor || '');
+    derecha(v, xDer, arriba, { f: b });
+    derecha(`${rotulo} `, xDer - ancho(v, { f: b }), arriba);
+  };
+
+  const [IZQ, DER] = [36, W - 36];
+  const [X1, X2] = [IZQ + 34, DER - 34]; // el cuerpo, dentro del marco
+  const MEDIO = (X1 + X2) / 2;
+
+  // ── Título
+  centro('Comprobante de Nómina', W / 2, 62, { s: 15 });
+
+  // ── Logo y razón social (izquierda)
+  let yLogo = 100;
+  if (fs.existsSync(LOGO)) {
+    const logo = await pdf.embedJpg(new Uint8Array(fs.readFileSync(LOGO)));
+    const wLogo = 170;
+    const hLogo = wLogo * (logo.height / logo.width);
+    p.drawImage(logo, { x: X1 - 6, y: H - yLogo - hLogo, width: wLogo, height: hLogo });
+    yLogo += hLogo + 9;
+  }
+  const xLogo = X1 + 80;
+  for (const l of renglones(empresa.nombre, b, 8, 176)) { centro(l, xLogo, yLogo, { f: b, s: 8 }); yLogo += 9.5; }
+  centro(`Nit ${empresa.nit}`, xLogo, yLogo, { f: b, s: 8 });
+
+  // ── Periodo y empleado (derecha)
+  const ultimo = new Date(Date.UTC(liq.anio, liq.mes, 0)).getUTCDate();
+  const mm = String(liq.mes).padStart(2, '0');
+  par('Periodo de Pago:', `${liq.anio}/${mm}/01 - ${liq.anio}/${mm}/${ultimo}`, X2, 116);
+  par('Comprobante Número:', liq.numero ?? 'sin emitir', X2, 129);
+  par('Nombre:', emp.nombre.toUpperCase(), X2, 155);
+  par('Identificación:', emp.numero_documento, X2, 168);
+  par('Cargo:', emp.cargo ?? '', X2, 181);
+  par('Salario básico:', dinero(liq.salario).replace('$ ', '$'), X2, 194);
+
+  // ── INGRESOS y DEDUCCIONES
+  const { ingresos, deducciones } = renglonesDesprendible(liq.liquidacion);
+  const ARRIBA = Math.max(yLogo + 26, 232);
+  const ALTO_CAB = 20;
+  // Columnas de cada tabla: concepto · cantidad · valor
+  const columnas = (x1, x2) => [x1, x1 + (x2 - x1) * 0.53, x1 + (x2 - x1) * 0.71, x2];
+  const pintar = (titulo, filas, total, rotuloTotal, x1, x2) => {
+    const c = columnas(x1, x2);
+    caja(x1, ARRIBA, x2, ARRIBA + ALTO_CAB, GRIS_CABECERA);
+    centro(titulo, (x1 + x2) / 2, ARRIBA + 13.5, { f: b, s: 10 });
+    let y = ARRIBA + ALTO_CAB;
+    caja(x1, y, x2, y + ALTO_CAB);
+    for (let i = 0; i < 3; i++) {
+      if (i) p.drawLine({ start: { x: c[i], y: H - y }, end: { x: c[i], y: H - y - ALTO_CAB }, thickness: 0.8, color: LINEA });
+      centro(['Concepto', 'Cantidad', 'Valor'][i], (c[i] + c[i + 1]) / 2, y + 13, { f: b });
+    }
+    y += ALTO_CAB;
+    for (const [concepto, cant, valor] of filas) {
+      const lineas = renglones(concepto, n, 8.5, c[1] - c[0] - 10);
+      const alto = Math.max(20, lineas.length * 10.5 + 9);
+      caja(x1, y, x2, y + alto);
+      for (const xi of [c[1], c[2]]) p.drawLine({ start: { x: xi, y: H - y }, end: { x: xi, y: H - y - alto }, thickness: 0.8, color: LINEA });
+      lineas.forEach((l, k) => texto(l, c[0] + 5, y + 13 + k * 10.5));
+      const yMedio = y + alto / 2 + 3;
+      derecha(cantidad(cant), c[2] - 6, yMedio);
+      derecha(dinero(valor), c[3] - 6, yMedio);
+      y += alto;
+    }
+    return { y, total: (yTotal) => {
+      caja(x1, yTotal, x2, yTotal + ALTO_CAB);
+      p.drawLine({ start: { x: c[2], y: H - yTotal }, end: { x: c[2], y: H - yTotal - ALTO_CAB }, thickness: 0.8, color: LINEA });
+      derecha(rotuloTotal, c[2] - 6, yTotal + 13, { f: b });
+      derecha(dinero(total), c[3] - 6, yTotal + 13, { f: b });
+    } };
+  };
+  const t = liq.liquidacion.totales;
+  const a = pintar('INGRESOS', ingresos, t.devengado, 'Total Ingresos', X1, MEDIO);
+  const c = pintar('DEDUCCIONES', deducciones, t.deducido, 'Total Deducciones', MEDIO, X2);
+  // Las dos tablas terminan a la misma altura: la más corta se completa con un recuadro vacío.
+  const yTotales = Math.max(a.y, c.y);
+  if (a.y < yTotales) caja(X1, a.y, MEDIO, yTotales);
+  if (c.y < yTotales) caja(MEDIO, c.y, X2, yTotales);
+  a.total(yTotales);
+  c.total(yTotales);
+
+  // ── NETO A PAGAR (a la derecha, bajo las deducciones)
+  const yNeto = yTotales + ALTO_CAB + 15;
+  const xNeto = MEDIO + 22;
+  const xNetoMedio = xNeto + (X2 - xNeto) * 0.49;
+  caja(xNeto, yNeto, X2, yNeto + 24, GRIS_CABECERA);
+  texto('NETO A PAGAR', xNeto + 7, yNeto + 16, { f: b, s: 10 });
+  p.drawLine({ start: { x: xNetoMedio, y: H - yNeto }, end: { x: xNetoMedio, y: H - yNeto - 24 }, thickness: 0.8, color: LINEA });
+  derecha(dinero(t.neto), X2 - 7, yNeto + 16, { f: b, s: 10 });
+
+  // ── Pie
+  let yPie = yNeto + 64;
+  centro('Este comprobante de nómina fue elaborado y enviado a través de ORBITA.', W / 2, yPie);
+  if (liq.cune) {
+    yPie += 14;
+    centro(`${liq.estado === 'ANULADO' ? `Anulada con la nota de ajuste ${liq.nota_numero ?? ''} · ` : ''}Nómina electrónica ${liq.numero} · CUNE`, W / 2, yPie, { s: 6.5 });
+    yPie += 8.5;
+    centro(liq.cune, W / 2, yPie, { s: 6 });
+  }
+
+  // ── Marco, con el alto que haya ocupado el contenido
+  caja(IZQ, 30, DER, yPie + 22);
 
   // ── Marca de agua mientras no esté en firme
   const marca = liq.estado === 'ANULADO' ? 'ANULADA' : liq.estado === 'VALIDADO' ? null : 'BORRADOR';
-  if (marca) p.drawText(marca, { x: 120, y: 250, size: 92, font: b, color: rgb(0.93, 0.93, 0.95), rotate: degrees(38) });
+  if (marca) p.drawText(marca, { x: 130, y: H - yTotales - 40, size: 80, font: b, color: rgb(0.86, 0.86, 0.88), opacity: 0.45, rotate: degrees(28) });
 
-  // ── Cabecera
-  if (fs.existsSync(LOGO)) {
-    const logo = await pdf.embedJpg(new Uint8Array(fs.readFileSync(LOGO)));
-    const wLogo = 104;
-    p.drawImage(logo, { x: IZQ, y: H - 48 - wLogo * (logo.height / logo.width), width: wLogo, height: wLogo * (logo.height / logo.width) });
-  }
-  derecha('Comprobante de pago de nómina', DER, 62, { f: b, s: 14, c: AZUL });
-  derecha(`${MESES[liq.mes - 1]} de ${liq.anio}`, DER, 80, { s: 11, c: AZUL });
-  derecha(liq.numero ? `Nómina electrónica ${liq.numero}` : 'Sin emitir ante la DIAN', DER, 95, { s: 8.5, c: GRIS });
-  texto(empresa.nombre, IZQ, 138, { f: b, s: 9.5 });
-  texto(`NIT ${empresa.nit}`, IZQ, 151, { s: 8.5, c: GRIS });
-  hor(IZQ, DER, 162, AZUL, 1.4);
-
-  // ── Datos del empleado, en dos columnas
-  const dato = (rotulo, valor, x, arriba) => { texto(rotulo, x, arriba, { s: 7.5, c: GRIS }); texto(valor || '-', x, arriba + 12, { f: b, s: 9.5 }); };
-  const col2 = IZQ + 270;
-  dato('Empleado', emp.nombre, IZQ, 180);
-  dato(emp.tipo_documento_nombre || 'Documento', emp.numero_documento, col2, 180);
-  dato('Cargo', emp.cargo, IZQ, 212);
-  dato('Salario básico', `${pesos(liq.salario)}${liq.salario_integral ? ' (integral)' : ''}`, col2, 212);
-  dato('Días laborados', String(Number(liq.dias_trabajados)), IZQ, 244);
-  dato('Fecha de pago', fechaCO(liq.fecha_pago), col2, 244);
-  dato('Forma de pago', emp.metodo_pago === '10' ? 'Efectivo' : `${emp.metodo_pago === '42' ? 'Consignación' : 'Transferencia'} · ${emp.banco ?? ''} ${emp.numero_cuenta ? `· cuenta terminada en ${String(emp.numero_cuenta).slice(-4)}` : ''}`, IZQ, 276);
-
-  // ── Devengados y deducciones, lado a lado
-  const { devengados, deducciones } = renglonesDesprendible(liq.liquidacion);
-  const medio = (IZQ + DER) / 2;
-  const tabla = (titulo, filas, total, rotuloTotal, x1, x2) => {
-    let y = 322;
-    p.drawRectangle({ x: x1, y: H - y - 6, width: x2 - x1, height: 18, color: AZUL });
-    texto(titulo, x1 + 6, y, { f: b, s: 8.5, c: rgb(1, 1, 1) });
-    derecha('Valor', x2 - 6, y, { f: b, s: 8.5, c: rgb(1, 1, 1) });
-    y += 22;
-    for (const [concepto, detalle, valor] of filas) {
-      texto(concepto, x1 + 6, y, { s: 8.5 });
-      if (detalle) texto(detalle, x1 + 6, y + 9.5, { s: 7, c: GRIS });
-      derecha(pesos(valor), x2 - 6, y, { s: 8.5 });
-      y += detalle ? 23 : 16;
-      hor(x1, x2, y - 9);
-    }
-    return { y, pintarTotal: (yTotal) => { texto(rotuloTotal, x1 + 6, yTotal, { f: b, s: 9 }); derecha(pesos(total), x2 - 6, yTotal, { f: b, s: 9 }); } };
-  };
-  const t = liq.liquidacion.totales;
-  const a = tabla('DEVENGADOS', devengados, t.devengado, 'Total devengado', IZQ, medio - 8);
-  const c = tabla('DEDUCCIONES', deducciones, t.deducido, 'Total deducciones', medio + 8, DER);
-  const yTotales = Math.max(a.y, c.y) + 6;
-  a.pintarTotal(yTotales);
-  c.pintarTotal(yTotales);
-
-  // ── Neto
-  const yNeto = yTotales + 22;
-  p.drawRectangle({ x: IZQ, y: H - yNeto - 22, width: DER - IZQ, height: 34, color: AZUL });
-  texto('NETO A PAGAR', IZQ + 12, yNeto + 9, { f: b, s: 10.5, c: rgb(1, 1, 1) });
-  derecha(pesos(t.neto), DER - 12, yNeto + 10, { f: b, s: 14, c: rgb(1, 1, 1) });
-  texto(`Base de cotización a salud y pensión: ${pesos(liq.liquidacion.ibc)}`, IZQ, yNeto + 40, { s: 7.5, c: GRIS });
-  if (liq.observaciones) texto(`Observaciones: ${String(liq.observaciones).slice(0, 110)}`, IZQ, yNeto + 52, { s: 7.5, c: GRIS });
-
-  // ── Pie: validación de la DIAN y firma de recibido
-  if (liq.cune) {
-    if (liq.qr_url) {
-      const qr = await pdf.embedPng(await QRCode.toBuffer(liq.qr_url, { margin: 0, width: 300, errorCorrectionLevel: 'M' }));
-      p.drawImage(qr, { x: IZQ, y: 70, width: 74, height: 74 });
-    }
-    const xT = liq.qr_url ? IZQ + 86 : IZQ;
-    texto(liq.estado === 'ANULADO' ? `Nómina anulada con la nota de ajuste ${liq.nota_numero ?? ''}` : 'Documento soporte de pago de nómina electrónica validado por la DIAN', xT, H - 132, { f: b, s: 8 });
-    texto('CUNE', xT, H - 118, { s: 7, c: GRIS });
-    // El CUNE son 96 caracteres: va en dos renglones para no salirse de la hoja.
-    texto(liq.cune.slice(0, 48), xT, H - 107, { s: 7 });
-    texto(liq.cune.slice(48), xT, H - 97, { s: 7 });
-  }
-  hor(DER - 190, DER, H - 96, NEGRO, 0.7);
-  derecha('Recibí conforme', DER, H - 84, { s: 8, c: GRIS });
-  derecha(`${winAnsi(emp.nombre)} · ${emp.numero_documento}`, DER, H - 73, { s: 7.5, c: GRIS });
-  texto('Generado por ORBITA', IZQ, H - 40, { s: 6.5, c: GRIS });
-
-  const archivo = `nomina-${liq.anio}-${String(liq.mes).padStart(2, '0')}-${emp.numero_documento}.pdf`;
+  const archivo = `nomina-${liq.anio}-${mm}-${emp.numero_documento}.pdf`;
   return { nombre: archivo, buffer: Buffer.from(await pdf.save()) };
 }
 
 /**
- * Le envía el desprendible por correo al empleado, con el PDF adjunto. Solo de una nómina
+ * Le envía el comprobante por correo al empleado, con el PDF adjunto. Solo de una nómina
  * validada: un borrador puede cambiar y no debe llegarle como si fuera el pago en firme.
  * Devuelve la dirección a la que salió.
  */
