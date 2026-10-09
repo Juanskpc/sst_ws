@@ -6,6 +6,7 @@ import { PDFDocument, StandardFonts, degrees, rgb } from 'pdf-lib';
 import { pool } from '../../config/db.js';
 import { storage } from '../../services/storage.service.js';
 import { obtenerBorrador } from './borrador.service.js';
+import { badRequest, conflict } from '../../utils/httpError.js';
 
 /**
  * 7-oct-2026 (reunión con JD&D) · REPRESENTACIÓN GRÁFICA PROPIA de la factura.
@@ -104,8 +105,9 @@ function mesesEntre(desde, hasta) {
  * @param resolucion { numero_resolucion, fecha_desde, fecha_hasta, prefijo, desde, hasta } | null
  * @param enlaceQr el enlace de consulta de la DIAN (va en el QR).
  * @param lateral  el texto vertical del borde derecho (fabricante del software y proveedor tecnológico).
+ * @param marcaAgua texto grande en diagonal sobre cada hoja (la vista previa de un borrador), o null.
  */
-export async function pdfFactura({ doc, emisor, cliente, resolucion = null, enlaceQr = null, lateral = null }) {
+export async function pdfFactura({ doc, emisor, cliente, resolucion = null, enlaceQr = null, lateral = null, marcaAgua = null }) {
   const pdf = await PDFDocument.create();
   const [n, b] = await Promise.all([pdf.embedFont(StandardFonts.Helvetica), pdf.embedFont(StandardFonts.HelveticaBold)]);
   const rutaLogo = path.join(ASSETS, 'logo-jdd.jpg');
@@ -130,6 +132,17 @@ export async function pdfFactura({ doc, emisor, cliente, resolucion = null, enla
     p.drawSvgPath(`M ${r},0 H ${w - r} Q ${w},0 ${w},${r} V ${h - r} Q ${w},${h} ${w - r},${h} H ${r} Q 0,${h} 0,${h - r} V ${r} Q 0,0 ${r},0 Z`,
       { x, y: H - y, borderColor: LINEA, borderWidth: 0.8 });
     if (lateral) p.drawText(winAnsi(lateral), { x: 554.5, y: H - 538 - EXTRA, size: 5.2, font: n, color: LATERAL, rotate: degrees(90) });
+    // 9-oct-2026 · Vista previa: que nadie la confunda con la factura emitida.
+    if (marcaAgua) {
+      // Centrada en la hoja: se mide el texto y se reparte lo que sobra a cada lado de la diagonal.
+      const [tam, ang] = [38, 40];
+      const largo = b.widthOfTextAtSize(winAnsi(marcaAgua), tam);
+      const rad = (ang * Math.PI) / 180;
+      p.drawText(winAnsi(marcaAgua), {
+        x: (W - largo * Math.cos(rad)) / 2, y: (H - largo * Math.sin(rad)) / 2,
+        size: tam, font: b, color: rgb(0.75, 0.1, 0.1), opacity: 0.13, rotate: degrees(ang),
+      });
+    }
   };
 
   const encabezado = () => {
@@ -276,9 +289,10 @@ export async function pdfFactura({ doc, emisor, cliente, resolucion = null, enla
   }
   const fiscal = [emisor.regimen, emisor.actividad ? `Actividad Económica ${emisor.actividad}` : null].filter(Boolean).join(' - ');
   if (fiscal) { centro(fiscal, cx, yl, { s: 5.7 }); yl += 6.5; }
-  const wCufe = ancho('CUFE: ', { f: b, s: 5.7 }) + ancho(doc.cufe ?? '', { s: 5.7 });
+  const cufe = doc.cufe ?? 'se genera al emitir ante la DIAN';
+  const wCufe = ancho('CUFE: ', { f: b, s: 5.7 }) + ancho(cufe, { s: 5.7 });
   texto('CUFE:', cx - wCufe / 2, yl, { f: b, s: 5.7 });
-  texto(doc.cufe ?? '', cx - wCufe / 2 + ancho('CUFE: ', { f: b, s: 5.7 }), yl, { s: 5.7 });
+  texto(cufe, cx - wCufe / 2 + ancho('CUFE: ', { f: b, s: 5.7 }), yl, { s: 5.7 });
 
   return Buffer.from(await pdf.save());
 }
@@ -300,7 +314,29 @@ const LEYENDA_LATERAL = 'Software: ORBITA. Factura electrónica generada con sof
 export async function pdfPropioFactura(documentoId, db = pool) {
   const doc = await obtenerBorrador(documentoId, db);
   if (doc.tipo !== 'FACTURA' || !['VALIDADO', 'ANULADO'].includes(doc.estado) || !doc.cufe) return null;
+  return armarPdf(doc, db);
+}
 
+/**
+ * 9-oct-2026 · «Ver la factura antes de emitir» (pedido de la contadora): el mismo PDF que
+ * recibirá el cliente, armado con el BORRADOR tal como está, con una marca de agua y sin
+ * número, CUFE ni QR (los da la DIAN al emitir). Lanza con un mensaje claro si no se puede.
+ */
+export async function pdfVistaPrevia(documentoId, db = pool) {
+  const doc = await obtenerBorrador(documentoId, db);
+  if (doc.tipo !== 'FACTURA') throw badRequest('La vista previa es solo para facturas.');
+  if (doc.estado !== 'BORRADOR') throw conflict('Esta factura ya salió del borrador: use «Ver factura».');
+  const res = (await db.query(
+    `SELECT prefijo FROM sst.resoluciones_numeracion WHERE tipo_documento = 'FACTURA' AND activa ORDER BY desde DESC LIMIT 1`,
+  )).rows[0];
+  const vista = { ...doc, prefijo: res?.prefijo ?? '', numero: '(se asigna al emitir)', cufe: null, qr_url: null };
+  const pdf = await armarPdf(vista, db, { marcaAgua: 'VISTA PREVIA - SIN VALIDEZ' });
+  if (!pdf) throw badRequest('Falta la empresa emisora (Parametrización → Empresa emisora): sin ella no se puede armar la factura.');
+  return pdf;
+}
+
+/** Arma el PDF propio de `doc` (detalle de `obtenerBorrador`); null si no hay empresa emisora. */
+async function armarPdf(doc, db, { marcaAgua = null } = {}) {
   const e = (await db.query(
     `SELECT e.razon_social, e.nit, e.dv, e.direccion, e.telefono, e.correo, e.ciiu_principal, e.responsabilidades_rut, m.nombre AS municipio
        FROM sst.emisor e LEFT JOIN sst.municipios m ON m.id = e.municipio_id WHERE e.id = 1`,
@@ -332,6 +368,7 @@ export async function pdfPropioFactura(documentoId, db = pool) {
     resolucion,
     enlaceQr: doc.qr_url,
     lateral: LEYENDA_LATERAL,
+    marcaAgua,
   });
 }
 

@@ -621,7 +621,7 @@ export async function obtenerBorrador(id, client = pool) {
       total_linea: calculoVivo ? deCentavos(calculoVivo.items[i].totalLinea) : it.total_linea,
     })),
     retenciones: retencionesAplicadas.map((t) => ({
-      codigo: t.retencion_codigo, nombre: t.retencion_nombre, tipo: t.retencion_tipo, tarifa: t.tarifa,
+      id: t.retencion_id, codigo: t.retencion_codigo, nombre: t.retencion_nombre, tipo: t.retencion_tipo, tarifa: t.tarifa,
       // En un borrador, el valor de HOY (p. ej. la ReteIVA corregida a 15 % del IVA).
       valor: calculoVivo ? deCentavos(calculoVivo.retenciones.find((r) => r.codigo === t.retencion_codigo)?.valor ?? 0) : t.valor,
     })),
@@ -690,6 +690,83 @@ export async function actualizarBorrador(id, body, usuarioId, dbClient = null) {
     await guardarDocumento(client, {
       documentoId: id, pagador, prefactura, items, calculo, descuentoComercialPct, retenciones,
       observaciones: body.observaciones, fechaEmision, formaPagoId, medioPagoId, plazoDias, usuarioId,
+    });
+    return obtenerBorrador(id, client);
+  });
+}
+
+/**
+ * 9-oct-2026 · Corregir los impuestos de un borrador sin rehacerlo (pedido de la contadora:
+ * «quitar IVA o retención cuando se vaya mal la tarifa»).
+ *
+ * `productos`: { itemId: productoId } — el IVA de una línea sale de su producto (gravado 19 %,
+ * exento…), así que quitarle el IVA es pasarla a un producto sin IVA; así cuadran la factura
+ * electrónica y la regla contable del producto. `retenciones_ids`: la lista completa de
+ * retenciones del documento (omitida = las que tiene). Todo lo demás (líneas, valores,
+ * descuento, fechas, pago, observaciones) queda igual y se recalcula el total.
+ */
+export async function cambiarImpuestosBorrador(id, body = {}, usuarioId = null, dbClient = null) {
+  return conTransaccion(dbClient, async (client) => {
+    const doc = (await client.query(
+      `SELECT tercero_id, prefactura_id, estado, fecha_emision::text, fecha_vencimiento::text, forma_pago_id, medio_pago_id,
+              observaciones, respuesta_proveedor
+         FROM sst.documentos_electronicos WHERE id = $1 AND tipo = 'FACTURA' FOR UPDATE`,
+      [id],
+    )).rows[0];
+    if (!doc) throw notFound('Esa factura no existe.');
+    if (doc.estado !== 'BORRADOR') throw conflict('Los impuestos solo se corrigen mientras la factura está en borrador.');
+
+    const actuales = (await client.query(
+      `SELECT id, orden_id, producto_id, codigo, descripcion, cantidad, valor_unitario FROM sst.documento_items WHERE documento_id = $1 ORDER BY orden`,
+      [id],
+    )).rows;
+    const cambios = body.productos && typeof body.productos === 'object' ? body.productos : {};
+    for (const itemId of Object.keys(cambios)) {
+      if (!actuales.some((it) => it.id === itemId)) throw badRequest('Alguna línea no pertenece a esta factura: recargue la página.');
+    }
+    const productos = new Map((await client.query(`SELECT id, codigo, tratamiento_iva, tarifa_iva, activo FROM sst.productos`)).rows.map((x) => [x.id, x]));
+    for (const productoId of Object.values(cambios)) {
+      const prod = productos.get(productoId);
+      if (!prod) throw badRequest('Ese producto no existe: recargue la página.');
+      if (!prod.activo) throw badRequest(`El producto ${prod.codigo} está inactivo: actívelo en Parametrización → Productos o elija otro.`);
+    }
+    // El IVA sale del producto (gravado → su tarifa; exento o excluido → 0). Solo una línea
+    // SIN producto conserva el IVA que tenía puesto a mano.
+    const ivaAnterior = new Map((await client.query(
+      `SELECT t.item_id, t.tarifa FROM sst.documento_item_tributos t JOIN sst.documento_items i ON i.id = t.item_id
+        WHERE i.documento_id = $1 AND t.retencion_id IS NULL`, [id],
+    )).rows.map((t) => [t.item_id, Number(t.tarifa)]));
+    const items = normalizarItems(actuales.map((it) => ({
+      orden_id: it.orden_id,
+      producto_id: cambios[it.id] ?? it.producto_id,
+      codigo: it.codigo,
+      descripcion: it.descripcion,
+      cantidad: it.cantidad,
+      valor_unitario: it.valor_unitario,
+      iva_pct: (cambios[it.id] ?? it.producto_id) ? 0 : (ivaAnterior.get(it.id) ?? 0),
+    })), productos);
+
+    let retencionesIds = body.retenciones_ids;
+    if (retencionesIds === undefined) {
+      retencionesIds = (await client.query(
+        `SELECT DISTINCT t.retencion_id FROM sst.documento_item_tributos t JOIN sst.documento_items i ON i.id = t.item_id
+          WHERE i.documento_id = $1 AND t.retencion_id IS NOT NULL`, [id],
+      )).rows.map((x) => x.retencion_id);
+    }
+    if (!Array.isArray(retencionesIds)) throw badRequest('Las retenciones deben ir en una lista.');
+    const retenciones = await retencionesDeVenta(retencionesIds, client);
+    if (retenciones.length !== new Set(retencionesIds).size) {
+      throw badRequest('Alguna retención elegida ya no existe o está inactiva: recargue la página.');
+    }
+
+    const descuentoComercialPct = Number(doc.respuesta_proveedor?.calculo_meta?.descuento_comercial_pct) || 0;
+    const calculo = calcular(items, descuentoComercialPct, retenciones);
+    if (calculo.totalAPagar <= 0) throw badRequest('Con esas retenciones el total a pagar queda en cero o negativo: revise las tarifas.');
+    const plazoDias = Math.max(0, Math.round((Date.parse(doc.fecha_vencimiento) - Date.parse(doc.fecha_emision)) / 86400000)) || 0;
+    await guardarDocumento(client, {
+      documentoId: id, pagador: { tercero_id: doc.tercero_id }, prefactura: doc.prefactura_id ? { id: doc.prefactura_id } : null,
+      items, calculo, descuentoComercialPct, retenciones, observaciones: doc.observaciones, fechaEmision: doc.fecha_emision,
+      formaPagoId: doc.forma_pago_id, medioPagoId: doc.medio_pago_id, plazoDias, usuarioId,
     });
     return obtenerBorrador(id, client);
   });

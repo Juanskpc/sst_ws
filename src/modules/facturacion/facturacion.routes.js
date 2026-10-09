@@ -5,6 +5,7 @@ import { badRequest } from '../../utils/httpError.js';
 import { authRequired, requireRole } from '../../middleware/auth.js';
 import { esBolivar, relacionPorFacturar, resolverSeleccion } from './relacion.service.js';
 import {
+  cambiarImpuestosBorrador,
   actualizarBorrador, cambiarDescripcionItem, cambiarPagoBorrador, crearBorrador, crearBorradorManual, eliminarBorrador,
   listarBorradores, obtenerBorrador,
 } from './borrador.service.js';
@@ -14,7 +15,7 @@ import { storage } from '../../services/storage.service.js';
 import { actualizarEventosEnLote, consultarEventosDocumento, marcarAceptacionTacita } from './eventos.service.js';
 import { CAUSALES_NOTA_CREDITO, crearNotaCredito, emitirNotaCredito, reconciliarNotaCredito } from './notas.service.js';
 import { generarPaquete, infoPaquete } from './paquete.service.js';
-import { pdfDeDocumento } from './representacion.service.js';
+import { pdfDeDocumento, pdfVistaPrevia } from './representacion.service.js';
 import { pool } from '../../config/db.js';
 import { hoyCO } from '../../utils/formato.js';
 
@@ -209,6 +210,17 @@ router.patch('/borradores/:id/pago', OPERAR, asyncHandler(async (req, res) => {
 }));
 
 // 7-oct-2026 · Solo el texto de una línea del borrador. Cuerpo: { descripcion }.
+// 9-oct-2026 · Corregir el IVA de las líneas (por producto) y las retenciones del borrador.
+router.patch('/borradores/:id/impuestos', OPERAR, asyncHandler(async (req, res) => {
+  res.json({ data: await cambiarImpuestosBorrador(req.params.id, req.body ?? {}, req.user.sub) });
+}));
+// 9-oct-2026 · Ver la factura antes de emitirla: el PDF del borrador con marca de agua.
+router.get('/borradores/:id/vista-previa', LEER, asyncHandler(async (req, res) => {
+  const pdf = await pdfVistaPrevia(req.params.id);
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', 'inline; filename="vista-previa-factura.pdf"');
+  res.send(pdf);
+}));
 router.patch('/borradores/:id/items/:itemId', OPERAR, asyncHandler(async (req, res) => {
   const data = await cambiarDescripcionItem(
     uuidOpcional(req.params.id, 'id'), uuidOpcional(req.params.itemId, 'itemId'), req.body?.descripcion, req.user.sub,
