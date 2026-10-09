@@ -87,9 +87,13 @@ export function calcularDocumento({ items, descuentoComercialPct = 0, retencione
   const ivasLinea = basesLinea.map((base, i) => porcentaje(base, Number(items[i].ivaPct) || 0));
   const totalIva = sumar(ivasLinea);
 
+  // La ReteIVA (Estatuto Tributario, art. 437-1) se practica sobre el IVA facturado,
+  // no sobre el subtotal: 15 % de un IVA de $190.000 son $28.500. Las demás van sobre
+  // el subtotal. Hasta el 9-oct-2026 todas tomaban el subtotal (la ReteIVA salía ~5 veces mayor).
   const detalleRetenciones = retenciones.map((r) => {
-    const valor = porcentaje(subtotal, Number(r.tarifa));
-    return { codigo: r.codigo, tipo: r.tipo, tarifa: Number(r.tarifa), base: subtotal, valor, reduceTotal: RETENCIONES_QUE_DESCUENTAN_TOTAL.has(r.tipo) };
+    const base = r.tipo === 'RETEIVA' ? totalIva : subtotal;
+    const valor = porcentaje(base, Number(r.tarifa));
+    return { codigo: r.codigo, tipo: r.tipo, tarifa: Number(r.tarifa), base, valor, reduceTotal: RETENCIONES_QUE_DESCUENTAN_TOTAL.has(r.tipo) };
   });
   const totalRetenciones = sumar(detalleRetenciones.filter((r) => r.reduceTotal).map((r) => r.valor));
   const totalAPagar = subtotal + totalIva - totalRetenciones;

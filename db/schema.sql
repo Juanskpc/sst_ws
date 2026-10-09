@@ -2730,6 +2730,8 @@ ALTER TABLE sst.documentos_electronicos ADD COLUMN IF NOT EXISTS contabilizacion
 -- pagar. En Siigo depende de la TARIFA (13551819 «Rete Ica 5» para el 5 ‰ de
 -- Bolívar, 13551820 «Rete ica 6» para el 6 ‰ de AXA y Colmena), no del cliente.
 ALTER TABLE sst.retenciones ADD COLUMN IF NOT EXISTS cuenta_id UUID REFERENCES sst.cuentas_contables(id);
+-- 9-oct-2026 · Cuenta de devolución de la retención (la usa la nota crédito; vacía = regla general).
+ALTER TABLE sst.retenciones ADD COLUMN IF NOT EXISTS cuenta_devolucion_id UUID REFERENCES sst.cuentas_contables(id);
 
 CREATE TABLE IF NOT EXISTS sst.cartera_documentos (
   id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),

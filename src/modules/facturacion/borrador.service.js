@@ -148,7 +148,7 @@ async function condicionDelPagador(terceroId, client) {
 async function retencionesDeVenta(ids, client) {
   if (!ids?.length) return [];
   const r = await client.query(
-    `SELECT id, codigo, tipo, tarifa FROM sst.retenciones WHERE id = ANY($1) AND activa`,
+    `SELECT id, codigo, nombre, tipo, tarifa FROM sst.retenciones WHERE id = ANY($1) AND activa`,
     [ids],
   );
   return r.rows;
@@ -587,13 +587,15 @@ export async function obtenerBorrador(id, client = pool) {
   const itemIds = items.map((i) => i.id);
   const tributos = itemIds.length ? (await client.query(
     `SELECT it.item_id, it.retencion_id, it.tributo_codigo, it.base, it.tarifa, it.valor,
-            r.codigo AS retencion_codigo, r.tipo AS retencion_tipo
+            r.codigo AS retencion_codigo, r.nombre AS retencion_nombre, r.tipo AS retencion_tipo
        FROM sst.documento_item_tributos it LEFT JOIN sst.retenciones r ON r.id = it.retencion_id
       WHERE it.item_id = ANY($1)`,
     [itemIds],
   )).rows : [];
 
   const ivaPorItem = new Map(tributos.filter((t) => t.retencion_id == null).map((t) => [t.item_id, t]));
+  // Incluye la autorretención: en la pantalla se muestra (9-oct-2026, la contadora la
+  // quiere ver ahí). Lo que no la lleva es el PDF de la factura (`representacion.service.js`).
   const retencionesAplicadas = tributos.filter((t) => t.retencion_id != null);
 
   let calculoVivo = null;
@@ -618,7 +620,11 @@ export async function obtenerBorrador(id, client = pool) {
       // no, el que quedó guardado.
       total_linea: calculoVivo ? deCentavos(calculoVivo.items[i].totalLinea) : it.total_linea,
     })),
-    retenciones: retencionesAplicadas.map((t) => ({ codigo: t.retencion_codigo, tipo: t.retencion_tipo, tarifa: t.tarifa, valor: t.valor })),
+    retenciones: retencionesAplicadas.map((t) => ({
+      codigo: t.retencion_codigo, nombre: t.retencion_nombre, tipo: t.retencion_tipo, tarifa: t.tarifa,
+      // En un borrador, el valor de HOY (p. ej. la ReteIVA corregida a 15 % del IVA).
+      valor: calculoVivo ? deCentavos(calculoVivo.retenciones.find((r) => r.codigo === t.retencion_codigo)?.valor ?? 0) : t.valor,
+    })),
     totales: calculoVivo ? {
       total_bruto: deCentavos(calculoVivo.totalBruto), total_descuento: deCentavos(calculoVivo.totalDescuento),
       subtotal: deCentavos(calculoVivo.subtotal), total_iva: deCentavos(calculoVivo.totalIva),

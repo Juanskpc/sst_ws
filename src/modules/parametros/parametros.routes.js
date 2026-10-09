@@ -11,7 +11,7 @@ import {
   setProductoActivo, setTarifaActiva,
 } from './productos.service.js';
 import {
-  actualizarRetencion, crearRetencion, guardarCondicion, guardarUvt, listarCondiciones,
+  actualizarRetencion, crearRetencion, eliminarRetencion, guardarCondicion, guardarUvt, listarCondiciones,
   listarRetenciones, listarUvt, obtenerCondicion, setRetencionActiva,
 } from './retenciones.service.js';
 
@@ -170,6 +170,10 @@ router.post('/retenciones', OPERAR, asyncHandler(async (req, res) => {
 }));
 router.put('/retenciones/:id', OPERAR, asyncHandler(async (req, res) => {
   res.json({ data: await actualizarRetencion(req.params.id, req.body) });
+}));
+// 9-oct-2026 · Borrar una retención que no se ha usado en nada contabilizado (ver el servicio).
+router.delete('/retenciones/:id', OPERAR, asyncHandler(async (req, res) => {
+  res.json({ data: await eliminarRetencion(req.params.id) });
 }));
 router.patch('/retenciones/:id/estado', OPERAR, asyncHandler(async (req, res) => {
   if (typeof req.body?.activa !== 'boolean') throw badRequest('activa (boolean) es obligatorio');

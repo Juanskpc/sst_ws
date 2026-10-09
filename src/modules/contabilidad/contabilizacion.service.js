@@ -41,15 +41,17 @@ function numeroDocumento(d) {
 const porcentaje = (baseCentavos, tarifa) => Math.round((baseCentavos * Number(tarifa)) / 100);
 
 /**
- * La autorretención del 1,1 % sobre el subtotal. Si la factura la trae calculada
- * (el pagador la tiene en sus condiciones), se usa esa; si no, se calcula con la
- * retención de tipo AUTORRETENCION activa, porque JD&D es autorretenedora en
- * TODAS sus ventas: en el auxiliar de septiembre la llevan las facturas a ARL y
- * también la de un privado con IVA (FV-1-807). Supuesto a confirmar con la
- * contadora (Q-28): si no hay ninguna activa, el asiento sale sin ella.
+ * La autorretención del 1,1 % sobre el subtotal, con la retención de tipo AUTORRETENCION
+ * activa, porque JD&D es autorretenedora en TODAS sus ventas: en el auxiliar de
+ * septiembre la llevan las facturas a ARL y también la de un privado con IVA (FV-1-807).
+ * Si no hay ninguna activa, el asiento sale sin ella.
+ *
+ * 9-oct-2026: se calcula SIEMPRE aquí y una sola vez. Ya no viaja en la factura (la
+ * contadora pidió que no se vea en ella) y un borrador viejo puede traer guardadas
+ * dos (la de la cuenta débito y la de la crédito, creadas como retenciones aparte):
+ * sumarlas duplicaba el valor del asiento.
  */
-async function autorretencion(client, guardada, subtotalCentavos) {
-  if (guardada > 0) return guardada;
+async function autorretencion(client, subtotalCentavos) {
   const r = (await client.query(
     `SELECT tarifa FROM sst.retenciones WHERE tipo = 'AUTORRETENCION' AND aplica_a = 'VENTA' AND activa ORDER BY codigo LIMIT 1`,
   )).rows[0];
@@ -82,10 +84,12 @@ export async function construirAsiento(documentoId, db = pool) {
   )).rows;
   if (!items.length) throw badRequest('El documento no tiene ítems.');
   const tributos = (await db.query(
-    `SELECT t.valor, t.base, r.tipo AS retencion_tipo
+    `SELECT t.valor, t.base, r.tipo AS retencion_tipo, cv.id AS cuenta_venta_id, cd.id AS cuenta_devolucion_id
        FROM sst.documento_item_tributos t
        JOIN sst.documento_items i ON i.id = t.item_id
        LEFT JOIN sst.retenciones r ON r.id = t.retencion_id
+       LEFT JOIN sst.cuentas_contables cv ON cv.id = r.cuenta_id AND cv.acepta_movimiento AND cv.activa
+       LEFT JOIN sst.cuentas_contables cd ON cd.id = r.cuenta_devolucion_id AND cd.acepta_movimiento AND cd.activa
       WHERE i.documento_id = $1`,
     [documentoId],
   )).rows;
@@ -93,10 +97,20 @@ export async function construirAsiento(documentoId, db = pool) {
   const iva = suma((t) => !t.retencion_tipo);
   // Base gravada (solo los ítems con IVA): con ítems mixtos no es el subtotal.
   const baseIva = tributos.filter((t) => !t.retencion_tipo).reduce((s, t) => s + aCentavos(t.base), 0);
-  const retefuente = suma((t) => t.retencion_tipo === 'RETEFUENTE');
-  const reteiva = suma((t) => t.retencion_tipo === 'RETEIVA');
+  // Cada retención va a SU cuenta, como en el software anterior (retefuente 4 % → 13551503,
+  // 11 % → 13551509…; en la nota crédito, la de devolución de esa tarifa). Sin cuenta propia
+  // (o si la suya ya no recibe movimiento) cae en la regla general del concepto, que era
+  // lo único que había hasta el 9-oct-2026: entonces toda retefuente iba a la del 11 %.
+  const gruposRetencion = new Map();
+  for (const t of tributos.filter((x) => x.retencion_tipo === 'RETEFUENTE' || x.retencion_tipo === 'RETEIVA')) {
+    const propia = esNota ? t.cuenta_devolucion_id : t.cuenta_venta_id;
+    const clave = `${t.retencion_tipo}|${propia ?? 'regla'}`;
+    const g = gruposRetencion.get(clave) ?? { tipo: t.retencion_tipo, cuentaId: propia ?? null, valor: 0 };
+    g.valor += aCentavos(t.valor);
+    gruposRetencion.set(clave, g);
+  }
   const subtotal = aCentavos(d.subtotal);
-  const auto = await autorretencion(db, suma((t) => t.retencion_tipo === 'AUTORRETENCION'), subtotal);
+  const auto = await autorretencion(db, subtotal);
 
   const cuenta = await resolvedorDeCuentas(db, d.tercero_id);
   const numero = numeroDocumento(d) ?? d.reference_code;
@@ -106,7 +120,7 @@ export async function construirAsiento(documentoId, db = pool) {
     if (!centavos) return;
     const debe = esNota ? lado === 'C' : lado === 'D';
     lineas.push({
-      cuenta_id: cuenta(concepto, extra.productoId ?? null),
+      cuenta_id: extra.cuentaId ?? cuenta(concepto, extra.productoId ?? null),
       tercero_id: d.tercero_id,
       debito: debe ? deCentavos(centavos) : null,
       credito: debe ? null : deCentavos(centavos),
@@ -118,8 +132,11 @@ export async function construirAsiento(documentoId, db = pool) {
   };
 
   linea(`${pre}_CXC`, 'D', aCentavos(d.total_a_pagar));
-  linea(`${pre}_RETEFUENTE`, 'D', retefuente, { base: subtotal });
-  linea(`${pre}_RETEIVA`, 'D', reteiva, { base: iva });
+  for (const tipo of ['RETEFUENTE', 'RETEIVA']) {
+    for (const g of [...gruposRetencion.values()].filter((x) => x.tipo === tipo)) {
+      linea(`${pre}_${tipo}`, 'D', g.valor, { base: tipo === 'RETEIVA' ? iva : subtotal, cuentaId: g.cuentaId });
+    }
+  }
   linea(`${pre}_DESCUENTO`, 'D', aCentavos(d.total_descuento));
   // La autorretención usa las mismas dos cuentas en la factura y en su reverso.
   linea('FV_AUTORRET_DB', 'D', auto, { base: subtotal });

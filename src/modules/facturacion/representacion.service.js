@@ -187,7 +187,13 @@ export async function pdfFactura({ doc, emisor, cliente, resolucion = null, enla
 
   // ── Ítems
   let y = nuevaPagina();
-  const retePct = (doc.retenciones ?? []).reduce((a, r) => a + Number(r.tarifa || 0), 0);
+  // Retención de cada línea, como la columna «Valor Impto.Rete.» de Siigo: la retefuente
+  // sobre la base de la línea y la ReteIVA sobre su IVA (9-oct-2026: antes todo iba sobre la base).
+  // La autorretención NO va en la factura emitida (9-oct-2026, la contadora): es un asiento
+  // de JD&D consigo misma y no cambia lo que paga el cliente. En la pantalla sí se ve.
+  const retencionesFactura = (doc.retenciones ?? []).filter((r) => r.tipo === 'RETEFUENTE' || r.tipo === 'RETEIVA');
+  const pctSobreBase = retencionesFactura.filter((r) => r.tipo !== 'RETEIVA').reduce((a, r) => a + Number(r.tarifa || 0), 0);
+  const pctSobreIva = retencionesFactura.filter((r) => r.tipo === 'RETEIVA').reduce((a, r) => a + Number(r.tarifa || 0), 0);
   const filas = doc.items ?? [];
   filas.forEach((it, i) => {
     const desc = renglones(it.descripcion, n, 6.6, COLS[3] - COLS[2] - 8);
@@ -199,7 +205,7 @@ export async function pdfFactura({ doc, emisor, cliente, resolucion = null, enla
     texto(it.codigo ?? '', COLS[1] + 3.5, y + 9.5, { s: 6.6 });
     desc.forEach((l, k) => texto(l, COLS[2] + 3.5, y + 10 + k * 7.6, { s: 6.6 }));
     const bruto = Number(it.cantidad) * Number(it.valor_unitario);
-    const rete = Number(it.base ?? it.total_linea) * retePct / 100;
+    const rete = (Number(it.base ?? it.total_linea) * pctSobreBase + Number(it.iva_valor || 0) * pctSobreIva) / 100;
     [Number(it.cantidad).toFixed(2), dinero(it.valor_unitario), dinero(bruto), dinero(it.iva_valor), dinero(rete), dinero(Number(it.total_linea) + Number(it.iva_valor || 0) - rete)]
       .forEach((v, k) => derecha(v, COLS[4 + k] - 4.5, y + 10, { s: 6.6 }));
     y += alto;
@@ -208,11 +214,16 @@ export async function pdfFactura({ doc, emisor, cliente, resolucion = null, enla
   // ── Pie de la última hoja: totales a la derecha, condiciones a la izquierda
   const t = doc.totales ?? doc;
   const nombreRete = (r) => `${r.tipo === 'RETEFUENTE' ? 'Retefuente' : r.tipo === 'RETEICA' ? 'ReteICA' : r.tipo === 'RETEIVA' ? 'ReteIVA' : r.codigo} ${Number(r.tarifa)}%`;
+  // Orden pedido por la contadora el 9-oct-2026: Subtotal → IVA → Total bruto, y después lo
+  // que retiene el cliente y el total a pagar. «Total bruto» = subtotal + IVA (antes era lo
+  // de antes del descuento, como en el software anterior); el descuento va antes del subtotal.
+  const totalBruto = Math.round((Number(t.subtotal) + Number(t.total_iva || 0)) * 100) / 100;
   const lineasTot = [
-    ['Total Bruto', t.total_bruto, true],
-    ...(Number(t.total_descuento) ? [['Descuentos', t.total_descuento, false], ['Subtotal', t.subtotal, false]] : []),
-    ...(Number(t.total_iva) ? [['IVA', t.total_iva, false]] : []),
-    ...(doc.retenciones ?? []).map((r) => [nombreRete(r), r.valor, false]),
+    ...(Number(t.total_descuento) ? [['Descuentos', t.total_descuento, false]] : []),
+    ['Subtotal', t.subtotal, false],
+    ['IVA', t.total_iva || 0, false],
+    ['Total Bruto', totalBruto, true],
+    ...retencionesFactura.map((r) => [nombreRete(r), r.valor, false]),
     ['Total a Pagar', t.total_a_pagar, true],
   ];
   const xT = 381;

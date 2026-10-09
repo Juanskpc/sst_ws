@@ -102,8 +102,10 @@ function leerFilas(buffer) {
     const f = filas[i] ?? [];
     const r = { fila: i + 1 };
     mapa.forEach((clave, j) => { if (clave) r[clave] = f[j] == null ? '' : String(f[j]).trim(); });
-    // Sin identificación no es un tercero: fila vacía o el pie «Procesado en…» de Siigo.
+    // Sin identificación no es un tercero: fila vacía. El pie «Procesado en: <fecha>» de
+    // Siigo tampoco, aunque traiga texto en todas las columnas (celda combinada).
     if (!r.numero) continue;
+    if (f.some((c) => /^procesado en\b/i.test(String(c ?? '').trim()))) continue;
     if (/^sin puntos/i.test(r.numero ?? '')) continue; // la fila de ayuda de la plantilla
     salida.push(r);
   }
@@ -111,12 +113,30 @@ function leerFilas(buffer) {
   return { formato, filas: salida };
 }
 
-/** «APELLIDO1 APELLIDO2 NOMBRE1 NOMBRE2» (así los lista Siigo) → nombres y apellidos. */
-function partirNombre(completo) {
-  const p = String(completo).trim().split(/\s+/);
-  if (p.length === 1) return { nombres: p[0], apellidos: '' };
-  if (p.length === 2) return { apellidos: p[0], nombres: p[1] };
-  return { apellidos: p.slice(0, 2).join(' '), nombres: p.slice(2).join(' ') };
+/** Partículas que van pegadas a la palabra siguiente: «DE LA CRUZ», «DEL CARMEN». */
+const PARTICULAS = new Set(['de', 'del', 'la', 'las', 'los', 'y', 'san', 'da', 'van']);
+
+/**
+ * Nombre completo en una celda → nombres y apellidos. Se lee «NOMBRES APELLIDOS», que es
+ * como viene la gran mayoría de personas en la exportación de terceros de JD&D (9-oct-2026:
+ * de 157 cédulas, solo unas 5 venían con el apellido primero). Antes se suponía lo
+ * contrario y casi todas quedaban invertidas. Las partículas se juntan con la palabra que
+ * sigue («KAREN ALEJANDRA DE LA CRUZ RAMIREZ» → KAREN ALEJANDRA | DE LA CRUZ RAMIREZ).
+ * 4 o más partes: dos nombres y el resto apellidos; 3: un nombre y dos apellidos.
+ * Es una propuesta: la revisión del cargue la muestra y se corrige en Terceros.
+ */
+export function partirNombre(completo) {
+  const palabras = String(completo).trim().split(/\s+/).filter(Boolean);
+  const partes = [];
+  let pendiente = [];
+  for (const w of palabras) {
+    pendiente.push(w);
+    if (!PARTICULAS.has(w.toLowerCase())) { partes.push(pendiente.join(' ')); pendiente = []; }
+  }
+  if (pendiente.length) partes.push(pendiente.join(' '));
+  if (partes.length === 1) return { nombres: partes[0], apellidos: '' };
+  const nNombres = partes.length >= 4 ? 2 : 1;
+  return { nombres: partes.slice(0, nNombres).join(' '), apellidos: partes.slice(nNombres).join(' ') };
 }
 
 /** Catálogos para resolver textos del Excel, una sola vez por cargue. */
@@ -162,7 +182,7 @@ function municipio(ciudad, departamento, municipios) {
 function aCuerpo(r, cat, rolPorDefecto) {
   const avisos = [];
   const td = tipoDocumento(r.tipo_documento, cat.tipos);
-  if (!td) throw badRequest(`no se reconoce el tipo de identificación «${r.tipo_documento || '(vacío)'}»`);
+  if (!td) throw badRequest(`El tipo de identificación «${r.tipo_documento || '(vacío)'}» no se reconoce. Use NIT, Cédula de ciudadanía, Cédula de extranjería, Pasaporte o Tarjeta de identidad.`);
   const esNit = td.codigo_dian === '31';
   const tipoPersona = /^(natural|juridica)$/.test(normalizar(r.tipo_persona)) ? normalizar(r.tipo_persona).toUpperCase() : (esNit ? 'JURIDICA' : 'NATURAL');
 
@@ -186,6 +206,10 @@ function aCuerpo(r, cat, rolPorDefecto) {
     telefono = '';
   }
 
+  // Lo que falta para usarlo: no impide cargarlo, pero se dice ya, fila por fila.
+  if (!r.direccion) avisos.push('sin dirección: complétela en Terceros antes de facturarle o hacerle un documento soporte');
+  if (!String(r.ciudad ?? '').trim()) avisos.push('sin ciudad: queda sin municipio; complételo en Terceros');
+
   const traeRoles = ['cliente', 'proveedor', 'empleado'].some((k) => r[k] !== undefined && r[k] !== '');
   const roles = traeRoles
     ? { es_cliente: si(r.cliente), es_proveedor: si(r.proveedor), es_empleado: si(r.empleado) }
@@ -194,6 +218,8 @@ function aCuerpo(r, cat, rolPorDefecto) {
       es_proveedor: rolPorDefecto === 'PROVEEDOR' || rolPorDefecto === 'AMBOS' || (rolPorDefecto === 'AUTO' && !esNit),
       es_empleado: false,
     };
+
+  if (roles.es_cliente && !r.correo) avisos.push('sin correo de facturación: hay que completarlo en Terceros antes de facturarle');
 
   return {
     cuerpo: {
@@ -219,15 +245,18 @@ function aCuerpo(r, cat, rolPorDefecto) {
  * Revisa (`simular`) o carga. `rolPorDefecto` aplica a las filas que no traen roles
  * (la exportación de Siigo no los trae): AUTO = cliente si tiene NIT, proveedor si no.
  */
-export async function importarTerceros(buffer, { usuarioId = null, simular = true, rolPorDefecto = 'AUTO' } = {}) {
+export async function importarTerceros(buffer, { usuarioId = null, simular = true, rolPorDefecto = 'AUTO', client: externo = null } = {}) {
   const rol = ['AUTO', 'CLIENTE', 'PROVEEDOR', 'AMBOS'].includes(String(rolPorDefecto).toUpperCase()) ? String(rolPorDefecto).toUpperCase() : 'AUTO';
   const { formato, filas } = leerFilas(buffer);
-  const client = await pool.connect();
+  // `client` (9-oct-2026): correr dentro de la transacción de quien llama (el script de
+  // carga de producción, que confirma o deshace todo junto). Entonces aquí no se abre
+  // ni se cierra nada y `simular` no aplica: lo decide quien llama.
+  const client = externo ?? await pool.connect();
   const resultados = [];
   try {
-    await client.query('BEGIN');
+    if (!externo) await client.query('BEGIN');
     const cat = await catalogos(client);
-    const vistos = new Set();
+    const vistos = new Map();
     let n = 0;
     for (const r of filas) {
       const res = { fila: r.fila, nombre: r.nombre || r.razon_social || [r.nombres, r.apellidos].filter(Boolean).join(' ') || null,
@@ -242,9 +271,14 @@ export async function importarTerceros(buffer, { usuarioId = null, simular = tru
         const campos = await validarTercero(cuerpo, client);
         res.documento = campos.dv != null ? `${campos.numero_documento}-${campos.dv}` : campos.numero_documento;
         res.nombre = campos.razon_social ?? [campos.nombres, campos.apellidos].filter(Boolean).join(' ');
+        if (!campos.razon_social) { res.nombres = campos.nombres; res.apellidos = campos.apellidos; }
         const clave = `${tipo.id}|${campos.numero_documento}`;
-        if (vistos.has(clave)) throw badRequest('está repetido en el archivo');
-        vistos.add(clave);
+        if (vistos.has(clave)) {
+          const primera = vistos.get(clave);
+          throw badRequest(`El documento ${res.documento} ya está en la fila ${primera.fila} (${primera.nombre}). ORBITA guarda un solo tercero `
+            + 'por documento: se carga la primera y esta se omite. Si era una sucursal, sus datos se agregan a mano en esa ficha.');
+        }
+        vistos.set(clave, { fila: r.fila, nombre: res.nombre });
         if (cat.existentes.has(clave)) {
           res.estado = 'YA_EXISTE';
         } else {
@@ -260,11 +294,14 @@ export async function importarTerceros(buffer, { usuarioId = null, simular = tru
       } catch (e) {
         await client.query(`ROLLBACK TO SAVEPOINT ${sp}`);
         res.estado = 'ERROR';
-        res.error = e.message;
+        // Los errores de la base no son frases para la persona: se traducen los conocidos.
+        res.error = e.statusCode ? e.message
+          : e.code === '23505' ? 'Ya existe un tercero con ese documento.'
+            : `No se pudo guardar la fila (${e.message}).`;
       }
       resultados.push(res);
     }
-    await client.query(simular ? 'ROLLBACK' : 'COMMIT');
+    if (!externo) await client.query(simular ? 'ROLLBACK' : 'COMMIT');
     const cuenta = (e) => resultados.filter((x) => x.estado === e).length;
     return {
       formato, simulado: simular, filas: filas.length,
@@ -274,9 +311,9 @@ export async function importarTerceros(buffer, { usuarioId = null, simular = tru
       resultados,
     };
   } catch (e) {
-    await client.query('ROLLBACK').catch(() => {});
+    if (!externo) await client.query('ROLLBACK').catch(() => {});
     throw e;
   } finally {
-    client.release();
+    if (!externo) client.release();
   }
 }
