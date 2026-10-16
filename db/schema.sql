@@ -190,6 +190,11 @@ CREATE TABLE IF NOT EXISTS sst.profesionales (
   actualizado_en TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_profesionales_estado ON sst.profesionales(estado);
+-- 16-oct-2026 · Firma digital del profesional (imagen PNG/JPG en el almacenamiento;
+-- aquí solo la key). Ver db/migraciones/2026-10-16-firma-profesional.sql.
+ALTER TABLE sst.profesionales ADD COLUMN IF NOT EXISTS firma_url TEXT;
+ALTER TABLE sst.profesionales ADD COLUMN IF NOT EXISTS firma_mime TEXT;
+ALTER TABLE sst.profesionales ADD COLUMN IF NOT EXISTS firma_actualizada_en TIMESTAMPTZ;
 
 -- 5-oct-2026 · Catálogo de especialidades (lo administra JD&D desde Profesionales).
 -- `profesionales.especialidad` guarda el NOMBRE elegido, no un id: los formatos de

@@ -7,6 +7,8 @@ import {
   validarNombre, validarCorreo, validarTelefono, validarTextoOpcional, validarValorHora,
 } from '../../utils/personas.js';
 import { parseFechaCO } from '../../utils/parseo.js';
+import { uploadFirma } from '../../middleware/upload.js';
+import { storage } from '../../services/storage.service.js';
 
 const router = Router();
 router.use(authRequired);
@@ -377,6 +379,79 @@ router.patch('/:id/estado', requireRole('admin'), asyncHandler(async (req, res) 
     [req.params.id]
   );
   if (!r.rows[0]) throw notFound('Profesional no encontrado');
+  res.json({ data: r.rows[0] });
+}));
+
+// ---------------------------------------------------------------------------
+// 16-oct-2026 · Firma digital del profesional
+//
+// Una imagen por profesional. En la BD va solo la key (`firma_url`); el binario
+// vive en el almacenamiento, como los soportes. Subir una nueva REEMPLAZA a la
+// anterior y borra su archivo: no se lleva histórico de firmas.
+// ---------------------------------------------------------------------------
+
+/**
+ * La imagen de la firma. La ve cualquier usuario con sesión (es lo que se pinta
+ * en la ficha), pero no es pública: no hay enlace sin login.
+ */
+router.get('/:id/firma', asyncHandler(async (req, res) => {
+  const r = await pool.query(
+    `SELECT firma_url, firma_mime FROM sst.profesionales WHERE id=$1`, [req.params.id]
+  );
+  if (!r.rows[0]) throw notFound('Profesional no encontrado');
+  if (!r.rows[0].firma_url) throw notFound('Este profesional no tiene firma registrada.');
+  let buffer;
+  try {
+    buffer = await storage.get(r.rows[0].firma_url);
+  } catch (err) {
+    if (err?.code === 'ENOENT' || err?.name === 'NoSuchKey') {
+      throw notFound('La imagen de la firma ya no está disponible en el almacenamiento.');
+    }
+    throw err;
+  }
+  res.setHeader('Content-Type', r.rows[0].firma_mime || 'image/png');
+  // Sin caché: tras reemplazarla, la ficha tiene que enseñar la nueva al instante.
+  res.setHeader('Cache-Control', 'no-store');
+  res.send(buffer);
+}));
+
+/** Sube o reemplaza la firma (admin). Campo multipart `firma`. */
+router.put('/:id/firma', requireRole('admin'), uploadFirma, asyncHandler(async (req, res) => {
+  const anterior = await pool.query(`SELECT firma_url FROM sst.profesionales WHERE id=$1`, [req.params.id]);
+  if (!anterior.rows[0]) throw notFound('Profesional no encontrado');
+  if (!req.file?.buffer?.length) throw badRequest('Adjunte la imagen de la firma (PNG o JPG).');
+
+  const ext = req.file.mimetype === 'image/jpeg' ? 'jpg' : 'png';
+  const key = await storage.put('firmas-profesionales', `firma-${req.params.id}.${ext}`, req.file.buffer);
+  const r = await pool.query(
+    `UPDATE sst.profesionales
+        SET firma_url = $2, firma_mime = $3, firma_actualizada_en = now(), actualizado_en = now()
+      WHERE id = $1 RETURNING *`,
+    [req.params.id, key, req.file.mimetype]
+  );
+  // El archivo viejo se borra DESPUÉS de guardar la fila nueva: si algo fallara
+  // antes, el profesional no se queda sin ninguna firma.
+  if (anterior.rows[0].firma_url && anterior.rows[0].firma_url !== key) {
+    await storage.remove(anterior.rows[0].firma_url).catch((e) =>
+      console.warn(`[profesionales] no se pudo borrar la firma anterior: ${e.message}`));
+  }
+  res.json({ data: r.rows[0] });
+}));
+
+/** Quita la firma (admin). */
+router.delete('/:id/firma', requireRole('admin'), asyncHandler(async (req, res) => {
+  const anterior = await pool.query(`SELECT firma_url FROM sst.profesionales WHERE id=$1`, [req.params.id]);
+  if (!anterior.rows[0]) throw notFound('Profesional no encontrado');
+  const r = await pool.query(
+    `UPDATE sst.profesionales
+        SET firma_url = NULL, firma_mime = NULL, firma_actualizada_en = NULL, actualizado_en = now()
+      WHERE id = $1 RETURNING *`,
+    [req.params.id]
+  );
+  if (anterior.rows[0].firma_url) {
+    await storage.remove(anterior.rows[0].firma_url).catch((e) =>
+      console.warn(`[profesionales] no se pudo borrar la firma: ${e.message}`));
+  }
   res.json({ data: r.rows[0] });
 }));
 

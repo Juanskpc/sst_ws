@@ -89,3 +89,21 @@ export const uploadSupports = soportes.fields([
   { name: 'informe', maxCount: 5 },
   { name: 'files', maxCount: 10 },
 ]);
+
+/**
+ * 16-oct-2026 · Firma digital del profesional: UNA imagen PNG o JPG.
+ *
+ * No se aceptan PDF: la firma se pinta encima de otros documentos y un PDF
+ * habría que rasterizarlo primero. El PNG es lo recomendado porque admite fondo
+ * transparente (la firma no tapa las rayas del formato).
+ */
+const FIRMA_MIMES = new Set(['image/png', 'image/jpeg']);
+
+export const uploadFirma = multer({
+  storage,
+  limits: { fileSize: LIMITE_BYTES, files: 1 },
+  fileFilter: (_req, file, cb) => {
+    if (FIRMA_MIMES.has(file.mimetype)) return cb(null, true);
+    cb(badRequest('La firma debe ser una imagen PNG o JPG (de preferencia PNG con fondo transparente).'));
+  },
+}).single('firma');
