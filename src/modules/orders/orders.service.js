@@ -167,6 +167,21 @@ function nombreDeArchivo(nombre) {
     .replace(/[^A-Za-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'asesor';
 }
 
+/**
+ * 16-oct-2026 · La ficha con la imagen de su firma digital ya leída
+ * (`firma_imagen`), para estamparla en los formatos. Si el archivo no está, el
+ * formato sale sin firma (se firma a mano) en vez de fallar la asignación.
+ */
+async function conFirma(ficha) {
+  if (!ficha?.firma_url) return ficha;
+  try {
+    return { ...ficha, firma_imagen: await storage.get(ficha.firma_url) };
+  } catch (e) {
+    console.warn(`[formatos] no se pudo leer la firma de ${ficha.nombre}: ${e.message}`);
+    return ficha;
+  }
+}
+
 export async function generateOrderDocuments(orderId, client = pool, { guardar = true } = {}) {
   const order = await getOrderExpanded(orderId, client);
   // A3-01 · La orden de un cliente particular no lleva formatos: los que hay son
@@ -181,7 +196,7 @@ export async function generateOrderDocuments(orderId, client = pool, { guardar =
   // encuesta siguen apuntando a `profesional_asignado_id`, que es quien trabaja.
   const firmanteId = order.profesional_formatos_id || order.profesional_asignado_id;
   const professional = firmanteId
-    ? (await client.query(`SELECT * FROM sst.profesionales WHERE id=$1`, [firmanteId])).rows[0]
+    ? await conFirma((await client.query(`SELECT * FROM sst.profesionales WHERE id=$1`, [firmanteId])).rows[0])
     : null;
 
   // Se leen aquí y no se reciben por parámetro para que el formato salga con lo
@@ -209,7 +224,7 @@ export async function generateOrderDocuments(orderId, client = pool, { guardar =
     for (const e of ejecutores) {
       const ficha = order.profesional_formatos_id
         ? professional
-        : (await client.query(`SELECT * FROM sst.profesionales WHERE id=$1`, [e.id])).rows[0];
+        : await conFirma((await client.query(`SELECT * FROM sst.profesionales WHERE id=$1`, [e.id])).rows[0]);
       juegos.push({
         profesional: ficha,
         franjas: todas.filter((f) => (f.profesional_id ?? order.profesional_asignado_id) === e.id),

@@ -14,6 +14,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pool } from '../src/config/db.js';
 import { storage } from '../src/services/storage.service.js';
+import { limpiarFirma } from '../src/services/firma.service.js';
 
 const args = process.argv.slice(2);
 const carpeta = args.find((a) => !a.startsWith('--') && !a.includes('='));
@@ -65,11 +66,13 @@ for (const f of FIRMAS) {
     console.log(`→ ${f.clave}: se cargaría en ${pro.nombre} (${pro.id})`);
     continue;
   }
-  const key = await storage.put('firmas-profesionales', `firma-${pro.id}.png`, fs.readFileSync(ruta));
+  // La misma limpieza que la subida desde la pantalla (fondo transparente, sin margen).
+  const limpia = await limpiarFirma(fs.readFileSync(ruta), 'image/png');
+  const key = await storage.put('firmas-profesionales', `firma-${pro.id}.png`, limpia.buffer);
   await pool.query(
     `UPDATE sst.profesionales
-        SET firma_url = $2, firma_mime = 'image/png', firma_actualizada_en = now(), actualizado_en = now()
-      WHERE id = $1`, [pro.id, key],
+        SET firma_url = $2, firma_mime = $3, firma_actualizada_en = now(), actualizado_en = now()
+      WHERE id = $1`, [pro.id, key, limpia.mime],
   );
   if (pro.firma_url) await storage.remove(pro.firma_url).catch(() => {});
   console.log(`✓ ${f.clave}: cargada en ${pro.nombre} (${key})`);

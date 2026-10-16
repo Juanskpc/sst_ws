@@ -9,6 +9,7 @@ import {
 import { parseFechaCO } from '../../utils/parseo.js';
 import { uploadFirma } from '../../middleware/upload.js';
 import { storage } from '../../services/storage.service.js';
+import { limpiarFirma } from '../../services/firma.service.js';
 
 const router = Router();
 router.use(authRequired);
@@ -421,13 +422,15 @@ router.put('/:id/firma', requireRole('admin'), uploadFirma, asyncHandler(async (
   if (!anterior.rows[0]) throw notFound('Profesional no encontrado');
   if (!req.file?.buffer?.length) throw badRequest('Adjunte la imagen de la firma (PNG o JPG).');
 
-  const ext = req.file.mimetype === 'image/jpeg' ? 'jpg' : 'png';
-  const key = await storage.put('firmas-profesionales', `firma-${req.params.id}.${ext}`, req.file.buffer);
+  // Fondo transparente y sin margen: así se estampa bien en los formatos.
+  const limpia = await limpiarFirma(req.file.buffer, req.file.mimetype);
+  const ext = limpia.mime === 'image/jpeg' ? 'jpg' : 'png';
+  const key = await storage.put('firmas-profesionales', `firma-${req.params.id}.${ext}`, limpia.buffer);
   const r = await pool.query(
     `UPDATE sst.profesionales
         SET firma_url = $2, firma_mime = $3, firma_actualizada_en = now(), actualizado_en = now()
       WHERE id = $1 RETURNING *`,
-    [req.params.id, key, req.file.mimetype]
+    [req.params.id, key, limpia.mime]
   );
   // El archivo viejo se borra DESPUÉS de guardar la fila nueva: si algo fallara
   // antes, el profesional no se queda sin ninguna firma.

@@ -29,6 +29,7 @@ import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
 import { horaAmPm, horasTexto } from '../utils/formato.js';
 import { indiceModalidad, indiceTipoActividadBolivar, normalizarModalidadEjecucion } from '../utils/bolivar.js';
 import { entregaDeLaOrden, tipoActividadDeOrden } from './entrega-arl.service.js';
+import { estamparFirma } from '../utils/firma-pdf.js';
 
 const RAIZ = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'assets', 'formatos-arl');
 
@@ -100,6 +101,8 @@ const FORMATOS = {
     // sesiones que el sistema ya pone ahí.
     observaciones: { campo: '42' },
     editables: () => EDITABLES_AT031,
+    // 16-oct · Sobre la raya «FIRMA ARL» del pie (la del participante ARL, el profesional).
+    firma: [[0, 190, 85, 165, 26]],
   },
   at028: {
     archivo: 'bolivar/asistencia.pdf', modo: 'acroform', alcance: 'sesion',
@@ -131,6 +134,8 @@ const FORMATOS = {
     etiqueta: 'Registro listado de asistencia',
     casillas: () => CASILLAS_ASISTENCIA_COLPATRIA, valores: valoresAsistenciaColpatria,
     editables: () => EDITABLES_ASISTENCIA_AXA,
+    // 16-oct · Primera raya «FIRMA EXPOSITOR(ES)» (la del profesional que dicta).
+    firma: [[0, 165, 138, 190, 26]],
   },
   fichaAxa: {
     archivo: 'colpatria/ficha-gestion.pdf', modo: 'acroform', alcance: 'orden',
@@ -138,6 +143,8 @@ const FORMATOS = {
     etiqueta: 'Ficha de gestión del proveedor',
     campos: camposFichaAxa,
     editables: () => EDITABLES_FICHA_AXA,
+    // 16-oct · Recuadro «Firma - Profesional ejecutor de la actividad» (pág. 3).
+    firma: [[2, 285, 62, 268, 58, { recuadro: true }]],
   },
   informeAxa: {
     archivo: 'colpatria/informe-tecnico.docx', modo: 'adjunto', alcance: 'orden',
@@ -173,7 +180,11 @@ const FORMATOS = {
       observaciones: { renglones: () => RENGLONES_OBS_SPM38 },
       // El resto del SPM-F 38 lo escribió Colmena: solo es de Orbita el nombre.
       editables: () => EDITABLES_SPM38,
+      // 16-oct · Sobre la raya de «FIRMA», a la derecha del nombre del profesional.
+      firma: [[0, 450, 241, 120, 25]],
     },
+    // 16-oct · Raya «FIRMA» del bloque del proveedor (PSP-F-007).
+    firma: [[0, 600, 359, 165, 36]],
   },
   // 29-sep · La asistencia vigente es el "Registro de Ejecución de Actividades
   // de Prevención y de Formación" (PSP-F-006 V3 03/2026), el que JD&D radica de
@@ -188,6 +199,9 @@ const FORMATOS = {
     marcas: marcasRegistroEjecucionColmena,
     observaciones: { renglones: () => RENGLONES_OBS_REGISTRO_EJECUCION },
     editables: () => EDITABLES_REGISTRO_EJECUCION_COLMENA,
+    // 16-oct · Raya «FIRMA» del pie, junto al nombre del profesional ejecutor. Hay
+    // poco alto entre la raya y el recuadro de observaciones: la firma sale pequeña.
+    firma: [[0, 500, 95, 160, 15]],
   },
   evaluacionColmena: {
     archivo: 'colmena/evaluacion.pdf', modo: 'plano', alcance: 'sesion',
@@ -1171,8 +1185,19 @@ export async function generarFormatosArl({
   return generados;
 }
 
-/** Rellena UN formato según su modo. */
-async function construir(def, orden, profesional, sesion, aliado, original = null, { observacion = '', campos: delUsuario = {} } = {}) {
+/**
+ * Rellena UN formato y, si el profesional tiene firma digital y el formato tiene
+ * dónde llevarla, se la estampa (16-oct-2026). La imagen llega ya leída del
+ * almacenamiento en `profesional.firma_imagen` (la pone `generateOrderDocuments`).
+ * Los adjuntos de Word/Excel no se tocan.
+ */
+async function construir(def, orden, profesional, sesion, aliado, original = null, extra = {}) {
+  const r = await construirSinFirma(def, orden, profesional, sesion, aliado, original, extra);
+  if (!profesional?.firma_imagen || !r.firma?.length) return r;
+  return { ...r, buffer: await estamparFirma(r.buffer, profesional.firma_imagen, r.firma) };
+}
+
+async function construirSinFirma(def, orden, profesional, sesion, aliado, original = null, { observacion = '', campos: delUsuario = {} } = {}) {
   // Devuelve `{ buffer, admiteObservaciones }`. Lo segundo le dice a la vista
   // previa si ESTE archivo tiene dónde escribir las observaciones (el informe de
   // Colmena sí sobre su original, no en la plantilla de respaldo), para no
@@ -1188,6 +1213,7 @@ async function construir(def, orden, profesional, sesion, aliado, original = nul
       ),
       admiteObservaciones: !!obs,
       editables,
+      firma: def.sobreOriginal.firma,
     };
   }
   const ruta = path.join(RAIZ, ...def.archivo.split('/'));
@@ -1210,6 +1236,7 @@ async function construir(def, orden, profesional, sesion, aliado, original = nul
       buffer: await rellenarAcroForm(ruta, campos, def.marcas ? def.marcas(orden) : [], { parrafo }),
       admiteObservaciones: !!obs,
       editables,
+      firma: def.firma,
     };
   }
   const valores = def.valores(orden, profesional, sesion, aliado);
@@ -1221,6 +1248,7 @@ async function construir(def, orden, profesional, sesion, aliado, original = nul
     ),
     admiteObservaciones: !!obs,
     editables,
+    firma: def.firma,
   };
 }
 

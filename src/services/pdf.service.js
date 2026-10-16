@@ -1,5 +1,6 @@
 import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
 import { fechaHoraCO, horasTexto } from '../utils/formato.js';
+import { dibujarFirma } from '../utils/firma-pdf.js';
 
 /**
  * Genera un PDF de formato auto-diligenciado (M4 / FOR) a partir de la OS.
@@ -80,6 +81,8 @@ export async function generateFormatoPdf({ template, order, professional }) {
   page.drawLine({ start: { x: 330, y }, end: { x: 530, y }, thickness: 1, color: gray });
   page.drawText('Firma del profesional', { x: 90, y: y - 15, size: 9, font, color: gray });
   page.drawText('Firma del cliente / contacto SST', { x: 350, y: y - 15, size: 9, font, color: gray });
+  // 16-oct-2026 · La firma digital del profesional, si la tiene, sobre su raya.
+  await dibujarFirma(doc, professional?.firma_imagen, [[0, 70, y + 1, 180, 45]]);
 
   const bytes = await doc.save();
   return Buffer.from(bytes);
