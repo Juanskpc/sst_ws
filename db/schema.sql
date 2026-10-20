@@ -921,6 +921,12 @@ ALTER TABLE sst.archivos_soporte ADD COLUMN IF NOT EXISTS categoria             
 ALTER TABLE sst.archivos_soporte ADD COLUMN IF NOT EXISTS nombre_archivo        TEXT;
 ALTER TABLE sst.archivos_soporte ADD COLUMN IF NOT EXISTS tamano_original_bytes BIGINT;
 
+-- 20-oct-2026 · Soporte subido por la OFICINA (`POST /orders/:id/supports`): la
+-- encargada corrige un documento mal subido y lo sube ella. Queda quién fue; NULL
+-- = lo subió el profesional por su enlace.
+ALTER TABLE sst.archivos_soporte
+  ADD COLUMN IF NOT EXISTS subido_por_usuario_id UUID REFERENCES sst.usuarios(id) ON DELETE SET NULL;
+
 -- M11 · Notificaciones ---------------------------------------------------------
 CREATE TABLE IF NOT EXISTS sst.notificaciones (
   id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),

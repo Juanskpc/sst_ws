@@ -24,7 +24,11 @@ import { parseNumeroCO, parseFechaCO } from '../../utils/parseo.js';
 import { resolverEmpresaId } from '../companies/companies.service.js';
 import {
   casillasDeOrden, esCategoriaValida, esOpcional, etiquetaCategoria, listaEtiquetas, normalizarCategoria,
+  nombreCanonico, nombreOriginalLegible,
 } from '../../services/soportes.service.js';
+import { uploadSupports } from '../../middleware/upload.js';
+import { storage } from '../../services/storage.service.js';
+import { comprimirSoporte } from '../../services/compress.service.js';
 import {
   esBolivar, normalizarModalidadEjecucion, normalizarTipoActividadBolivar,
 } from '../../utils/bolivar.js';
@@ -703,10 +707,11 @@ router.get('/:id', asyncHandler(async (req, res) => {
     // 7-oct-2026 · Con el asesor que subió cada uno (NULL = el principal).
     pool.query(
       `SELECT s.*, COALESCE(s.profesional_id, o.profesional_asignado_id) AS de_profesional_id,
-              p.nombre AS profesional_nombre
+              p.nombre AS profesional_nombre, u.nombre AS subido_por_nombre
          FROM sst.archivos_soporte s
          JOIN sst.ordenes_servicio o ON o.id = s.orden_id
          LEFT JOIN sst.profesionales p ON p.id = COALESCE(s.profesional_id, o.profesional_asignado_id)
+         LEFT JOIN sst.usuarios u ON u.id = s.subido_por_usuario_id
         WHERE s.orden_id=$1 ORDER BY s.subido_en`, [req.params.id]),
     // El enlace que se enseña en la ficha es el del asesor principal.
     pool.query(`SELECT * FROM sst.enlaces_publicos WHERE orden_id=$1 AND activo AND profesional_id IS NULL ORDER BY creado_en DESC LIMIT 1`, [req.params.id]),
@@ -1794,10 +1799,11 @@ router.get('/:id/supports', asyncHandler(async (req, res) => {
   // de quién son y salen agrupados por asesor (el principal primero).
   const r = await pool.query(
     `SELECT s.*, COALESCE(s.profesional_id, o.profesional_asignado_id) AS de_profesional_id,
-              p.nombre AS profesional_nombre
+              p.nombre AS profesional_nombre, u.nombre AS subido_por_nombre
          FROM sst.archivos_soporte s
          JOIN sst.ordenes_servicio o ON o.id = s.orden_id
          LEFT JOIN sst.profesionales p ON p.id = COALESCE(s.profesional_id, o.profesional_asignado_id)
+         LEFT JOIN sst.usuarios u ON u.id = s.subido_por_usuario_id
         WHERE s.orden_id=$1
       ORDER BY (s.profesional_id IS NOT NULL), p.nombre,
                CASE s.categoria
@@ -1829,6 +1835,111 @@ router.get('/:id/supports', asyncHandler(async (req, res) => {
     `SELECT soportes_requeridos FROM sst.ordenes_servicio WHERE id=$1`, [req.params.id]
   );
   res.json({ data: r.rows, casillas: casillasDeOrden(req_.rows[0]?.soportes_requeridos), equipo });
+}));
+
+/**
+ * 20-oct-2026 · La OFICINA sube el documento corregido de una casilla.
+ *
+ * Petición de JD&D: a veces el profesional sube mal un soporte (sin firma, otra
+ * página, borroso) y la encargada lo necesita YA para radicar. Devolverlo por el
+ * portal la obliga a esperar al profesional; con esto lo corrige ella y lo sube
+ * en su lugar desde «Verificación de soportes».
+ *
+ * Es lo mismo que hace el portal con una casilla —el archivo nuevo borra al
+ * anterior, una casilla guarda un documento, no un historial—, pero:
+ *   - no mueve el estado de la orden ni toca el enlace del profesional: la
+ *     revisión la sigue decidiendo la encargada con Aceptar/Rechazar;
+ *   - solo sobre EJECUTADA (en revisión) o FINALIZADA (ya aceptada, para radicar).
+ *     En PROGRAMADA el enlace está abierto y lo que suba la oficina lo pisaría el
+ *     profesional al enviar lo suyo;
+ *   - queda constancia de quién lo subió (`subido_por_usuario_id`), para que
+ *     nadie confunda el documento de la oficina con el del profesional.
+ *
+ * Una casilla por envío. `profesional_id` dice de qué asesor es el documento
+ * cuando la orden tiene varios; vacío o el principal = el principal.
+ */
+router.post('/:id/supports', requireRole('admin', 'administrativo'), uploadSupports, asyncHandler(async (req, res) => {
+  const entrantes = Object.entries(req.files || {}).flatMap(([campo, archivos]) =>
+    (archivos || []).map((archivo) => ({ archivo, categoria: normalizarCategoria(campo) })),
+  );
+  if (!entrantes.length) throw badRequest('Adjunte el documento corregido.');
+  const categorias = [...new Set(entrantes.map((e) => e.categoria))];
+  if (categorias.length > 1) throw badRequest('Suba los documentos de una casilla a la vez.');
+  const categoria = categorias[0];
+
+  const result = await withTransaction(async (client) => {
+    const orden = (await client.query(
+      `SELECT id, codigo, estado::text AS estado, profesional_asignado_id, soportes_requeridos
+         FROM sst.ordenes_servicio WHERE id=$1 FOR UPDATE`, [req.params.id]
+    )).rows[0];
+    if (!orden) throw badRequest('OS no encontrada');
+    if (!['EJECUTADA', 'FINALIZADA'].includes(orden.estado)) {
+      throw badRequest(
+        orden.estado === 'PROGRAMADA'
+          ? 'Esta orden está PROGRAMADA: el enlace del profesional está abierto y lo que suba ' +
+            'aquí lo reemplazaría su envío. Espere a que la entregue (EJECUTADA) para corregir un documento.'
+          : `Esta orden está ${orden.estado} y todavía no tiene soportes que corregir.`,
+      );
+    }
+    const deLaOrden = casillasDeOrden(orden.soportes_requeridos).map((c) => c.clave);
+    if (categoria !== 'otros' && !deLaOrden.includes(categoria)) {
+      throw badRequest(
+        `A esta orden no se le pidió ${listaEtiquetas([categoria])}. Sus documentos son: ${listaEtiquetas(deLaOrden)}.`,
+      );
+    }
+
+    // Mismo convenio que el portal: NULL = el principal.
+    const pedido = String(req.body?.profesional_id ?? '').trim() || null;
+    const de = !pedido || pedido === orden.profesional_asignado_id ? null : pedido;
+    if (de && !(await coasesoresDeOrden(orden.id, client)).some((c) => c.profesional_id === de)) {
+      throw badRequest('Ese asesor no está en esta orden.');
+    }
+
+    const del = await client.query(
+      `DELETE FROM sst.archivos_soporte
+        WHERE orden_id=$1 AND COALESCE(categoria,'otros') = $2
+          AND profesional_id IS NOT DISTINCT FROM $3
+        RETURNING id, url_archivo, nombre_archivo`,
+      [orden.id, categoria, de]
+    );
+
+    const saved = [];
+    let indice = 0;
+    for (const { archivo } of entrantes) {
+      const comprimido = await comprimirSoporte({ buffer: archivo.buffer, mime: archivo.mimetype });
+      const nombre = nombreCanonico(categoria, comprimido.mime, indice++);
+      const key = await storage.put(`supports/${orden.id}`, nombre, comprimido.buffer);
+      const sf = await client.query(
+        `INSERT INTO sst.archivos_soporte
+           (orden_id, url_archivo, nombre_original, nombre_archivo, categoria, mime,
+            tamano_bytes, tamano_original_bytes, via_enlace_publico, profesional_id, subido_por_usuario_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,false,$9,$10)
+         RETURNING *`,
+        [orden.id, key, nombreOriginalLegible(archivo.originalname), nombre, categoria,
+         comprimido.mime, comprimido.buffer.length, comprimido.original, de, req.user.sub]
+      );
+      saved.push(sf.rows[0]);
+    }
+    return { orden, saved, reemplazados: del.rows };
+  });
+
+  // Los binarios viejos, DESPUÉS de confirmar: si la transacción se hubiera
+  // deshecho, el documento anterior tenía que seguir ahí.
+  for (const viejo of result.reemplazados) {
+    await storage.remove(viejo.url_archivo)
+      .catch((e) => console.error('[soportes] no se pudo borrar el archivo reemplazado:', viejo.url_archivo, e?.message));
+  }
+  console.log(
+    `[soportes] ${result.orden.codigo} · la oficina subió ${result.saved.map((s) => s.nombre_archivo).join(', ')}` +
+    (result.reemplazados.length ? ` (reemplaza ${result.reemplazados.map((v) => v.nombre_archivo).join(', ')})` : ''),
+  );
+
+  res.status(201).json({
+    message: result.reemplazados.length
+      ? `Se reemplazó «${etiquetaCategoria(categoria)}» por la versión corregida.`
+      : `Se agregó «${etiquetaCategoria(categoria)}» a la orden.`,
+    data: result.saved,
+  });
 }));
 
 /**
