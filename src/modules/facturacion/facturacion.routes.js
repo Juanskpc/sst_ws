@@ -51,16 +51,19 @@ router.get('/por-facturar', LEER, asyncHandler(async (req, res) => {
 }));
 
 // Comprueba una selección antes de crear la factura: mismo pagador, todo libre.
-// Cuerpo: { arl_id, orden_ids? } o, en Bolívar, { arl_id, prefactura_id, fila_ids? }.
+// Cuerpo: { arl_id, orden_ids? } o, en Bolívar, { arl_id, prefactura_id | prefactura_ids, fila_ids? }
+// (20-oct-2026: varias prefacturas de Bolívar se pueden unir en una sola factura).
 router.post('/seleccion/validar', OPERAR, asyncHandler(async (req, res) => {
   const b = req.body || {};
   if (b.orden_ids != null && !Array.isArray(b.orden_ids)) throw badRequest('"orden_ids" debe ser una lista.');
   if (b.fila_ids != null && !Array.isArray(b.fila_ids)) throw badRequest('"fila_ids" debe ser una lista.');
+  if (b.prefactura_ids != null && !Array.isArray(b.prefactura_ids)) throw badRequest('"prefactura_ids" debe ser una lista.');
   const r = await resolverSeleccion({
     arlId: uuidOpcional(b.arl_id, 'arl_id'),
     pagadorTerceroId: uuidOpcional(b.pagador_tercero_id, 'pagador_tercero_id'),
     ordenIds: (b.orden_ids ?? []).map((id) => uuidOpcional(id, 'orden_ids')),
     prefacturaId: uuidOpcional(b.prefactura_id, 'prefactura_id'),
+    prefacturaIds: b.prefactura_ids ? b.prefactura_ids.map((id) => uuidOpcional(id, 'prefactura_ids')) : null,
     filaIds: b.fila_ids ? b.fila_ids.map((id) => uuidOpcional(id, 'fila_ids')) : null,
   });
   res.json({ data: r });
@@ -76,18 +79,23 @@ router.get('/relacion.xlsx', LEER, asyncHandler(async (req, res) => {
   const arlId = uuidOpcional(req.query.arl_id, 'arl_id');
   const pagadorTerceroId = uuidOpcional(req.query.pagador_tercero_id, 'pagador_tercero_id');
   if (!arlId && !pagadorTerceroId) throw badRequest('Indique el pagador (arl_id, o pagador_tercero_id si es un cliente particular).');
-  const prefacturaId = uuidOpcional(req.query.prefactura_id, 'prefactura_id');
+  // 20-oct-2026 · Bolívar: una prefactura o varias (`prefactura_id` admite la lista separada por coma),
+  // la misma selección con que se arma la factura que las une.
+  const prefacturaIds = req.query.prefactura_id
+    ? String(req.query.prefactura_id).split(',').map((s) => uuidOpcional(s.trim(), 'prefactura_id'))
+    : [];
   const ids = req.query.orden_ids ? String(req.query.orden_ids).split(',').map((s) => uuidOpcional(s.trim(), 'orden_ids')) : null;
 
   const { pagadores } = await relacionPorFacturar({ arlId, pagadorTerceroId: arlId ? null : pagadorTerceroId });
   const pagador = pagadores[0];
   if (!pagador) throw badRequest('Ese pagador no existe o no tiene nada por facturar.');
   const bolivar = esBolivar(pagador.arl_nombre);
-  if (bolivar && !prefacturaId) throw badRequest('Bolívar se factura por prefactura: indique cuál (prefactura_id).');
+  if (bolivar && !prefacturaIds.length) throw badRequest('Bolívar se factura por prefactura: indique cuál (prefactura_id).');
 
   let grupos = pagador.grupos;
-  if (bolivar) grupos = grupos.filter((g) => g.prefactura?.id === prefacturaId);
-  const lineas = grupos.flatMap((g) => g.lineas)
+  if (bolivar) grupos = grupos.filter((g) => prefacturaIds.includes(g.prefactura?.id));
+  // Cada línea con el número de SU prefactura: con varias unidas, no todas son de la primera.
+  const lineas = grupos.flatMap((g) => g.lineas.map((l) => ({ ...l, numero_prefactura: g.prefactura?.numero ?? '' })))
     .filter((l) => l.facturable && (ids ? ids.includes(l.orden_id) : true));
   if (!lineas.length) throw badRequest('No hay líneas facturables para esa relación.');
 
@@ -122,7 +130,7 @@ router.get('/relacion.xlsx', LEER, asyncHandler(async (req, res) => {
       bolivar ? l.codigo_cronograma ?? '' : l.numero_orden ?? l.codigo ?? '',
       bolivar ? l.secuencia ?? '' : '', l.empresa_nombre ?? '',
       l.tema_actividad || l.tipo_actividad || '',
-      bolivar ? grupos[0].prefactura.numero : '',
+      bolivar ? l.numero_prefactura : '',
     ]);
     if (!tieneValor) row.getCell(5).fill = SIN_VALOR;
   }
@@ -133,7 +141,7 @@ router.get('/relacion.xlsx', LEER, asyncHandler(async (req, res) => {
   ws.views = [{ state: 'frozen', ySplit: 1 }];
 
   const buffer = await wb.xlsx.writeBuffer();
-  const sufijo = bolivar ? `prefactura-${grupos[0].prefactura.numero}` : hoyCO();
+  const sufijo = bolivar ? `prefactura-${grupos.map((g) => g.prefactura.numero).join('-')}` : hoyCO();
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
   res.setHeader('Content-Disposition', `attachment; filename="relacion-${sufijo}.xlsx"`);
   res.send(Buffer.from(buffer));
@@ -158,11 +166,13 @@ router.post('/borradores', OPERAR, asyncHandler(async (req, res) => {
   const b = req.body || {};
   if (b.orden_ids != null && !Array.isArray(b.orden_ids)) throw badRequest('"orden_ids" debe ser una lista.');
   if (b.fila_ids != null && !Array.isArray(b.fila_ids)) throw badRequest('"fila_ids" debe ser una lista.');
+  if (b.prefactura_ids != null && !Array.isArray(b.prefactura_ids)) throw badRequest('"prefactura_ids" debe ser una lista.');
   const data = await crearBorrador({
     arlId: uuidOpcional(b.arl_id, 'arl_id'),
     pagadorTerceroId: uuidOpcional(b.pagador_tercero_id, 'pagador_tercero_id'),
     ordenIds: (b.orden_ids ?? []).map((id) => uuidOpcional(id, 'orden_ids')),
     prefacturaId: uuidOpcional(b.prefactura_id, 'prefactura_id'),
+    prefacturaIds: b.prefactura_ids ? b.prefactura_ids.map((id) => uuidOpcional(id, 'prefactura_ids')) : null,
     filaIds: b.fila_ids ? b.fila_ids.map((id) => uuidOpcional(id, 'fila_ids')) : null,
     observaciones: b.observaciones ?? null,
     usuarioId: req.user.sub,

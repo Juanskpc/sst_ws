@@ -344,11 +344,17 @@ export async function relacionPorFacturar({ arlId = null, pagadorTerceroId = nul
  * Valida una selección para crear la factura (lo usará A1-04): todas las líneas
  * elegidas deben existir, ser del mismo pagador y estar libres. No escribe nada.
  *
- * @param {{arlId?: string, pagadorTerceroId?: string, ordenIds?: string[], prefacturaId?: string, filaIds?: string[]}} sel
- *   AXA/Colmena/privados: `ordenIds`. Bolívar: `prefacturaId` (+ `filaIds`
- *   opcional; sin él se toman las filas marcadas por defecto).
+ * @param {{arlId?: string, pagadorTerceroId?: string, ordenIds?: string[], prefacturaId?: string, prefacturaIds?: string[], filaIds?: string[]}} sel
+ *   AXA/Colmena/privados: `ordenIds`. Bolívar: `prefacturaId`, o varias en
+ *   `prefacturaIds` (+ `filaIds` opcional; sin él se toman las filas marcadas
+ *   por defecto).
+ *
+ * 20-oct-2026 (petición de la contadora) · En Bolívar se pueden unir VARIAS
+ * prefacturas en una sola factura: las filas de todas van como líneas de la
+ * misma factura. Con una sola, `prefactura` es esa; con varias es null (el
+ * documento no tiene UNA prefactura) y `prefacturas` las lista.
  */
-export async function resolverSeleccion({ arlId, pagadorTerceroId = null, ordenIds = [], prefacturaId = null, filaIds = null }, db = pool) {
+export async function resolverSeleccion({ arlId, pagadorTerceroId = null, ordenIds = [], prefacturaId = null, prefacturaIds = null, filaIds = null }, db = pool) {
   if (!arlId && !pagadorTerceroId) throw badRequest('Indique el pagador (arl_id, o pagador_tercero_id si es un cliente particular).');
   if (arlId && pagadorTerceroId) throw badRequest('Indique un solo pagador: la ARL o el cliente particular.');
   const { pagadores } = await relacionPorFacturar({ arlId, pagadorTerceroId }, db);
@@ -359,19 +365,26 @@ export async function resolverSeleccion({ arlId, pagadorTerceroId = null, ordenI
 
   let lineas;
   let prefactura = null;
+  let prefacturas = [];
+  const idsPrefactura = [...new Set([...(prefacturaIds ?? []), ...(prefacturaId ? [prefacturaId] : [])])];
   if (pagador.modo === 'PREFACTURA') {
-    if (!prefacturaId) throw badRequest('Bolívar se factura por prefactura: indique cuál (prefactura_id).');
-    const grupo = pagador.grupos.find((g) => g.prefactura?.id === prefacturaId);
-    if (!grupo) throw badRequest('Esa prefactura no existe o ya no tiene nada por facturar.');
-    prefactura = grupo.prefactura;
+    if (!idsPrefactura.length) throw badRequest('Bolívar se factura por prefactura: indique cuál (prefactura_id) o cuáles (prefactura_ids).');
+    const grupos = idsPrefactura.map((id) => {
+      const g = pagador.grupos.find((x) => x.prefactura?.id === id);
+      if (!g) throw badRequest('Alguna prefactura elegida no existe o ya no tiene nada por facturar.');
+      return g;
+    });
+    prefacturas = grupos.map((g) => g.prefactura);
+    prefactura = grupos.length === 1 ? grupos[0].prefactura : null;
+    const filas = grupos.flatMap((g) => g.lineas);
     const elegidas = filaIds ? new Set(filaIds) : null;
-    lineas = grupo.lineas.filter((l) => (elegidas ? elegidas.has(l.fila_id) : l.marcada_por_defecto));
+    lineas = filas.filter((l) => (elegidas ? elegidas.has(l.fila_id) : l.marcada_por_defecto));
     if (elegidas) {
-      const faltan = [...elegidas].filter((id) => !grupo.lineas.some((l) => l.fila_id === id));
-      if (faltan.length) throw badRequest('Alguna fila elegida no pertenece a esa prefactura.');
+      const faltan = [...elegidas].filter((id) => !filas.some((l) => l.fila_id === id));
+      if (faltan.length) throw badRequest('Alguna fila elegida no pertenece a las prefacturas elegidas.');
     }
   } else {
-    if (prefacturaId) throw badRequest('Solo Bolívar se factura por prefactura.');
+    if (idsPrefactura.length) throw badRequest('Solo Bolívar se factura por prefactura.');
     if (!ordenIds.length) throw badRequest('Elija al menos una orden.');
     const todas = pagador.grupos.flatMap((g) => g.lineas);
     lineas = ordenIds.map((id) => {
@@ -397,6 +410,7 @@ export async function resolverSeleccion({ arlId, pagadorTerceroId = null, ordenI
       tercero_id: pagador.tercero_id, tercero_nombre: pagador.tercero_nombre,
     },
     prefactura,
+    prefacturas,
     lineas,
     total: total(lineas),
   };

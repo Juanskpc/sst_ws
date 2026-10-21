@@ -367,11 +367,13 @@ function conTransaccion(dbClient, fn) {
  * de verificación (todo en una transacción con ROLLBACK); el resto del código
  * lo deja vacío.
  */
-export async function crearBorrador({ arlId, pagadorTerceroId, ordenIds, prefacturaId, filaIds, observaciones, usuarioId }, dbClient = null) {
+export async function crearBorrador({ arlId, pagadorTerceroId, ordenIds, prefacturaId, prefacturaIds, filaIds, observaciones, usuarioId }, dbClient = null) {
   return conTransaccion(dbClient, async (client) => {
     // Revalida DENTRO de la transacción: nada de fiarse de una selección hecha
     // hace rato en el navegador mientras otra persona creaba otro borrador.
-    const seleccion = await resolverSeleccion({ arlId, pagadorTerceroId, ordenIds, prefacturaId, filaIds }, client);
+    // 20-oct-2026 · Con varias prefacturas `seleccion.prefactura` es null: la
+    // factura no tiene UNA prefactura, y las suyas se leen de sus órdenes.
+    const seleccion = await resolverSeleccion({ arlId, pagadorTerceroId, ordenIds, prefacturaId, prefacturaIds, filaIds }, client);
     const pagador = seleccion.pagador;
 
     const [{ productoArl, productoPrivado }, condicion] = await Promise.all([
@@ -514,7 +516,13 @@ export async function cambiarPagoBorrador(documentoId, body, usuarioId, dbClient
 const DOCUMENTO_SELECT = `
   d.id, d.tipo, d.estado, d.reference_code, d.numero, d.prefijo,
   d.tercero_id, COALESCE(t.razon_social, btrim(concat_ws(' ', t.nombres, t.apellidos))) AS tercero_nombre,
-  d.prefactura_id, pf.numero_prefactura,
+  d.prefactura_id,
+  -- 20-oct-2026 · Una factura que une varias prefacturas no guarda una sola: las
+  -- suyas salen de sus órdenes («161906, 162117, 162187»).
+  COALESCE(pf.numero_prefactura, (
+    SELECT string_agg(DISTINCT o.numero_prefactura, ', ')
+      FROM sst.documento_ordenes dor JOIN sst.ordenes_servicio o ON o.id = dor.orden_id
+     WHERE dor.documento_id = d.id AND o.numero_prefactura IS NOT NULL)) AS numero_prefactura,
   to_char(d.fecha_emision, 'YYYY-MM-DD') AS fecha_emision,
   to_char(d.fecha_vencimiento, 'YYYY-MM-DD') AS fecha_vencimiento,
   d.forma_pago_id, fp.nombre AS forma_pago_nombre, fp.codigo_dian AS forma_pago_codigo, d.medio_pago_id, mp.nombre AS medio_pago_nombre,
