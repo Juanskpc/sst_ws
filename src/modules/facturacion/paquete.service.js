@@ -245,7 +245,10 @@ async function cargar(documentoId, db = pool) {
   if (!f) throw notFound('Esa factura no existe.');
   const ordenes = (await db.query(
     `SELECT o.id, o.codigo, o.empresa_nombre, o.secuencia, o.codigo_cronograma, o.numero_orden, o.numero_prefactura,
-            COALESCE(NULLIF(btrim(o.tema_actividad), ''), o.descripcion) AS actividad, o.tipo_actividad,
+            -- 20-oct-2026 (contadora) · La actividad es la «Descripción» del SIPAB (tipo_actividad,
+            -- p. ej. "PRIMEROS AUXILIOS"), no descripcion, que guarda las Observaciones enteras
+            -- (contacto, requisitos, «ACTIVIDAD CARGADA EN PROCESO DE LOTE»…).
+            COALESCE(NULLIF(btrim(o.tipo_actividad), ''), NULLIF(btrim(o.tema_actividad), ''), o.descripcion) AS actividad, o.tipo_actividad,
             o.url_archivo_original,
             -- La factura de Bolívar va en UNA línea sin orden (20-oct-2026): el valor de cada
             -- orden es entonces el que aprobó operación (el mismo de su fila de prefactura).
