@@ -171,6 +171,14 @@ export async function pdfActividades(ordenes) {
     celda(pesos(o.valor), 2, y - alto + 4, { alinear: 'der' });
     y -= alto;
   }
+  // 20-oct-2026 (contadora) · Fila final con la suma de todas las actividades: es el total de
+  // la factura y lo que la ARL coteja. Se suma en centavos para no arrastrar decimales.
+  const total = ordenes.reduce((t, o) => t + Math.round(Number(o.valor || 0) * 100), 0) / 100;
+  if (y - 18 < 150) await cabecera();
+  caja(y, 18, gris);
+  p.drawLine({ start: { x: xs[2], y }, end: { x: xs[2], y: y - 18 }, thickness: 0.7, color: NEGRO });
+  celda('TOTAL', 0, y - 13, { fuente: r.negrita, tam: 10.5 });
+  celda(pesos(total), 2, y - 13, { fuente: r.negrita, tam: 10, alinear: 'der' });
   return Buffer.from(await doc.save());
 }
 
