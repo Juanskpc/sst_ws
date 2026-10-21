@@ -317,7 +317,8 @@ async function finalizarNotaValidadaTx(notaId, resultado, usuarioId) {
         [factura.id, `Anulada por la nota crédito ${numeroNota}. Sus órdenes vuelven a estar pendientes por facturar.`, usuarioId],
       );
       const ordenes = (await client.query(
-        `SELECT DISTINCT orden_id FROM sst.documento_items WHERE documento_id = $1 AND orden_id IS NOT NULL`, [factura.id],
+        // Del documento, no de sus líneas: la factura de Bolívar va en una sola línea sin orden.
+        `SELECT DISTINCT orden_id FROM sst.documento_ordenes WHERE documento_id = $1`, [factura.id],
       )).rows;
       for (const { orden_id: ordenId } of ordenes) {
         const previa = (await client.query(

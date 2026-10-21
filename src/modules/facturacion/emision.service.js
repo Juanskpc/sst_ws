@@ -130,7 +130,10 @@ export function validarParaEmitir({ doc, items, resolucion }) {
 
 /** Vuelve a comprobar, con lock, que las órdenes del documento sigan libres (paso 1, punto "órdenes aún libres"). */
 async function verificarOrdenesLibres(client, documentoId, items) {
-  const ordenIds = items.map((it) => it.orden_id).filter(Boolean);
+  // Las de las líneas y las del documento: la factura de Bolívar (20-oct-2026) va en una sola
+  // línea sin orden y sus órdenes solo están en documento_ordenes.
+  const delDocumento = (await client.query(`SELECT orden_id FROM sst.documento_ordenes WHERE documento_id = $1`, [documentoId])).rows;
+  const ordenIds = [...new Set([...items.map((it) => it.orden_id), ...delDocumento.map((r) => r.orden_id)].filter(Boolean))];
   if (!ordenIds.length) return;
   // FOR UPDATE: si dos emisiones de documentos distintos comparten por error
   // una orden, la segunda espera a que la primera termine su transacción (que
@@ -279,7 +282,9 @@ async function finalizarValidadoTx(documentoId, resultado, usuarioId) {
       );
     }
 
-    const items = (await client.query(`SELECT orden_id FROM sst.documento_items WHERE documento_id = $1 AND orden_id IS NOT NULL`, [documentoId])).rows;
+    // Las órdenes del DOCUMENTO, no de sus líneas: la factura de Bolívar va en una sola línea
+    // sin orden (20-oct-2026) y sus órdenes están solo en documento_ordenes.
+    const items = (await client.query(`SELECT orden_id FROM sst.documento_ordenes WHERE documento_id = $1`, [documentoId])).rows;
     const numeroFactura = numeroCompleto(resolucion?.prefijo, resultado.numeroDocumento);
     for (const { orden_id: ordenId } of items) {
       const previa = (await client.query(`SELECT estado_cobro::text AS estado_cobro FROM sst.ordenes_servicio WHERE id = $1 FOR UPDATE`, [ordenId])).rows[0];

@@ -247,7 +247,10 @@ async function cargar(documentoId, db = pool) {
     `SELECT o.id, o.codigo, o.empresa_nombre, o.secuencia, o.codigo_cronograma, o.numero_orden, o.numero_prefactura,
             COALESCE(NULLIF(btrim(o.tema_actividad), ''), o.descripcion) AS actividad, o.tipo_actividad,
             o.url_archivo_original,
-            (SELECT COALESCE(sum(i.total_linea), 0) FROM sst.documento_items i WHERE i.documento_id = $1 AND i.orden_id = o.id) AS valor,
+            -- La factura de Bolívar va en UNA línea sin orden (20-oct-2026): el valor de cada
+            -- orden es entonces el que aprobó operación (el mismo de su fila de prefactura).
+            COALESCE((SELECT NULLIF(sum(i.total_linea), 0) FROM sst.documento_items i WHERE i.documento_id = $1 AND i.orden_id = o.id),
+                     o.cobro_aprobado_total, 0) AS valor,
             (SELECT count(*)::int FROM sst.archivos_soporte s WHERE s.orden_id = o.id) AS soportes
        FROM sst.documento_ordenes dor JOIN sst.ordenes_servicio o ON o.id = dor.orden_id
       WHERE dor.documento_id = $1

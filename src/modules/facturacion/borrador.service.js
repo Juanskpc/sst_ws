@@ -3,7 +3,7 @@ import { pool, withTransaction } from '../../config/db.js';
 import { badRequest, conflict, notFound } from '../../utils/httpError.js';
 import { aCentavos, deCentavos, sumar } from '../../utils/dinero.js';
 import { calcularDocumento } from './calculo.js';
-import { resolverSeleccion } from './relacion.service.js';
+import { esBolivar, resolverSeleccion } from './relacion.service.js';
 import { hoyCO } from '../../utils/formato.js';
 
 /**
@@ -243,8 +243,13 @@ function calcular(items, descuentoComercialPct, retenciones) {
  * BORRADOR: A1-05 la sobreescribe con la respuesta real de Factus al emitir, y
  * a partir de ahí ya no hace falta recalcular (el documento queda fijo).
  */
-async function guardarDocumento(client, { documentoId, pagador, prefactura, items, calculo, descuentoComercialPct, retenciones, observaciones, fechaEmision, formaPagoId, medioPagoId, plazoDias, usuarioId, origen = 'Borrador creado desde la relación a facturar.' }) {
+async function guardarDocumento(client, { documentoId, pagador, prefactura, items, ordenIds = null, calculo, descuentoComercialPct, retenciones, observaciones, fechaEmision, formaPagoId, medioPagoId, plazoDias, usuarioId, origen = 'Borrador creado desde la relación a facturar.' }) {
   const fechaVencimiento = plazoDias > 0 ? sumarDias(fechaEmision, plazoDias) : fechaEmision;
+  // Las órdenes que cubre el documento. Normalmente salen de sus líneas (una por orden); la
+  // factura de Bolívar (20-oct-2026) va en UNA línea sin orden y las pasa en `ordenIds`.
+  // Si no hay ni una cosa ni la otra al EDITAR, se conservan las que ya tenía: una edición
+  // de la descripción o de los impuestos no puede dejar la factura sin sus órdenes.
+  const ordenesDoc = ordenIds ?? [...new Set(items.map((it) => it.orden_id).filter(Boolean))];
 
   let docId = documentoId;
   if (!docId) {
@@ -292,7 +297,7 @@ async function guardarDocumento(client, { documentoId, pagador, prefactura, item
       ],
     );
     await client.query(`DELETE FROM sst.documento_items WHERE documento_id = $1`, [docId]); // CASCADE se lleva sus tributos
-    await client.query(`DELETE FROM sst.documento_ordenes WHERE documento_id = $1`, [docId]);
+    if (ordenesDoc.length) await client.query(`DELETE FROM sst.documento_ordenes WHERE documento_id = $1`, [docId]);
     await client.query(
       `INSERT INTO sst.documento_eventos (documento_id, codigo, descripcion, usuario_id)
        VALUES ($1, 'EDITADO', 'Borrador editado.', $2)`,
@@ -317,13 +322,13 @@ async function guardarDocumento(client, { documentoId, pagador, prefactura, item
         [itemId, deCentavos(c.base), it.iva_pct, deCentavos(c.iva)],
       );
     }
-    if (it.orden_id) {
-      await client.query(
-        `INSERT INTO sst.documento_ordenes (documento_id, orden_id) VALUES ($1, $2)
-         ON CONFLICT DO NOTHING`,
-        [docId, it.orden_id],
-      );
-    }
+  }
+  for (const ordenId of ordenesDoc) {
+    await client.query(
+      `INSERT INTO sst.documento_ordenes (documento_id, orden_id) VALUES ($1, $2)
+       ON CONFLICT DO NOTHING`,
+      [docId, ordenId],
+    );
   }
 
   // Las retenciones son del DOCUMENTO (base = subtotal), no de una línea: en
@@ -393,7 +398,11 @@ export async function crearBorrador({ arlId, pagadorTerceroId, ordenIds, prefact
     }
 
     const retenciones = await retencionesDeVenta(condicion.retenciones_ids, client);
-    const items = lineasConEsArl.flatMap((l) => {
+    // 20-oct-2026 (petición de la contadora) · A Bolívar se le factura en UNA sola línea por
+    // el total de sus prefacturas, como en Siigo; el detalle por orden va en la relación y en
+    // el paquete. Las órdenes siguen enlazadas al documento (`ordenIds`), no a la línea.
+    const agrupada = esBolivar(pagador.arl_nombre) && seleccion.prefacturas?.length > 0;
+    const items = agrupada ? [itemUnicoBolivar(lineasConEsArl, seleccion.prefacturas, productoArl)] : lineasConEsArl.flatMap((l) => {
       const honorarios = construirItemDesdeLinea(l, {
         productoArl, productoPrivado, formatoDescripcion: condicion.formato_descripcion,
       });
@@ -417,11 +426,33 @@ export async function crearBorrador({ arlId, pagadorTerceroId, ordenIds, prefact
 
     const docId = await guardarDocumento(client, {
       documentoId: null, pagador, prefactura: seleccion.prefactura, items, calculo,
+      ordenIds: agrupada ? seleccion.lineas.map((l) => l.orden_id).filter(Boolean) : null,
       descuentoComercialPct, retenciones, observaciones, fechaEmision,
       formaPagoId, medioPagoId, plazoDias, usuarioId,
     });
     return obtenerBorrador(docId, client);
   });
+}
+
+/**
+ * La línea única de una factura a Bolívar: el texto que JD&D usaba en Siigo, con los números
+ * de sus prefacturas, cantidad 1 y el total. El valor de cada fila de prefactura ya incluye
+ * sus gastos (transporte…), así que el total es la suma de lo que dice Bolívar.
+ */
+function itemUnicoBolivar(lineas, prefacturas, productoArl) {
+  if (!productoArl) throw badRequest('No hay un producto configurado para facturar a la ARL (Parametrización → Productos).');
+  const total = Number(deCentavos(lineas.reduce((t, l) => t + aCentavos(l.valor_referencia), 0)));
+  const numeros = prefacturas.map((p) => p.numero).join('-');
+  return {
+    orden_id: null,
+    producto_id: productoArl.id,
+    codigo: productoArl.codigo,
+    descripcion: 'Servicios de promoción y prevención de riesgos laborales prestados a las empresas afiliadas '
+      + `a la compañía según pre facturas: ${numeros}`,
+    cantidad: 1,
+    valor_unitario: total,
+    iva_pct: productoArl.tratamiento_iva === 'GRAVADO' ? Number(productoArl.tarifa_iva) : 0,
+  };
 }
 
 /**
