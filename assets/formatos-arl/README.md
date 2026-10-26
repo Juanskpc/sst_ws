@@ -27,6 +27,9 @@ las horas y la modalidad; este README solo dice qué es cada archivo.
 | `colpatria/asistencia.pdf` | Registro Listado de Asistencia | Coordenadas | sesión |
 | `colpatria/ficha-gestion.pdf` | Ficha de Gestión · Proveedor de Gestión del Riesgo (3 págs.) | AcroForm | **orden** |
 | `colpatria/informe-tecnico.docx` | Formato Informe Técnico | **se adjunta tal cual** | **orden** |
+| `sura/asistencia.pdf` | Registro de asistencia a eventos de capacitación · **ARL SURA**. Se DIBUJA con `scripts/generar-plantilla-asistencia-sura.mjs` (el ejemplo del cliente va ya diligenciado y sin formulario) con el logo extraído de su propio PDF | Coordenadas (`CASILLAS_ASISTENCIA_SURA`) + firma del asesor | sesión |
+| `sura/modelo-informe.docx` | Modelo para la presentación de informes de ARL SURA (asesorías) | **se adjunta tal cual** | **orden** |
+| `sura/logo-arl-sura.png` | Logo de ARL SURA (insumo de la plantilla de asistencia) | — | — |
 | *(PDF original de la orden)* | Informe de Prestación de Servicios · **SPM-F 38**, el que genera Colmena | Coordenadas sobre el original | sesión |
 | `colmena/prestacion-servicios.pdf` | PSP-F-007 V3.3 · solo **respaldo** si la orden no tiene su PDF original | Coordenadas | sesión |
 | `colmena/registro-ejecucion.pdf` | Registro de Ejecución de Actividades · **PSP-F-006 V3 03/2026** (exportado del `.xls`) | Coordenadas + marcas | sesión |

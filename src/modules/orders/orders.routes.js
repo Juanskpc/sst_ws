@@ -926,7 +926,7 @@ router.put('/:id', requireRole('admin'), asyncHandler(async (req, res) => {
         );
       } else {
         const prof = (await client.query(
-          `SELECT * FROM sst.profesionales WHERE id=$1`, [actual.profesional_asignado_id]
+          `SELECT p.*, COALESCE(p.documento_identidad, u.documento_identidad) AS documento_identidad FROM sst.profesionales p LEFT JOIN sst.usuarios u ON u.id = p.usuario_id WHERE p.id=$1`, [actual.profesional_asignado_id]
         )).rows[0];
         const tarifa = await valorHoraDeOrden({ ordenId: req.params.id, profesional: prof }, client);
         await client.query(
@@ -936,7 +936,7 @@ router.put('/:id', requireRole('admin'), asyncHandler(async (req, res) => {
         // 5-oct-2026 · Y lo mismo para cada asesor adicional: el tipo nuevo le
         // cambia el valor hora igual que al principal.
         for (const c of await coasesoresDeOrden(req.params.id, client)) {
-          const co = (await client.query(`SELECT * FROM sst.profesionales WHERE id=$1`, [c.profesional_id])).rows[0];
+          const co = (await client.query(`SELECT p.*, COALESCE(p.documento_identidad, u.documento_identidad) AS documento_identidad FROM sst.profesionales p LEFT JOIN sst.usuarios u ON u.id = p.usuario_id WHERE p.id=$1`, [c.profesional_id])).rows[0];
           const tarifaCo = await valorHoraDeOrden({ ordenId: req.params.id, profesional: co }, client);
           await client.query(
             `UPDATE sst.orden_coasesores SET valor_hora_cobro=$3, valor_hora_origen=$4
@@ -1146,7 +1146,7 @@ async function aplicarAsignacion(req, client, { vistaPrevia = false } = {}) {
   const camposUsuario = camposDeFormatos(req.body?.campos_formatos);
   const coasesoresPedidos = normalizarCoasesores(req.body?.coasesores);
 
-  const prof = await client.query(`SELECT * FROM sst.profesionales WHERE id=$1`, [profesionalId]);
+  const prof = await client.query(`SELECT p.*, COALESCE(p.documento_identidad, u.documento_identidad) AS documento_identidad FROM sst.profesionales p LEFT JOIN sst.usuarios u ON u.id = p.usuario_id WHERE p.id=$1`, [profesionalId]);
   if (!prof.rows[0]) throw badRequest('Profesional no existe');
   if (prof.rows[0].estado !== 'Activo') throw badRequest('El profesional está Inactivo');
 
@@ -1240,7 +1240,7 @@ async function aplicarAsignacion(req, client, { vistaPrevia = false } = {}) {
   }
   await client.query(`DELETE FROM sst.orden_coasesores WHERE orden_id=$1`, [req.params.id]);
   for (const c of coasesores) {
-    const co = (await client.query(`SELECT * FROM sst.profesionales WHERE id=$1`, [c.profesional_id])).rows[0];
+    const co = (await client.query(`SELECT p.*, COALESCE(p.documento_identidad, u.documento_identidad) AS documento_identidad FROM sst.profesionales p LEFT JOIN sst.usuarios u ON u.id = p.usuario_id WHERE p.id=$1`, [c.profesional_id])).rows[0];
     if (!co) throw badRequest('El asesor adicional no existe.');
     if (co.estado !== 'Activo') throw badRequest(`${co.nombre} está Inactivo y no se le puede asignar la orden.`);
     // 7-oct-2026 · Sus horas son las que tiene marcadas en la agenda: un asesor

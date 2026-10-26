@@ -77,13 +77,17 @@ export async function crearCompra(b = {}, usuarioId = null, { client = null } = 
       if (dup.rows[0]) throw conflict(`La factura ${numeroProveedor} de ${tercero.nombre} ya está registrada.`);
     }
 
-    // B8-01 · Centro de costo de la compra (opcional): va en las líneas de gasto.
-    const centroId = b.centro_costo_id || null;
-    if (centroId) {
-      const cc = (await db.query(`SELECT codigo, activo FROM sst.centros_costo WHERE id = $1`, [centroId])).rows[0];
+    // B8-01 · Centro de costo (opcional). Desde el 24-oct-2026 cada ítem lleva el SUYO
+    // (`items[].centro_costo_id`); el de la cabecera es el que toman los ítems que no
+    // traen uno (así sigue funcionando el cuerpo anterior y la importación por Excel).
+    const centroDe = async (id) => {
+      if (!id) return null;
+      const cc = (await db.query(`SELECT codigo, activo FROM sst.centros_costo WHERE id = $1`, [id])).rows[0];
       if (!cc) throw badRequest('Ese centro de costo no existe.');
       if (!cc.activo) throw badRequest(`El centro de costo ${cc.codigo} está inactivo.`);
-    }
+      return id;
+    };
+    const centroCabecera = await centroDe(b.centro_costo_id || null);
 
     const items = Array.isArray(b.items) ? b.items.filter((i) => i && (i.cuenta_id || i.valor)) : [];
     if (!items.length) throw badRequest('La compra necesita al menos un ítem.');
@@ -95,8 +99,12 @@ export async function crearCompra(b = {}, usuarioId = null, { client = null } = 
       const ivaPct = it.iva_pct == null || it.iva_pct === '' ? 0 : Number(it.iva_pct);
       if (!Number.isFinite(ivaPct) || ivaPct < 0 || ivaPct > 100) throw badRequest(`Ítem ${n + 1}: el IVA no es válido.`);
       const descripcion = String(it.descripcion ?? '').trim() || `Ítem ${n + 1}`;
-      itemsOk.push({ cuenta_id: cuenta.id, descripcion: descripcion.slice(0, 500), valor, iva_pct: ivaPct, iva: Math.round((valor * ivaPct) / 100) });
+      const centro = (await centroDe(it.centro_costo_id || null)) ?? centroCabecera;
+      itemsOk.push({ cuenta_id: cuenta.id, descripcion: descripcion.slice(0, 500), valor, iva_pct: ivaPct, iva: Math.round((valor * ivaPct) / 100), centro_costo_id: centro });
     }
+    // El de la cabecera es el centro COMÚN: si los ítems van a centros distintos, queda vacío.
+    const centrosUsados = new Set(itemsOk.map((i) => i.centro_costo_id));
+    const centroId = centrosUsados.size === 1 ? [...centrosUsados][0] : null;
     const subtotal = itemsOk.reduce((s, i) => s + i.valor, 0);
     const iva = itemsOk.reduce((s, i) => s + i.iva, 0);
 
@@ -130,8 +138,8 @@ export async function crearCompra(b = {}, usuarioId = null, { client = null } = 
     )).rows[0];
     for (const [n, it] of itemsOk.entries()) {
       await db.query(
-        `INSERT INTO sst.compra_items (compra_id, orden, cuenta_id, descripcion, valor, iva_pct, iva_valor) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-        [compra.id, n, it.cuenta_id, it.descripcion, deCentavos(it.valor), it.iva_pct, deCentavos(it.iva)],
+        `INSERT INTO sst.compra_items (compra_id, orden, cuenta_id, descripcion, valor, iva_pct, iva_valor, centro_costo_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+        [compra.id, n, it.cuenta_id, it.descripcion, deCentavos(it.valor), it.iva_pct, deCentavos(it.iva), it.centro_costo_id],
       );
     }
     for (const r of retOk) {
@@ -145,7 +153,7 @@ export async function crearCompra(b = {}, usuarioId = null, { client = null } = 
     const cuenta = await resolvedorDeCuentas(db, tercero.id);
     const cruce = numeroProveedor ?? null;
     const lineas = itemsOk.map((it) => ({
-      cuenta_id: it.cuenta_id, tercero_id: tercero.id, centro_costo_id: centroId, debito: deCentavos(it.valor), descripcion: it.descripcion, documento_cruce: cruce,
+      cuenta_id: it.cuenta_id, tercero_id: tercero.id, centro_costo_id: it.centro_costo_id, debito: deCentavos(it.valor), descripcion: it.descripcion, documento_cruce: cruce,
     }));
     if (iva) lineas.push({ cuenta_id: cuenta('CP_IVA_DESCONTABLE'), tercero_id: tercero.id, debito: deCentavos(iva), base: deCentavos(subtotal), documento_cruce: cruce });
     for (const r of retOk) {
@@ -192,8 +200,10 @@ export async function obtenerCompra(id, db = pool) {
   )).rows[0];
   if (!c) throw notFound('Esa compra no existe.');
   const items = (await db.query(
-    `SELECT i.id, i.cuenta_id, cc.codigo AS cuenta_codigo, cc.nombre AS cuenta_nombre, i.descripcion, i.valor, i.iva_pct, i.iva_valor
-       FROM sst.compra_items i JOIN sst.cuentas_contables cc ON cc.id = i.cuenta_id WHERE i.compra_id = $1 ORDER BY i.orden`,
+    `SELECT i.id, i.cuenta_id, cc.codigo AS cuenta_codigo, cc.nombre AS cuenta_nombre, i.descripcion, i.valor, i.iva_pct, i.iva_valor,
+            i.centro_costo_id, co.codigo AS centro_costo_codigo, co.nombre AS centro_costo_nombre
+       FROM sst.compra_items i JOIN sst.cuentas_contables cc ON cc.id = i.cuenta_id
+       LEFT JOIN sst.centros_costo co ON co.id = i.centro_costo_id WHERE i.compra_id = $1 ORDER BY i.orden`,
     [id],
   )).rows;
   const retenciones = (await db.query(

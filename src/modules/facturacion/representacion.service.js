@@ -228,12 +228,16 @@ export async function pdfFactura({ doc, emisor, cliente, resolucion = null, enla
   const t = doc.totales ?? doc;
   const nombreRete = (r) => `${r.tipo === 'RETEFUENTE' ? 'Retefuente' : r.tipo === 'RETEICA' ? 'ReteICA' : r.tipo === 'RETEIVA' ? 'ReteIVA' : r.codigo} ${Number(r.tarifa)}%`;
   // Orden pedido por la contadora el 9-oct-2026: Subtotal → IVA → Total bruto, y después lo
-  // que retiene el cliente y el total a pagar. «Total bruto» = subtotal + IVA (antes era lo
-  // de antes del descuento, como en el software anterior); el descuento va antes del subtotal.
+  // que retiene el cliente y el total a pagar. «Total bruto» = subtotal (ya descontado) + IVA.
   const totalBruto = Math.round((Number(t.subtotal) + Number(t.total_iva || 0)) * 100) / 100;
+  // 24-oct-2026 (JD&D) · Primero el SUBTOTAL y después los descuentos: con «Descuentos» arriba
+  // de todo se confundía. Con descuento, «Subtotal» es el de ANTES de descontar (los bruto de las
+  // líneas); sin descuento es el mismo de siempre.
+  const hayDescuento = Number(t.total_descuento) > 0;
+  const subtotalAntes = Math.round((Number(t.subtotal) + Number(t.total_descuento || 0)) * 100) / 100;
   const lineasTot = [
-    ...(Number(t.total_descuento) ? [['Descuentos', t.total_descuento, false]] : []),
-    ['Subtotal', t.subtotal, false],
+    ['Subtotal', hayDescuento ? subtotalAntes : t.subtotal, false],
+    ...(hayDescuento ? [['Descuentos', t.total_descuento, false]] : []),
     ['IVA', t.total_iva || 0, false],
     ['Total Bruto', totalBruto, true],
     ...retencionesFactura.map((r) => [nombreRete(r), r.valor, false]),

@@ -8,7 +8,7 @@ import {
   obtenerRecibo, propuestaRecibo, sincronizarCartera,
 } from './cartera.service.js';
 import {
-  anularAnticipo, anularEgreso, crearAnticipo, crearEgreso, listarAnticipos, listarEgresos, obtenerEgreso, propuestaEgreso,
+  anularAnticipo, anularEgreso, crearAnticipo, cuentaDeAnticipo, crearEgreso, listarAnticipos, listarEgresos, obtenerEgreso, propuestaEgreso,
 } from './pagos.service.js';
 
 const router = Router();
@@ -119,6 +119,11 @@ router.post('/sincronizar', OPERAR, asyncHandler(async (_req, res) => {
 }));
 
 // ─── B4-01 · Anticipos a proveedores y egresos ───────────────────────────────
+
+// 24-oct-2026 · Cuenta a la que irá el anticipo de este proveedor (para mostrarla en el formulario).
+router.get('/anticipos/cuenta', LEER, asyncHandler(async (req, res) => {
+  res.json({ data: await cuentaDeAnticipo(req.query.tercero_id || null) });
+}));
 
 router.get('/anticipos', LEER, asyncHandler(async (req, res) => {
   const data = await listarAnticipos({ terceroId: req.query.tercero_id || null, conSaldo: req.query.con_saldo === 'true' });

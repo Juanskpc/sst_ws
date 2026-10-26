@@ -402,6 +402,17 @@ export async function generarPrecuentas({ periodo, profesionalId = null, precuen
           [profId, periodo]
         )).rows[0];
 
+    // 24-oct-2026 · Lo que se ajustó A MANO (valor hora o viáticos) sobrevive a «generar» otra vez:
+    // si no, cada recálculo borraría el trabajo de quien revisó la cuenta.
+    const manuales = new Map();
+    if (existente) {
+      const r = await pool.query(
+        `SELECT orden_id, valor_hora_snapshot, viaticos, valor_hora_original FROM sst.precuenta_items WHERE precuenta_id=$1 AND ajuste_manual`,
+        [existente.id],
+      );
+      for (const m of r.rows) manuales.set(m.orden_id, m);
+    }
+
     // Valora cada orden ANTES de abrir la transacción (son consultas de lectura).
     const items = [];
     let totalHoras = 0;
@@ -421,8 +432,10 @@ export async function generarPrecuentas({ periodo, profesionalId = null, precuen
         valorHoraBase: o.valor_hora_base,
       });
       const horas = Number(o.horas) || 0;
-      const monto = Math.round(horas * valorHora);
-      const viaticos = Math.round(Number(o.viaticos_valor) || 0);
+      const manual = manuales.get(o.orden_id);
+      const valorFinal = manual ? Number(manual.valor_hora_snapshot) : valorHora;
+      const monto = Math.round(horas * valorFinal);
+      const viaticos = manual ? Math.round(Number(manual.viaticos) || 0) : Math.round(Number(o.viaticos_valor) || 0);
       totalHoras += horas;
       totalHonorarios += monto;
       totalViaticos += viaticos;
@@ -435,9 +448,11 @@ export async function generarPrecuentas({ periodo, profesionalId = null, precuen
         actividad: o.tipo_orden || o.tipo_actividad || o.actividad_economica,
         fecha_ejecucion: o.fecha_ejecucion,
         horas,
-        valor_hora_snapshot: valorHora,
+        valor_hora_snapshot: valorFinal,
+        valor_hora_original: manual ? (manual.valor_hora_original ?? valorHora) : null,
+        ajuste_manual: !!manual,
         monto,
-        origen_tarifa: origen,
+        origen_tarifa: manual ? 'manual' : origen,
       });
     }
 
@@ -502,10 +517,11 @@ export async function generarPrecuentas({ periodo, profesionalId = null, precuen
         await client.query(
           `INSERT INTO sst.precuenta_items
              (precuenta_id, orden_id, orden_codigo, empresa_nombre, arl_nombre, actividad,
-              fecha_ejecucion, horas, valor_hora_snapshot, monto, viaticos, origen_tarifa)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+              fecha_ejecucion, horas, valor_hora_snapshot, monto, viaticos, origen_tarifa, ajuste_manual, valor_hora_original)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
           [pc.id, it.orden_id, it.orden_codigo, it.empresa_nombre, it.arl_nombre, it.actividad,
-           it.fecha_ejecucion, it.horas, it.valor_hora_snapshot, it.monto, it.viaticos, it.origen_tarifa]
+           it.fecha_ejecucion, it.horas, it.valor_hora_snapshot, it.monto, it.viaticos, it.origen_tarifa,
+           it.ajuste_manual, it.valor_hora_original]
         );
       }
       return pc;
@@ -519,6 +535,64 @@ export async function generarPrecuentas({ periodo, profesionalId = null, precuen
   }
 
   return { periodo, generadas, omitidas };
+}
+
+/**
+ * 24-oct-2026 (petición de JD&D) · Ajusta el valor hora y los viáticos de las líneas de una cuenta
+ * ANTES de enviarla: el valor de la hora ya no es siempre el mismo (una risoterapia se pacta en
+ * $120.000 o $150.000 con el asesor) y a veces hay que sumar viáticos que la orden no traía.
+ *
+ * `cambios`: [{ id, valor_hora?, viaticos? }]. Solo se puede mientras la cuenta no se haya enviado
+ * ni aceptado: lo que el profesional ya vio no se mueve por debajo. Una cuenta rechazada vuelve a
+ * «generada» (queda lista para enviar de nuevo, igual que al rehacerla).
+ */
+export async function ajustarItemsPrecuenta(id, cambios = [], userId = null, { client: externo = null } = {}) {
+  if (!Array.isArray(cambios) || !cambios.length) throw badRequest('No hay cambios que guardar.');
+  return (externo ? (fn) => fn(externo) : withTransaction)(async (client) => {
+    const pc = (await client.query(`SELECT id, estado FROM sst.precuentas WHERE id=$1 FOR UPDATE`, [id])).rows[0];
+    if (!pc) throw notFound('Cuenta de cobro no encontrada');
+    if (pc.estado === 'aceptada') throw badRequest('El profesional ya aceptó esta cuenta: no se puede cambiar.');
+    if (pc.estado === 'enviada') {
+      throw badRequest('La cuenta ya se envió al profesional. Devuélvala a «generada» antes de cambiar sus valores.');
+    }
+    for (const c of cambios) {
+      const it = (await client.query(
+        `SELECT id, horas, valor_hora_snapshot, viaticos, valor_hora_original FROM sst.precuenta_items WHERE id=$1 AND precuenta_id=$2`,
+        [c.id, id],
+      )).rows[0];
+      if (!it) throw badRequest('Una de las líneas no pertenece a esta cuenta.');
+      const valorHora = c.valor_hora == null || c.valor_hora === '' ? Number(it.valor_hora_snapshot) : Number(c.valor_hora);
+      const viaticos = c.viaticos == null || c.viaticos === '' ? Number(it.viaticos) || 0 : Number(c.viaticos);
+      if (!Number.isFinite(valorHora) || valorHora < 0) throw badRequest('El valor hora debe ser un número igual o mayor a cero.');
+      if (!Number.isFinite(viaticos) || viaticos < 0) throw badRequest('Los viáticos deben ser un número igual o mayor a cero.');
+      const monto = Math.round(Number(it.horas) * valorHora);
+      const cambioValor = Math.round(valorHora) !== Math.round(Number(it.valor_hora_snapshot));
+      const cambioViaticos = Math.round(viaticos) !== Math.round(Number(it.viaticos) || 0);
+      if (!cambioValor && !cambioViaticos) continue;
+      await client.query(
+        `UPDATE sst.precuenta_items
+            SET valor_hora_snapshot=$2, monto=$3, viaticos=$4, ajuste_manual=true,
+                valor_hora_original=COALESCE(valor_hora_original, $5), origen_tarifa='manual', ajustado_por=$6
+          WHERE id=$1`,
+        [it.id, valorHora, monto, Math.round(viaticos), it.valor_hora_snapshot, userId],
+      );
+    }
+    const t = (await client.query(
+      `SELECT COALESCE(sum(horas),0) AS horas, COALESCE(sum(monto),0) AS honorarios, COALESCE(sum(viaticos),0) AS viaticos
+         FROM sst.precuenta_items WHERE precuenta_id=$1`,
+      [id],
+    )).rows[0];
+    if (Number(t.honorarios) <= 0) throw badRequest('Los honorarios no pueden quedar en cero: una cuenta en cero no se emite.');
+    await client.query(
+      `UPDATE sst.precuentas
+          SET total_horas=$2, total_monto=$3, total_viaticos=$4, estado='generada', actualizado_en=now(),
+              enviado_en = CASE WHEN estado = 'rechazada' THEN NULL ELSE enviado_en END,
+              respondido_en = CASE WHEN estado = 'rechazada' THEN NULL ELSE respondido_en END
+        WHERE id=$1`,
+      [id, Number(t.horas), Number(t.honorarios) + Number(t.viaticos), Number(t.viaticos)],
+    );
+    return obtenerPrecuenta(id, client);
+  });
 }
 
 /** Pre-cuenta + sus ítems, o 404. */

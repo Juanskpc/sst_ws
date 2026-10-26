@@ -34,7 +34,7 @@
  */
 import crypto from 'node:crypto';
 import { pool } from '../config/db.js';
-import { parseExcelSipab } from './extraction.service.js';
+import { esExcelSura, parseExcelSipab, parseExcelSura } from './extraction.service.js';
 
 /** Identificadores más cortos que esto no se buscan en el texto: colisionan. */
 const LARGO_MINIMO_IDENTIDAD = 7;
@@ -139,6 +139,19 @@ async function porTextoDelDocumento(texto, client) {
  * base remota antes de que el usuario viera nada.
  */
 async function porFilasDelExcel(buffer, client) {
+  // 24-oct-2026 · El reporte de tareas de ARL SURA identifica cada orden por su NÚMERO (no por cronograma y secuencia).
+  if (await esExcelSura(buffer)) {
+    const sura = await parseExcelSura(buffer);
+    const numeros = sura.map((f) => f.fields?.numero_orden?.value).filter(Boolean);
+    if (!numeros.length) return { ordenes: [], todas: false, total: sura.length };
+    const r = await client.query(
+      `${SELECT_ORDEN}
+        WHERE o.numero_orden = ANY($1::text[]) AND o.arl_id IN (SELECT id FROM sst.arls WHERE nombre ILIKE '%sura%')
+        ORDER BY o.fecha_carga`,
+      [numeros],
+    );
+    return { ordenes: r.rows, todas: r.rows.length === numeros.length, total: sura.length };
+  }
   const filas = await parseExcelSipab(buffer);
   if (!filas.length) return { ordenes: [], todas: false, total: 0 };
 

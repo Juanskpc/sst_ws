@@ -94,3 +94,9 @@ export function esAxa(arlNombre) {
   const slug = String(arlNombre ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
   return slug.includes('colpatria') || /(^|[^a-z])axa([^a-z]|$)/.test(slug);
 }
+
+/** ¿Esta ARL es ARL SURA? Mismo criterio que `esAxa`: el nombre llega de la BD. */
+export function esSura(arlNombre) {
+  const slug = String(arlNombre ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+  return /(^|[^a-z])sura([^a-z]|$)/.test(slug);
+}

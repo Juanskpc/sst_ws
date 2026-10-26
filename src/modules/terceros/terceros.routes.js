@@ -131,6 +131,111 @@ router.get('/desde-profesional/:profesionalId', LEER, asyncHandler(async (req, r
   });
 }));
 
+// ─── 24-oct-2026 · Bancos y cuentas bancarias del tercero ───────────────────
+// A JD&D se le paga a profesionales y proveedores: el banco y el número de cuenta
+// viven en el tercero. Los asesores cambian de cuenta a menudo, así que se pueden
+// tener varias, con UNA principal, y borrar las que ya no sirven.
+const TIPOS_CUENTA = ['AHORROS', 'CORRIENTE', 'DEPOSITO_ELECTRONICO'];
+
+router.get('/bancos', LEER, asyncHandler(async (_req, res) => {
+  const r = await pool.query(`SELECT id, nombre FROM sst.bancos WHERE activo ORDER BY nombre`);
+  res.json({ data: r.rows });
+}));
+
+// Un banco que no está en la lista se crea al vuelo (queda en el catálogo).
+router.post('/bancos', ESCRIBIR, asyncHandler(async (req, res) => {
+  const nombre = String(req.body?.nombre ?? '').trim().replace(/\s+/g, ' ');
+  if (nombre.length < 3) throw badRequest('Escriba el nombre del banco.');
+  const dup = await pool.query(`SELECT id, nombre FROM sst.bancos WHERE lower(btrim(nombre)) = lower($1)`, [nombre]);
+  if (dup.rows[0]) return res.json({ data: dup.rows[0] });
+  const r = await pool.query(`INSERT INTO sst.bancos (nombre) VALUES ($1) RETURNING id, nombre`, [nombre.slice(0, 80)]);
+  res.status(201).json({ data: r.rows[0] });
+}));
+
+const CUENTA_SELECT = `
+  c.id, c.tercero_id, c.banco_id, b.nombre AS banco_nombre, c.tipo_cuenta, c.numero, c.titular, c.principal, c.creado_en`;
+
+async function cuentasDe(client, terceroId) {
+  return (await client.query(
+    `SELECT ${CUENTA_SELECT} FROM sst.terceros_cuentas_bancarias c JOIN sst.bancos b ON b.id = c.banco_id
+      WHERE c.tercero_id = $1 ORDER BY c.principal DESC, c.creado_en`,
+    [terceroId],
+  )).rows;
+}
+
+function validarCuenta(b = {}) {
+  const numero = String(b.numero ?? '').replace(/[\s.]/g, '');
+  if (!/^[0-9A-Za-z-]{4,34}$/.test(numero)) throw badRequest('El número de cuenta debe tener entre 4 y 34 caracteres (letras, números o guion).');
+  const tipo = String(b.tipo_cuenta ?? 'AHORROS').toUpperCase();
+  if (!TIPOS_CUENTA.includes(tipo)) throw badRequest('El tipo de cuenta es ahorros, corriente o depósito electrónico.');
+  if (!b.banco_id) throw badRequest('Elija el banco.');
+  const titular = String(b.titular ?? '').trim().slice(0, 150) || null;
+  return { numero, tipo, bancoId: b.banco_id, titular };
+}
+
+router.get('/:id/cuentas', LEER, asyncHandler(async (req, res) => {
+  res.json({ data: await cuentasDe(pool, req.params.id) });
+}));
+
+router.post('/:id/cuentas', ESCRIBIR, asyncHandler(async (req, res) => {
+  const c = validarCuenta(req.body);
+  const data = await withTransaction(async (client) => {
+    const t = await client.query(`SELECT id FROM sst.terceros WHERE id = $1 FOR UPDATE`, [req.params.id]);
+    if (!t.rows[0]) throw notFound('Tercero no encontrado');
+    const dup = await client.query(
+      `SELECT 1 FROM sst.terceros_cuentas_bancarias WHERE tercero_id = $1 AND banco_id = $2 AND numero = $3`,
+      [req.params.id, c.bancoId, c.numero],
+    );
+    if (dup.rows[0]) throw conflict('Esa cuenta ya está registrada en este tercero.');
+    const hay = await client.query(`SELECT 1 FROM sst.terceros_cuentas_bancarias WHERE tercero_id = $1`, [req.params.id]);
+    // La primera cuenta es la principal; las demás, solo si se pide.
+    const principal = !hay.rows[0] || req.body?.principal === true;
+    if (principal) await client.query(`UPDATE sst.terceros_cuentas_bancarias SET principal = false WHERE tercero_id = $1`, [req.params.id]);
+    await client.query(
+      `INSERT INTO sst.terceros_cuentas_bancarias (tercero_id, banco_id, tipo_cuenta, numero, titular, principal, creado_por)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [req.params.id, c.bancoId, c.tipo, c.numero, c.titular, principal, req.user.sub],
+    );
+    return cuentasDe(client, req.params.id);
+  });
+  res.status(201).json({ data });
+}));
+
+router.patch('/:id/cuentas/:cuentaId/principal', ESCRIBIR, asyncHandler(async (req, res) => {
+  const data = await withTransaction(async (client) => {
+    const r = await client.query(
+      `SELECT id FROM sst.terceros_cuentas_bancarias WHERE id = $1 AND tercero_id = $2 FOR UPDATE`,
+      [req.params.cuentaId, req.params.id],
+    );
+    if (!r.rows[0]) throw notFound('Esa cuenta no existe.');
+    await client.query(`UPDATE sst.terceros_cuentas_bancarias SET principal = false WHERE tercero_id = $1`, [req.params.id]);
+    await client.query(`UPDATE sst.terceros_cuentas_bancarias SET principal = true WHERE id = $1`, [req.params.cuentaId]);
+    return cuentasDe(client, req.params.id);
+  });
+  res.json({ data });
+}));
+
+// Se borra de verdad: nada contable cuelga de la cuenta (el pago sale del banco de JD&D).
+router.delete('/:id/cuentas/:cuentaId', ESCRIBIR, asyncHandler(async (req, res) => {
+  const data = await withTransaction(async (client) => {
+    const r = await client.query(
+      `DELETE FROM sst.terceros_cuentas_bancarias WHERE id = $1 AND tercero_id = $2 RETURNING principal`,
+      [req.params.cuentaId, req.params.id],
+    );
+    if (!r.rows[0]) throw notFound('Esa cuenta no existe.');
+    // Si se borró la principal, la más antigua de las que quedan ocupa su lugar.
+    if (r.rows[0].principal) {
+      await client.query(
+        `UPDATE sst.terceros_cuentas_bancarias SET principal = true
+          WHERE id = (SELECT id FROM sst.terceros_cuentas_bancarias WHERE tercero_id = $1 ORDER BY creado_en LIMIT 1)`,
+        [req.params.id],
+      );
+    }
+    return cuentasDe(client, req.params.id);
+  });
+  res.json({ data });
+}));
+
 router.get('/:id', LEER, asyncHandler(async (req, res) => {
   const t = await cargar(pool, req.params.id);
   if (!t) throw notFound('Tercero no encontrado');

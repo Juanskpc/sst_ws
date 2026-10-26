@@ -236,6 +236,57 @@ export async function cambiarActiva(id, activa, usuarioId = null) {
   });
 }
 
+/**
+ * 24-oct-2026 (petición de JD&D) · ELIMINAR cuentas que no se necesitan.
+ *
+ * Hasta hoy el plan solo se inactivaba. Con un PUC importado de Siigo quedan miles de
+ * cuentas que JD&D nunca usará, y esas estorban al buscar. Se puede borrar una cuenta
+ * solo si NADA depende de ella: ni subcuentas, ni movimientos contables, ni reglas, retenciones,
+ * activos fijos, compras, cartera… La base de datos lo garantiza (todas esas tablas apuntan a la cuenta
+ * con una llave foránea), así que se intenta el DELETE y, si hay algo, se explica qué en vez de
+ * dejar un error de SQL. Lo que ya tiene historia se inactiva, como siempre.
+ */
+export async function eliminarCuenta(id, db = null) {
+  const correr = async (client) => {
+    const c = (await client.query(`SELECT id, codigo, nombre FROM sst.cuentas_contables WHERE id = $1 FOR UPDATE`, [id])).rows[0];
+    if (!c) throw notFound('Esa cuenta no existe.');
+    const hijas = await client.query(`SELECT codigo FROM sst.cuentas_contables WHERE padre_id = $1 ORDER BY codigo LIMIT 3`, [id]);
+    if (hijas.rows.length) {
+      throw conflict(`${c.codigo} tiene subcuentas (${hijas.rows.map((h) => h.codigo).join(', ')}…): elimine primero las de abajo.`);
+    }
+    const movs = (await client.query(`SELECT count(*)::int AS n FROM sst.movimientos WHERE cuenta_id = $1`, [id])).rows[0].n;
+    if (movs) throw conflict(`${c.codigo} ya tiene ${movs} movimiento(s) contables: no se puede eliminar, inactívela.`);
+    await client.query('SAVEPOINT eliminar_cuenta');
+    try {
+      await client.query(`DELETE FROM sst.cuentas_contables WHERE id = $1`, [id]);
+    } catch (err) {
+      await client.query('ROLLBACK TO SAVEPOINT eliminar_cuenta');
+      if (err.code === '23503') {
+        throw conflict(`${c.codigo} está en uso (reglas de contabilización, retenciones, activos, compras o cartera): no se puede eliminar, inactívela.`);
+      }
+      throw err;
+    }
+    return { id, codigo: c.codigo, nombre: c.nombre };
+  };
+  return db ? correr(db) : withTransaction(correr);
+}
+
+/** Elimina varias; cada una por su cuenta (una que no se pueda no frena a las demás). */
+export async function eliminarCuentas(ids = []) {
+  const eliminadas = [];
+  const omitidas = [];
+  // De la más profunda a la más corta: así se pueden borrar de una vez una cuenta y sus subcuentas.
+  const filas = (await pool.query(`SELECT id, codigo FROM sst.cuentas_contables WHERE id = ANY($1::uuid[]) ORDER BY length(codigo) DESC, codigo DESC`, [ids])).rows;
+  for (const f of filas) {
+    try {
+      eliminadas.push(await eliminarCuenta(f.id));
+    } catch (err) {
+      omitidas.push({ codigo: f.codigo, motivo: err.message });
+    }
+  }
+  return { eliminadas, omitidas };
+}
+
 // ─── Importación desde Excel ────────────────────────────────────────────────
 
 const normalizar = (s) => String(s ?? '').trim().toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');

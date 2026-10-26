@@ -7,7 +7,8 @@ SET search_path TO sst, public;
 INSERT INTO sst.arls (nombre, formato_origen) VALUES
   ('Bolívar',       'excel'),
   ('AXA Colpatria', 'pdf'),
-  ('Colmena',       'pdf')
+  ('Colmena',       'pdf'),
+  ('ARL SURA',      'excel')
 ON CONFLICT (nombre) DO NOTHING;
 
 -- Configuración global ---------------------------------------------------------

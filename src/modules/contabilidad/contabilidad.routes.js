@@ -4,7 +4,7 @@ import { badRequest } from '../../utils/httpError.js';
 import { authRequired, requireRole } from '../../middleware/auth.js';
 import { uploadImport } from '../../middleware/upload.js';
 import {
-  actualizarCuenta, cambiarActiva, crearCuenta, importarCuentas, leerExcelCuentas, listarCuentas, obtenerCuenta,
+  actualizarCuenta, cambiarActiva, crearCuenta, eliminarCuenta, eliminarCuentas, importarCuentas, leerExcelCuentas, listarCuentas, obtenerCuenta,
 } from './cuentas.service.js';
 import {
   actualizarBorrador, anularComprobante, cerrarPeriodo, contabilizarComprobante, crearComprobante, eliminarBorrador,
@@ -57,6 +57,16 @@ router.put('/cuentas/:id', OPERAR, asyncHandler(async (req, res) => {
 router.patch('/cuentas/:id/activa', OPERAR, asyncHandler(async (req, res) => {
   if (typeof req.body?.activa !== 'boolean') throw badRequest('Indique "activa": true o false.');
   res.json({ data: await cambiarActiva(req.params.id, req.body.activa, req.user.sub) });
+}));
+
+// 24-oct-2026 · Eliminar cuentas que nada usa (sin subcuentas ni movimientos ni reglas…).
+router.delete('/cuentas/:id', OPERAR, asyncHandler(async (req, res) => {
+  res.json({ data: await eliminarCuenta(req.params.id) });
+}));
+router.post('/cuentas/eliminar', OPERAR, asyncHandler(async (req, res) => {
+  const ids = Array.isArray(req.body?.ids) ? req.body.ids.filter((x) => typeof x === 'string').slice(0, 2000) : [];
+  if (!ids.length) throw badRequest('Marque al menos una cuenta.');
+  res.json({ data: await eliminarCuentas(ids) });
 }));
 
 // Importa el PUC desde Excel. ?simular=true corre todo y deshace: es la vista previa.

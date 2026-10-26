@@ -100,10 +100,14 @@ function etiquetaEstado(estado) {
 
 /**
  * PRE-03 · Documento de la cuenta de cobro: profesional, mes, detalle de
- * órdenes (fecha, empresa, ARL, horas, valor) y totales.
+ * órdenes (fecha, orden, actividad, empresa, ARL, horas, valor hora, viáticos y
+ * valor) y totales.
  *
- * Se pagina sola: un mes cargado puede pasar de 25 órdenes y en una sola página
- * el detalle se saldría del pie. Devuelve un Buffer.
+ * 24-oct-2026 · JD&D lo pidió ver completo: las columnas cortaban el nombre de la
+ * empresa y no estaban la actividad ni los viáticos de cada línea. Ahora la hoja es
+ * horizontal y el texto largo se PARTE en renglones en vez de recortarse con la fila
+ * creciendo a su alto. Se pagina sola: un mes cargado puede pasar de 25 órdenes.
+ * Devuelve un Buffer.
  */
 export async function generatePrecuentaPdf(precuenta) {
   const doc = await PDFDocument.create();
@@ -123,56 +127,79 @@ export async function generatePrecuentaPdf(precuenta) {
   const complemento = Number(precuenta.numero) > 1 ? ' · complementaria' : '';
   const periodoLargo = `${meses[(mes || 1) - 1]} de ${anio}${complemento}`;
 
-  // Columnas del detalle: x de inicio y ancho útil para recortar el texto.
+  // Hoja horizontal (A4): 842 × 595. Margen de 40 → 762 útiles.
+  const ANCHO = 842;
+  const ALTO = 595;
+  const IZQ = 40;
+  const DER = ANCHO - 40;
+  const SIZE = 8.2;
+  const INTERLINEA = 10;
+  // x de inicio y ancho útil de cada columna (las cifras van alineadas a la derecha).
   const COLS = [
-    { titulo: 'Fecha', x: 45, ancho: 55 },
-    { titulo: 'Orden', x: 100, ancho: 72 },
-    { titulo: 'Empresa', x: 172, ancho: 150 },
-    { titulo: 'ARL', x: 322, ancho: 70 },
-    { titulo: 'Horas', x: 400, ancho: 35 },
-    { titulo: 'Valor hora', x: 440, ancho: 60 },
-    { titulo: 'Subtotal', x: 505, ancho: 60 },
+    { titulo: 'Fecha', x: 44, ancho: 50 },
+    { titulo: 'Orden', x: 98, ancho: 62 },
+    { titulo: 'Actividad', x: 164, ancho: 118 },
+    { titulo: 'Empresa', x: 286, ancho: 190 },
+    { titulo: 'ARL', x: 480, ancho: 74 },
+    { titulo: 'Horas', x: 558, ancho: 34, der: true },
+    { titulo: 'Valor hora', x: 596, ancho: 64, der: true },
+    { titulo: 'Viáticos', x: 664, ancho: 62, der: true },
+    { titulo: 'Valor', x: 730, ancho: 68, der: true },
   ];
 
   let page, y;
-  const recortar = (texto, ancho, size) => {
-    let s = String(texto ?? '');
-    while (s.length && font.widthOfTextAtSize(s, size) > ancho) s = s.slice(0, -1);
-    return s;
+
+  /** Parte el texto en renglones que quepan en `ancho` (por palabras; una palabra más larga se corta). */
+  const partir = (texto, ancho) => {
+    const palabras = String(texto ?? '').replace(/\s+/g, ' ').trim().split(' ').filter(Boolean);
+    const lineas = [];
+    let actual = '';
+    for (let w of palabras) {
+      while (font.widthOfTextAtSize(w, SIZE) > ancho) {
+        let corte = w.length - 1;
+        while (corte > 1 && font.widthOfTextAtSize(w.slice(0, corte), SIZE) > ancho) corte--;
+        if (actual) { lineas.push(actual); actual = ''; }
+        lineas.push(w.slice(0, corte));
+        w = w.slice(corte);
+      }
+      const prueba = actual ? `${actual} ${w}` : w;
+      if (actual && font.widthOfTextAtSize(prueba, SIZE) > ancho) { lineas.push(actual); actual = w; } else { actual = prueba; }
+    }
+    if (actual) lineas.push(actual);
+    return lineas.length ? lineas : ['—'];
   };
 
   const nuevaPagina = () => {
-    page = doc.addPage([595, 842]);
-    page.drawRectangle({ x: 0, y: 812, width: 595, height: 30, color: primary });
+    page = doc.addPage([ANCHO, ALTO]);
+    page.drawRectangle({ x: 0, y: ALTO - 30, width: ANCHO, height: 30, color: primary });
     page.drawText('JD&D Consultores en Sistemas de Gestión', {
-      x: 45, y: 820, size: 12, font: bold, color: rgb(1, 1, 1),
+      x: IZQ + 4, y: ALTO - 21, size: 12, font: bold, color: rgb(1, 1, 1),
     });
-    y = 780;
+    y = ALTO - 64;
   };
 
   const cabeceraTabla = () => {
-    page.drawRectangle({ x: 40, y: y - 4, width: 515, height: 18, color: primary });
+    page.drawRectangle({ x: IZQ, y: y - 5, width: DER - IZQ, height: 18, color: primary });
     for (const c of COLS) {
-      page.drawText(c.titulo, { x: c.x, y, size: 8.5, font: bold, color: rgb(1, 1, 1) });
+      const x = c.der ? c.x + c.ancho - bold.widthOfTextAtSize(c.titulo, SIZE) : c.x;
+      page.drawText(c.titulo, { x, y, size: SIZE, font: bold, color: rgb(1, 1, 1) });
     }
     y -= 22;
   };
 
   nuevaPagina();
 
-  page.drawText('Cuenta de cobro', { x: 45, y, size: 17, font: bold, color: primary });
-  y -= 24;
-  page.drawText(`Periodo: ${periodoLargo}`, { x: 45, y, size: 11, font, color: gray });
-  y -= 16;
-  page.drawText(`Profesional: ${precuenta.profesional_nombre || ''}`, { x: 45, y, size: 11, font: bold });
-  y -= 14;
-  if (precuenta.profesional_correo) {
-    page.drawText(precuenta.profesional_correo, { x: 45, y, size: 9.5, font, color: gray });
-    y -= 14;
-  }
+  page.drawText('Cuenta de cobro', { x: 44, y, size: 17, font: bold, color: primary });
+  y -= 22;
+  page.drawText(`Periodo: ${periodoLargo}`, { x: 44, y, size: 11, font, color: gray });
+  page.drawText(`Profesional: ${precuenta.profesional_nombre || ''}`, { x: 300, y, size: 11, font: bold });
+  y -= 15;
   page.drawText(`Generada el ${new Date(precuenta.creado_en || Date.now()).toLocaleDateString('es-CO')}`, {
-    x: 45, y, size: 9.5, font, color: gray,
+    x: 44, y, size: 9.5, font, color: gray,
   });
+  if (precuenta.profesional_correo) {
+    page.drawText(precuenta.profesional_correo, { x: 300, y, size: 9.5, font, color: gray });
+  }
   y -= 26;
 
   cabeceraTabla();
@@ -180,66 +207,81 @@ export async function generatePrecuentaPdf(precuenta) {
   const items = precuenta.items || [];
   let fila = 0;
   for (const it of items) {
+    // La fecha del día de ejecución es DATE: se arma con sus componentes, sin pasar por la zona horaria
+    // (un servidor en UTC la correría un día y la visita del 1.º saldría del mes que se cobra).
+    const f = it.fecha_ejecucion;
+    const m = typeof f === 'string' ? /^(\d{4})-(\d{2})-(\d{2})/.exec(f) : null;
+    const d = f instanceof Date ? f : null;
+    const fecha = m ? `${m[3]}/${m[2]}/${m[1]}`
+      : d ? `${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')}/${d.getFullYear()}` : '—';
+    const celdas = [
+      fecha, it.orden_codigo || '—', it.actividad || '—', it.empresa_nombre || '—', it.arl_nombre || '—',
+      String(Number(it.horas) || 0), pesos(it.valor_hora_snapshot),
+      Number(it.viaticos) > 0 ? pesos(it.viaticos) : '—', pesos(it.monto),
+    ];
+    const partidas = celdas.map((t, i) => (COLS[i].der ? [t] : partir(t, COLS[i].ancho)));
+    const alto = Math.max(...partidas.map((l) => l.length)) * INTERLINEA + 6;
     // Espacio reservado abajo para los totales y la firma de la última página.
-    if (y < 120) {
+    if (y - alto < 70) {
       nuevaPagina();
       cabeceraTabla();
       fila = 0;
     }
     if (fila % 2 === 1) {
-      page.drawRectangle({ x: 40, y: y - 4, width: 515, height: 16, color: suave });
+      page.drawRectangle({ x: IZQ, y: y - alto + 8, width: DER - IZQ, height: alto, color: suave });
     }
-    const fecha = it.fecha_ejecucion ? new Date(it.fecha_ejecucion).toLocaleDateString('es-CO') : '—';
-    const valores = [
-      fecha, it.orden_codigo || '—', it.empresa_nombre || '—', it.arl_nombre || '—',
-      String(Number(it.horas) || 0), pesos(it.valor_hora_snapshot), pesos(it.monto),
-    ];
-    COLS.forEach((c, i) => {
-      page.drawText(recortar(valores[i], c.ancho, 8.5), { x: c.x, y, size: 8.5, font });
+    partidas.forEach((lineas, i) => {
+      const c = COLS[i];
+      lineas.forEach((l, k) => {
+        const x = c.der ? c.x + c.ancho - font.widthOfTextAtSize(l, SIZE) : c.x;
+        page.drawText(l, { x, y: y - k * INTERLINEA, size: SIZE, font });
+      });
     });
-    y -= 16;
+    // Un valor hora ajustado a mano se marca: quien lee la cuenta ve que no es la tarifa de siempre.
+    if (it.ajuste_manual) {
+      page.drawText('ajustado', { x: COLS[6].x + COLS[6].ancho - font.widthOfTextAtSize('ajustado', 6.2), y: y - INTERLINEA, size: 6.2, font, color: gray });
+    }
+    y -= alto;
     fila++;
   }
 
   if (!items.length) {
-    page.drawText('Sin órdenes ejecutadas en el periodo.', { x: 45, y, size: 10, font, color: gray });
+    page.drawText('Sin órdenes ejecutadas en el periodo.', { x: 44, y, size: 10, font, color: gray });
     y -= 16;
   }
 
-  // Totales
-  y -= 10;
-  page.drawLine({ start: { x: 380, y: y + 8 }, end: { x: 565, y: y + 8 }, thickness: 1, color: primary });
+  // Totales. Si no caben en lo que queda de la hoja, van a una nueva.
+  if (y < 110) nuevaPagina();
+  y -= 8;
+  const xEt = 560;
+  const xVal = DER - 4;
+  page.drawLine({ start: { x: xEt - 10, y: y + 10 }, end: { x: DER, y: y + 10 }, thickness: 1, color: primary });
+  const linea = (etiqueta, valor, negrita = false, color = rgb(0, 0, 0)) => {
+    const f = negrita ? bold : font;
+    page.drawText(etiqueta, { x: xEt, y, size: negrita ? 11 : 10, font: f, color });
+    const t = String(valor);
+    page.drawText(t, { x: xVal - f.widthOfTextAtSize(t, negrita ? 11 : 10), y, size: negrita ? 11 : 10, font: f, color });
+    y -= 16;
+  };
   y -= 6;
-  page.drawText('Total de horas:', { x: 380, y, size: 10, font: bold });
-  page.drawText(String(Number(precuenta.total_horas) || 0), { x: 505, y, size: 10, font });
+  linea('Total de horas', String(Number(precuenta.total_horas) || 0), true);
 
   // Con viáticos, el total deja de ser horas × tarifa: hay que desglosarlo o la
   // cifra no cuadra con las cuentas del profesional. Van en su propia línea
   // porque no son honorarios — la contadora los trata distinto.
   const viaticos = Number(precuenta.total_viaticos) || 0;
   if (viaticos > 0) {
-    y -= 16;
-    page.drawText('Honorarios:', { x: 380, y, size: 10, font: bold });
-    page.drawText(pesos((Number(precuenta.total_monto) || 0) - viaticos), { x: 480, y, size: 10, font });
-    y -= 16;
-    // "Viáticos" a secas, como en el correo y en las dos pantallas: el cliente
-    // retiró la coletilla "(reembolso)" el 24-ago-2026. Aquí además no cabía —
-    // la etiqueta larga pasaba de los 100 pt que hay hasta la columna de cifras.
-    page.drawText('Viáticos:', { x: 380, y, size: 10, font: bold });
-    page.drawText(pesos(viaticos), { x: 480, y, size: 10, font });
+    linea('Honorarios', pesos((Number(precuenta.total_monto) || 0) - viaticos));
+    linea('Viáticos', pesos(viaticos));
   }
-
-  y -= 18;
-  page.drawText('Total a pagar:', { x: 380, y, size: 11, font: bold, color: primary });
-  page.drawText(pesos(precuenta.total_monto), { x: 480, y, size: 11, font: bold, color: primary });
+  y -= 2;
+  linea('Total a pagar', pesos(precuenta.total_monto), true, primary);
 
   // Estado de la cuenta (PRE-06). Las observaciones NO se imprimen: son notas
   // internas del seguimiento —lo que anotó quien revisó un rechazo— y este
   // documento es el que se le manda al profesional y el que acompaña el pago.
-  y -= 34;
   if (precuenta.estado) {
-    page.drawText(`Estado: ${etiquetaEstado(precuenta.estado)}`, { x: 45, y, size: 10, font: bold });
-    y -= 14;
+    page.drawText(`Estado: ${etiquetaEstado(precuenta.estado)}`, { x: 44, y: y + 16, size: 10, font: bold });
   }
 
   const bytes = await doc.save();

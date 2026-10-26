@@ -195,6 +195,8 @@ CREATE INDEX IF NOT EXISTS idx_profesionales_estado ON sst.profesionales(estado)
 ALTER TABLE sst.profesionales ADD COLUMN IF NOT EXISTS firma_url TEXT;
 ALTER TABLE sst.profesionales ADD COLUMN IF NOT EXISTS firma_mime TEXT;
 ALTER TABLE sst.profesionales ADD COLUMN IF NOT EXISTS firma_actualizada_en TIMESTAMPTZ;
+-- 24-oct-2026 · Cédula del asesor: el registro de asistencia de ARL SURA la imprime.
+ALTER TABLE sst.profesionales ADD COLUMN IF NOT EXISTS documento_identidad TEXT;
 
 -- 5-oct-2026 · Catálogo de especialidades (lo administra JD&D desde Profesionales).
 -- `profesionales.especialidad` guarda el NOMBRE elegido, no un id: los formatos de
@@ -3203,3 +3205,60 @@ CREATE TABLE IF NOT EXISTS sst.orden_radicados (
 CREATE INDEX IF NOT EXISTS idx_orden_radicados_orden ON sst.orden_radicados (orden_id, creado_en DESC);
 ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS radicado_fecha    DATE;
 ALTER TABLE sst.ordenes_servicio ADD COLUMN IF NOT EXISTS radicado_aprobado BOOLEAN NOT NULL DEFAULT false;
+
+-- =============================================================================
+-- 24-oct-2026 · ARL SURA, bancos de terceros, centros de costo por línea y ajustes de cuentas de cobro
+-- (espejo de db/migraciones/2026-10-24-*.sql; idempotente)
+-- =============================================================================
+
+-- 2026-10-24-arl-sura.sql
+
+ALTER TABLE sst.profesionales ADD COLUMN IF NOT EXISTS documento_identidad TEXT;
+
+-- 2026-10-24-terceros-bancos.sql
+CREATE TABLE IF NOT EXISTS sst.bancos (
+  id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  nombre  TEXT NOT NULL,
+  activo  BOOLEAN NOT NULL DEFAULT true
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_bancos_nombre ON sst.bancos (lower(btrim(nombre)));
+
+INSERT INTO sst.bancos (nombre) VALUES
+  ('Bancolombia'), ('Banco de Bogotá'), ('Davivienda'), ('BBVA Colombia'), ('Banco de Occidente'),
+  ('Banco Popular'), ('Banco AV Villas'), ('Banco Caja Social'), ('Itaú'), ('Scotiabank Colpatria'),
+  ('Banco Agrario de Colombia'), ('Banco GNB Sudameris'), ('Banco Falabella'), ('Banco Pichincha'),
+  ('Bancoomeva'), ('Banco Finandina'), ('Banco Santander'), ('Banco Serfinanza'), ('Banco W'),
+  ('Bancamía'), ('Banco Mundo Mujer'), ('Coopcentral'), ('Confiar Cooperativa'),
+  ('Nequi'), ('Daviplata'), ('Lulo Bank'), ('Nu Colombia'), ('RappiPay'), ('Movii')
+ON CONFLICT DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS sst.terceros_cuentas_bancarias (
+  id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tercero_id   UUID NOT NULL REFERENCES sst.terceros(id) ON DELETE CASCADE,
+  banco_id     UUID NOT NULL REFERENCES sst.bancos(id),
+  tipo_cuenta  TEXT NOT NULL DEFAULT 'AHORROS'
+                 CHECK (tipo_cuenta IN ('AHORROS', 'CORRIENTE', 'DEPOSITO_ELECTRONICO')),
+  numero       TEXT NOT NULL CHECK (numero ~ '^[0-9A-Za-z-]{4,34}$'),
+  -- Titular de la cuenta cuando NO es el propio tercero (p. ej. la cuenta de un familiar).
+  titular      TEXT,
+  principal    BOOLEAN NOT NULL DEFAULT false,
+  creado_por   UUID REFERENCES sst.usuarios(id) ON DELETE SET NULL,
+  creado_en    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_tercero_cuenta_numero
+  ON sst.terceros_cuentas_bancarias (tercero_id, banco_id, numero);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_tercero_cuenta_principal
+  ON sst.terceros_cuentas_bancarias (tercero_id) WHERE principal;
+
+-- 2026-10-24-centros-costo-lineas.sql
+ALTER TABLE sst.compra_items
+  ADD COLUMN IF NOT EXISTS centro_costo_id UUID REFERENCES sst.centros_costo(id);
+
+ALTER TABLE sst.centros_costo
+  ADD COLUMN IF NOT EXISTS arl_id UUID REFERENCES sst.arls(id) ON DELETE SET NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_centro_costo_arl ON sst.centros_costo (arl_id) WHERE arl_id IS NOT NULL AND activo;
+
+-- 2026-10-24-cuenta-cobro-ajustes.sql
+ALTER TABLE sst.precuenta_items ADD COLUMN IF NOT EXISTS ajuste_manual BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE sst.precuenta_items ADD COLUMN IF NOT EXISTS valor_hora_original NUMERIC(12,2);
+ALTER TABLE sst.precuenta_items ADD COLUMN IF NOT EXISTS ajustado_por UUID REFERENCES sst.usuarios(id) ON DELETE SET NULL;

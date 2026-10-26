@@ -167,7 +167,7 @@ export function normalizarFechaSipab(raw) {
   }
   m = /^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/.exec(s);
   if (m) return `${m[3]}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}`;
-  m = /^(\d{4})-(\d{2})-(\d{2})/.exec(s);
+  m = /^(\d{4})[-/](\d{2})[-/](\d{2})/.exec(s);
   if (m) return `${m[1]}-${m[2]}-${m[3]}`;
   return null;
 }
@@ -482,6 +482,140 @@ export async function parseExcelSipab(buffer) {
   return records;
 }
 
+// ---------------------------------------------------------------------------
+// Excel «Reporte estado de las tareas» (ARL SURA)
+// ---------------------------------------------------------------------------
+//
+// 24-oct-2026 · Sura no manda un documento por orden: el distribuidor descarga
+// de su plataforma UN Excel con todas las tareas. Como el SIPAB, sale siempre con
+// las mismas 21 columnas, así que se lee por nombre exacto de encabezado. Se
+// reconoce por tres de ellas (ORDEN, CONTRATO, PRESTADOR) para no confundirlo con
+// el SIPAB, que es el otro Excel que entra por aquí.
+const SURA_HEADERS = {
+  'orden': 'numero_orden',
+  'fecha aprobacion oc': 'fecha_orden',
+  'fecha ntrega inicial de la oc': null,
+  'fecha entrega inicial de la oc': null,
+  // La fecha final de la OC es el plazo de Sura para entregar: es el vencimiento
+  // que la app exige y que el SIPAB de Bolívar no trae.
+  'fecha entrega final de la oc': 'fecha_vencimiento',
+  'contrato': 'nro_afiliacion',
+  'empresa': 'empresa_nombre',
+  'tarea': 'tipo_actividad',
+  'producto': '@producto',
+  'clasificacion': 'tipo_servicio_arl',
+  'profesional': '@profesional_arl',
+  'prestador': '@prestador',
+  'cantidad pedida': 'horas_asignadas',
+  'cantidad sin programar': '@sin_programar',
+  'cantidad programada': '@programada',
+  'cantidad cumplida': '@cumplida',
+  'cantidad facturada distribuidor': '@facturada',
+  'cantidad pagada arl sura': '@pagada',
+  'estado de la tarea': '@estado_tarea',
+  'factura proveedor': '@factura_proveedor',
+  'centro de trabajo': '@centro_trabajo',
+  'observaciones de la orden': 'descripcion',
+};
+
+/** ¿La hoja es el reporte de tareas de Sura? Se mira la fila de encabezados. */
+export async function esExcelSura(buffer) {
+  const grid = await leerRejillaExcel(buffer);
+  if (!grid) return false;
+  for (let r = 1; r <= Math.min(grid.rowCount, 10); r++) {
+    const claves = new Set();
+    grid.eachCell(r, (cell) => claves.add(normalizarEncabezado(cell.value)));
+    if (claves.has('orden') && claves.has('contrato') && claves.has('prestador')) return true;
+  }
+  return false;
+}
+
+/**
+ * Parsing determinista del reporte de tareas de Sura. Una fila = una orden.
+ * La plataforma no entrega NIT, dirección ni contacto de la empresa: quedan en
+ * blanco para quien revisa (el NIT es opcional, igual que en AXA).
+ */
+export async function parseExcelSura(buffer) {
+  const grid = await leerRejillaExcel(buffer);
+  if (!grid) return [];
+
+  let headerRowIdx = 1;
+  let colMap = {};
+  let auxMap = {};
+  for (let r = 1; r <= Math.min(grid.rowCount, 10); r++) {
+    const map = {};
+    const aux = {};
+    grid.eachCell(r, (cell, col) => {
+      const destino = SURA_HEADERS[normalizarEncabezado(cell.value)];
+      if (destino == null) return;
+      if (destino.startsWith('@')) aux[destino.slice(1)] = col;
+      else if (!map[destino]) map[destino] = col;
+    });
+    if (map.numero_orden && Object.keys(map).length + Object.keys(aux).length >= 5) {
+      headerRowIdx = r;
+      colMap = map;
+      auxMap = aux;
+      break;
+    }
+  }
+
+  const celda = (r, col) => (col ? textoDeCelda(grid.celda(r, col)) : '');
+  const records = [];
+  for (let r = headerRowIdx + 1; r <= grid.rowCount; r++) {
+    const fields = {};
+    const poner = (campo, value, confidence = 99) => {
+      fields[campo] = { value: value || '', confidence: value ? confidence : 0 };
+    };
+    for (const canonical of CAMPOS_BORRADOR) poner(canonical, celda(r, colMap[canonical]));
+    if (!fields.numero_orden.value) continue;                // fila de relleno al final de la hoja
+
+    // «Cantidad pedida» llega como "6.0": se deja como número limpio. Sura mide
+    // en HORAS (lo confirma el reporte de facturas: unidad HORAS).
+    const horas = Number(String(fields.horas_asignadas.value).replace(',', '.'));
+    if (Number.isFinite(horas) && horas > 0) fields.horas_asignadas.value = String(horas);
+
+    // Fechas como "2026/10/20".
+    for (const campo of ['fecha_orden', 'fecha_vencimiento']) {
+      const iso = normalizarFechaSipab(fields[campo].value);
+      if (iso) fields[campo].value = iso;
+    }
+
+    // CLASIFICACION: ASESORÍA / CAPACITACIÓN → la letra A / C que usa la app.
+    const letra = normalizarTipoActividadBolivar(fields.tipo_servicio_arl.value);
+    fields.tipo_servicio_arl = { value: letra || '', confidence: letra ? 99 : 0 };
+
+    // Sin observaciones, el detalle es el producto de Sura ("170-SISTEMA DE GESTIÓN EN SST").
+    const producto = celda(r, auxMap.producto);
+    if (!fields.descripcion.value && producto) poner('descripcion', producto, 90);
+
+    // El «centro de trabajo» de Sura es el cargo o la sede de los asistentes
+    // («TECNICO EN RAYOS X», «R4»): no es un contacto ni una dirección, así que
+    // solo se conserva como contexto en `sura`.
+    const centro = celda(r, auxMap.centro_trabajo);
+
+    records.push({
+      fields,
+      sourceRow: r,
+      sura: {
+        contrato: fields.nro_afiliacion.value || null,
+        producto: producto || null,
+        profesional_arl: celda(r, auxMap.profesional_arl) || null,
+        prestador: celda(r, auxMap.prestador) || null,
+        estado_tarea: celda(r, auxMap.estado_tarea) || null,
+        centro_trabajo: centro || null,
+        cantidades: {
+          sin_programar: celda(r, auxMap.sin_programar) || null,
+          programada: celda(r, auxMap.programada) || null,
+          cumplida: celda(r, auxMap.cumplida) || null,
+          facturada: celda(r, auxMap.facturada) || null,
+          pagada: celda(r, auxMap.pagada) || null,
+        },
+      },
+    });
+  }
+  return records;
+}
+
 /**
  * Representación en texto plano de la hoja, para pintarla junto a los campos
  * extraídos en el modal de revisión (IMP-03). No interpreta nada: devuelve las
@@ -549,6 +683,14 @@ export async function runExtraction({ buffer, mime, filename, arlHint }) {
   // extensión para no mandar un Excel por el camino de PDF.
   const isExcel = /sheet|excel/.test(mime || '') || /\.(xlsx|xls)$/i.test(filename || '');
   if (isExcel) {
+    if (await esExcelSura(buffer)) {
+      const records = await parseExcelSura(buffer);
+      return {
+        arlNombre: 'ARL SURA',
+        arlConfidence: 99, // Reporte de tareas de Sura → ARL SURA por formato (determinista).
+        records: records.map((r) => ({ ...r, engine: 'excel-determinista' })),
+      };
+    }
     const records = await parseExcelSipab(buffer);
     return {
       arlNombre: 'Bolívar',

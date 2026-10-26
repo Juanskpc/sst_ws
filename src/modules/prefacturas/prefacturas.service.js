@@ -44,8 +44,9 @@ function clasificar(fila, orden, numeroPrefactura) {
  * justo antes de aplicar (para no fiarse de un cruce que el cliente pudo haber
  * calculado hace rato, mientras alguien más cambiaba la orden).
  */
-export async function cruzarFilas(filas, numeroPrefactura, client = pool) {
+export async function cruzarFilas(filas, numeroPrefactura, client = pool, arl = 'BOLIVAR') {
   const resultado = [];
+  const filtroIdentidad = filtroDe(arl);
   for (const fila of filas) {
     const r = await client.query(
       `SELECT o.id, o.codigo, o.estado, o.estado_arl::text AS estado_arl,
@@ -54,8 +55,7 @@ export async function cruzarFilas(filas, numeroPrefactura, client = pool) {
                 + COALESCE(o.cobro_material,0)) AS valor_total, o.empresa_nombre
          FROM sst.ordenes_servicio o
          JOIN sst.arls a ON a.id = o.arl_id
-        WHERE a.nombre ILIKE '%bol%var%'
-          AND o.codigo_cronograma = $1 AND o.secuencia = $2`,
+        WHERE ${filtroIdentidad}`,
       [fila.codigo_cronograma, fila.secuencia]
     );
     const orden = r.rows[0] || null;
@@ -70,6 +70,14 @@ export async function cruzarFilas(filas, numeroPrefactura, client = pool) {
  * No es un bloqueo: cargarla de nuevo no duplica nada (`numero_prefactura` es
  * único) y volver a aplicar sigue permitido.
  */
+/**
+ * Cómo se identifica una orden en cada ARL: Bolívar por cronograma + secuencia ($1, $2); ARL SURA por el
+ * número de su orden ($1, y `secuencia` no cuenta). 24-oct-2026.
+ */
+const IDENTIDAD_BOLIVAR = `a.nombre ILIKE '%bol%var%' AND o.codigo_cronograma = $1 AND o.secuencia = $2`;
+const IDENTIDAD_SURA = `a.nombre ILIKE '%sura%' AND o.numero_orden = $1 AND $2::text IS NOT NULL`;
+const filtroDe = (arl) => (arl === 'SURA' ? IDENTIDAD_SURA : IDENTIDAD_BOLIVAR);
+
 export async function prefacturaExistente(numeroPrefactura) {
   const r = await pool.query(
     `SELECT p.id, p.cargada_en, u.nombre AS cargada_por_nombre
@@ -93,6 +101,7 @@ export async function prefacturaExistente(numeroPrefactura) {
  * este clic) se devuelven en `omitidas`, no se fuerzan.
  */
 export async function aplicarPrefactura({ datos, filasMarcadas, nombreArchivo, usuarioId }) {
+  const filtroIdentidad = filtroDe(datos?.arl);
   if (!datos?.numero_prefactura) throw badRequest('Falta el número de prefactura.');
   const marcadas = new Set(
     (filasMarcadas || []).map((k) => `${k.codigo_cronograma}|${k.secuencia}`)
@@ -126,8 +135,7 @@ export async function aplicarPrefactura({ datos, filasMarcadas, nombreArchivo, u
                 + COALESCE(o.cobro_alimentacion,0) + COALESCE(o.cobro_tiempo_muerto,0)
                 + COALESCE(o.cobro_material,0)) AS valor_total
            FROM sst.ordenes_servicio o JOIN sst.arls a ON a.id = o.arl_id
-          WHERE a.nombre ILIKE '%bol%var%'
-            AND o.codigo_cronograma=$1 AND o.secuencia=$2 FOR UPDATE`,
+          WHERE ${filtroIdentidad} FOR UPDATE OF o`,
         [fila.codigo_cronograma, fila.secuencia]
       )).rows[0] || null;
 

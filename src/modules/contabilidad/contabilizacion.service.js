@@ -182,6 +182,8 @@ async function asientoSoporte(d, db) {
   const esNota = d.tipo === 'NOTA_AJUSTE_DS';
   const items = (await db.query(
     `SELECT i.id, i.descripcion, i.total_linea, i.cuenta_costo_id,
+            -- 24-oct-2026 · El valor de cada orden va al centro de costo de SU ARL (Contabilidad → Centros de costo).
+            (SELECT cc.id FROM sst.centros_costo cc WHERE cc.arl_id = o.arl_id AND cc.activo LIMIT 1) AS centro_costo_id,
             COALESCE(a.tercero_id, o.pagador_tercero_id) AS pagador_tercero_id,
             COALESCE(a.nombre, NULLIF(btrim(COALESCE(tp.razon_social, concat_ws(' ', tp.nombres, tp.apellidos))), '')) AS pagador_nombre
        FROM sst.documento_items i
@@ -209,6 +211,7 @@ async function asientoSoporte(d, db) {
   const numero = numeroDocumento(d) ?? d.reference_code;
   const lineas = items.map((it) => ({
     cuenta_id: costoDe(it),
+    centro_costo_id: it.centro_costo_id ?? null,
     tercero_id: d.tercero_id,
     debito: esNota ? null : deCentavos(aCentavos(it.total_linea)),
     credito: esNota ? deCentavos(aCentavos(it.total_linea)) : null,

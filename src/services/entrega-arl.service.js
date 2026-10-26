@@ -39,7 +39,10 @@ export function carpetaArl(nombre) {
   const slug = String(nombre ?? '')
     .normalize('NFD').replace(/[̀-ͯ]/g, '')
     .trim().toLowerCase();
-  return slug.includes('colpatria') ? 'colpatria' : slug;
+  if (slug.includes('colpatria')) return 'colpatria';
+  // 'ARL SURA' → 'sura' (la ARL se llama así en el catálogo desde el 24-oct-2026).
+  if (/(^|[^a-z])sura([^a-z]|$)/.test(slug)) return 'sura';
+  return slug;
 }
 
 // ---------------------------------------------------------------------------
@@ -135,6 +138,7 @@ export const TIPOS_ACTIVIDAD_POR_ARL = {
   bolivar: ['A', 'T', 'C', 'E', 'M', 'O'],
   colpatria: ['A', 'C'],
   colmena: ['A', 'C'],
+  sura: ['A', 'C'],
 };
 
 /** Lo que se ofrece cuando la ARL no es ninguna de las tres conocidas. */
@@ -229,6 +233,9 @@ const DEVUELVE = {
   asistenciaColmena: 'asistencia',
   informeColmenaA: 'informe',
   informeColmenaB: 'informe',
+  // ARL SURA · la asistencia firmada por los asistentes y el informe de la asesoría.
+  asistenciaSura: 'asistencia',
+  informeSura: 'informe',
   evaluacionColmena: null,
   registroEjecucionColmena: null,
   plantillaColmena: null,
@@ -325,6 +332,22 @@ const REGLAS = [
     nota: 'Se adjuntan los DOS modelos de informe de Colmena (tipo A y tipo B). Use el que ' +
           'corresponda a esta actividad y descarte el otro.',
   },
+
+  // --- ARL SURA (24-oct-2026) ---
+  // Lo dijo el cliente: «capacitación no lleva nada, solo la asistencia», y la
+  // asesoría entrega el informe con el modelo de Sura. Ni una ni otra pide
+  // registro fotográfico ni acta aparte.
+  {
+    arl: 'sura', tipo: TIPOS_ACTIVIDAD.CAPACITACION,
+    formatos: ['asistenciaSura'],
+  },
+  {
+    arl: 'sura', tipo: TIPOS_ACTIVIDAD.ASESORIA,
+    formatos: ['informeSura'],
+    nota: 'Redacte el informe con el modelo de ARL SURA que va adjunto (portada, introducción, ' +
+          'objetivos, alcance, metodología, hallazgos, conclusiones y recomendaciones) y súbalo ' +
+          'en la casilla "Informe técnico o de gestión".',
+  },
 ];
 
 /**
@@ -344,6 +367,7 @@ const RESPALDO = {
     formatos: ['prestacionColmena', 'asistenciaColmena'],
     extras: ['evidencias'],
   },
+  sura: { formatos: ['asistenciaSura'] },
 };
 
 /**

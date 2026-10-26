@@ -27,7 +27,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
 import { horaAmPm, horasTexto } from '../utils/formato.js';
-import { indiceModalidad, indiceTipoActividadBolivar, normalizarModalidadEjecucion } from '../utils/bolivar.js';
+import { etiquetaTipoActividadBolivar, indiceModalidad, indiceTipoActividadBolivar, normalizarModalidadEjecucion, normalizarTipoActividadBolivar } from '../utils/bolivar.js';
 import { entregaDeLaOrden, tipoActividadDeOrden } from './entrega-arl.service.js';
 import { estamparFirma } from '../utils/firma-pdf.js';
 
@@ -102,7 +102,8 @@ const FORMATOS = {
     observaciones: { campo: '42' },
     editables: () => EDITABLES_AT031,
     // 16-oct · Sobre la raya «FIRMA ARL» del pie (la del participante ARL, el profesional).
-    firma: [[0, 190, 85, 165, 26]],
+    // 24-oct-2026 · Más grande (JD&D lo pidió): cruza la raya como una firma a mano, sin pasar de la casilla (arriba hay texto de la ARL).
+    firma: [[0, 172, 84, 215, 29]],
   },
   at028: {
     archivo: 'bolivar/asistencia.pdf', modo: 'acroform', alcance: 'sesion',
@@ -150,6 +151,27 @@ const FORMATOS = {
     archivo: 'colpatria/informe-tecnico.docx', modo: 'adjunto', alcance: 'orden',
     tipo: 'informe_tecnico', nombre: 'informe-tecnico (plantilla).docx',
     etiqueta: 'Formato de informe técnico (Word)',
+  },
+
+  // --- ARL SURA (24-oct-2026) ---
+  // La capacitación lleva solo el registro de asistencia; la asesoría, el modelo
+  // de informe en Word. La asistencia la genera la plataforma de Sura por orden;
+  // aquí se reproduce en blanco (`scripts/generar-plantilla-asistencia-sura.mjs`)
+  // y se prediligencia con lo que la orden ya sabe.
+  asistenciaSura: {
+    archivo: 'sura/asistencia.pdf', modo: 'plano', alcance: 'sesion',
+    tipo: 'asistencia', nombre: 'asistencia-sura.pdf',
+    etiqueta: 'Registro de asistencia a eventos de capacitación (ARL SURA)',
+    casillas: () => CASILLAS_ASISTENCIA_SURA, valores: valoresAsistenciaSura,
+    marcas: marcasAsistenciaSura,
+    editables: () => EDITABLES_ASISTENCIA_SURA,
+    // Casilla «FIRMA:» del pie (la del asesor que dictó la capacitación).
+    firma: [[0, 420, 99, 138, 30]],
+  },
+  informeSura: {
+    archivo: 'sura/modelo-informe.docx', modo: 'adjunto', alcance: 'orden',
+    tipo: 'informe_sura', nombre: 'modelo-informe-arl-sura.docx',
+    etiqueta: 'Modelo de informe de ARL SURA (Word) · asesorías',
   },
 
   // --- Colmena ---
@@ -301,6 +323,9 @@ function sesionDe(orden, franja) {
     fechaCorta: iso ? `${iso[3]}/${iso[2]}/${iso[1]}` : '',
     horaInicio: franja?.hora_inicio ? horaAmPm(franja.hora_inicio) : '',
     horaFin: franja?.hora_fin ? horaAmPm(franja.hora_fin) : '',
+    // «8:00» a 24 horas y sin segundos: así la escribe ARL SURA.
+    horaInicioCorta: franja?.hora_inicio ? String(franja.hora_inicio).slice(0, 5).replace(/^0(\d:)/, '$1') : '',
+    horaFinCorta: franja?.hora_fin ? String(franja.hora_fin).slice(0, 5).replace(/^0(\d:)/, '$1') : '',
     // Las horas de ESTA sesión, no las de la orden: una visita de 8 h partida en
     // dos mañanas lleva "4" en cada registro de asistencia.
     horas: horasFranja !== null ? horasTexto(horasFranja) : horasTexto(orden.horas_asignadas),
@@ -812,6 +837,39 @@ const MARCAS_REGISTRO_EJECUCION_COLMENA = {
   tipo: { CAPACITACION: [227.6, 461], ASESORIA: [644.8, 461] },
 };
 
+/** ARL SURA · Registro de asistencia a eventos de capacitación (coordenadas del script que lo dibuja). */
+const CASILLAS_ASISTENCIA_SURA = [
+  ['fecha', 130, 698, 60, 'centro'],
+  ['duracion', 240, 698, 50, 'centro'],
+  ['hora_inicio', 348, 698, 36, 'centro'],
+  ['hora_fin', 426, 698, 36, 'centro'],
+  ['orden_compra', 480, 686, 82],
+  ['lugar', 114, 668.5, 346],
+  ['producto', 114, 651.5, 346],
+  ['tarea', 114, 634.5, 346],
+  ['clasificacion', 114, 617.5, 346],
+  ['asesor', 150, 119, 255],
+  ['cedula_asesor', 150, 103, 255],
+];
+
+const EDITABLES_ASISTENCIA_SURA = [
+  { campo: 'fecha', etiqueta: 'Fecha del evento', fecha: 'DD/MM/AAAA' },
+  { campo: 'duracion', etiqueta: 'Duración' },
+  { campo: 'hora_inicio', etiqueta: 'Hora de inicio' },
+  { campo: 'hora_fin', etiqueta: 'Hora de fin' },
+  { campo: 'orden_compra', etiqueta: 'Orden de compra' },
+  { campo: 'lugar', etiqueta: 'Lugar' },
+  { campo: 'producto', etiqueta: 'Producto' },
+  { campo: 'tarea', etiqueta: 'Tarea' },
+  { campo: 'cedula_asesor', etiqueta: 'Cédula del asesor' },
+];
+
+/** «Domicilio» o «Virtual»: una X dibujada dentro de la casilla (centro de cada cuadrito). */
+function marcasAsistenciaSura(orden) {
+  const virtual = normalizarModalidadEjecucion(orden?.modalidad_ejecucion) === 'VIRTUAL';
+  return [[488, virtual ? 640 : 654]];
+}
+
 /** AXA Colpatria · Formato Registro Listado de Asistencia, apaisado. */
 const CASILLAS_ASISTENCIA_COLPATRIA = [
   ['ciudad', 93, 512, 175],
@@ -828,6 +886,27 @@ const CASILLAS_ASISTENCIA_COLPATRIA = [
 // ---------------------------------------------------------------------------
 // Qué valor va en cada casilla de los formatos planos
 // ---------------------------------------------------------------------------
+
+/** ARL SURA · Registro de asistencia. */
+function valoresAsistenciaSura(orden, profesional, sesion) {
+  const horas = Number(sesion.horas);
+  const direccion = enBlanco(orden.direccion);
+  const letra = normalizarTipoActividadBolivar(orden.tipo_servicio_arl);
+  return {
+    fecha: sesion.fechaCorta,
+    // Como lo imprime la plataforma de Sura: «4.0 HORAS».
+    duracion: Number.isFinite(horas) && horas > 0 ? `${horas.toFixed(1)} HORAS` : '',
+    hora_inicio: sesion.horaInicioCorta,
+    hora_fin: sesion.horaFinCorta,
+    orden_compra: orden.numero_orden,
+    lugar: [enBlanco(orden.empresa_nombre), direccion && `Dirección: ${direccion}`].filter(Boolean).join(' '),
+    producto: enBlanco(orden.metadatos_extraccion?.sura?.producto),
+    tarea: orden.tipo_actividad,
+    clasificacion: (letra ? etiquetaTipoActividadBolivar(letra) : '').toUpperCase(),
+    asesor: profesional?.nombre,
+    cedula_asesor: profesional?.documento_identidad,
+  };
+}
 
 /** AXA Colpatria · Registro Listado de Asistencia. */
 function valoresAsistenciaColpatria(orden, profesional, sesion, aliado) {

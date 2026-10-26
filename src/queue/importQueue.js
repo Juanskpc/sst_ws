@@ -126,6 +126,8 @@ async function processBatch({ batchId, buffer, mime, filename, arlHint }) {
       // Solo Excel SIPAB: columnas que no son campos canónicos pero explican la
       // orden (unidad de medida, hora programada, póliza, departamento…).
       ...(rec.sipab ? { sipab: rec.sipab } : {}),
+      // Solo reporte de Sura: contrato, producto, prestador y estado de la tarea.
+      ...(rec.sura ? { sura: rec.sura } : {}),
     };
     // Primero el título de la actividad, que es el dato limpio; si de ahí no
     // sale nada, el detalle. En el SIPAB de Bolívar el título es el nombre del

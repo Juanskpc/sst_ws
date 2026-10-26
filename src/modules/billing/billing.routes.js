@@ -5,7 +5,7 @@ import { authRequired, requireRole } from '../../middleware/auth.js';
 import { badRequest } from '../../utils/httpError.js';
 import { generatePrecuentaPdf } from '../../services/pdf.service.js';
 import {
-  ESTADOS_PRECUENTA, aniosConTrabajo, avisarCorteDeCobro, enviarPrecuenta, generarPrecuentas,
+  ESTADOS_PRECUENTA, ajustarItemsPrecuenta, aniosConTrabajo, avisarCorteDeCobro, enviarPrecuenta, generarPrecuentas,
   obtenerPrecuenta, resumenPorMes, urlPrecuenta,
 } from './billing.service.js';
 
@@ -125,6 +125,15 @@ router.post('/generate', requireRole('admin'), asyncHandler(async (req, res) => 
         : `No hay órdenes con soportes aceptados sin cobrar en ${periodo}.`,
     data: r,
   });
+}));
+
+/**
+ * 24-oct-2026 · Ajusta el valor hora y los viáticos de las líneas antes de enviar la cuenta.
+ * Cuerpo: { items: [{ id, valor_hora?, viaticos? }] }.
+ */
+router.patch('/:id/items', requireRole('admin'), asyncHandler(async (req, res) => {
+  const data = await ajustarItemsPrecuenta(req.params.id, req.body?.items, req.user.sub);
+  res.json({ message: 'Valores de la cuenta actualizados.', data });
 }));
 
 /** PRE-04 · Envía la pre-cuenta al profesional (PDF + enlace de aceptación). */

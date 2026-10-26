@@ -4,6 +4,7 @@ import { asyncHandler } from '../../utils/asyncHandler.js';
 import { badRequest } from '../../utils/httpError.js';
 import { uploadImport } from '../../middleware/upload.js';
 import { extraerPrefactura } from './prefacturas.extraction.js';
+import { esReporteSura, leerReporteSura } from './sura.reporte.js';
 import { cruzarFilas, prefacturaExistente, aplicarPrefactura } from './prefacturas.service.js';
 
 const router = Router();
@@ -20,14 +21,17 @@ router.use(authRequired);
 router.post('/previsualizar', requireRole('admin', 'contador'), uploadImport.single('file'),
   asyncHandler(async (req, res) => {
     if (!req.file) throw badRequest('Adjunte el PDF de la prefactura en el campo "file".');
-    const datos = await extraerPrefactura(req.file.buffer);
+    // 24-oct-2026 · El reporte de facturas de ARL SURA se lee sin IA (columnas fijas); el de Bolívar, con OpenAI.
+    const datos = (await esReporteSura(req.file.buffer))
+      ? await leerReporteSura(req.file.buffer)
+      : { arl: 'BOLIVAR', ...(await extraerPrefactura(req.file.buffer)) };
     if (!datos.numero_prefactura) {
       throw badRequest('No se pudo leer el número de prefactura en el PDF.');
     }
 
     const [existente, filasClasificadas] = await Promise.all([
       prefacturaExistente(datos.numero_prefactura),
-      cruzarFilas(datos.filas, datos.numero_prefactura),
+      cruzarFilas(datos.filas, datos.numero_prefactura, undefined, datos.arl),
     ]);
 
     res.json({
@@ -55,7 +59,7 @@ router.post('/aplicar', requireRole('admin', 'contador'), asyncHandler(async (re
   const {
     numero_prefactura: numeroPrefactura, plan_codigo: planCodigo, plan_descripcion: planDescripcion,
     fecha_corte: fechaCorte, valor_total: valorTotal, nombre_archivo: nombreArchivo,
-    filas, filas_marcadas: filasMarcadas,
+    filas, filas_marcadas: filasMarcadas, arl,
   } = req.body || {};
   if (!numeroPrefactura) throw badRequest('Falta el número de prefactura.');
   if (!Array.isArray(filas) || !filas.length) throw badRequest('La prefactura no trae filas.');
@@ -64,7 +68,7 @@ router.post('/aplicar', requireRole('admin', 'contador'), asyncHandler(async (re
   const resultado = await aplicarPrefactura({
     datos: {
       numero_prefactura: numeroPrefactura, plan_codigo: planCodigo, plan_descripcion: planDescripcion,
-      fecha_corte: fechaCorte, valor_total: valorTotal, filas,
+      fecha_corte: fechaCorte, valor_total: valorTotal, filas, arl: arl === 'SURA' ? 'SURA' : 'BOLIVAR',
     },
     filasMarcadas,
     nombreArchivo,

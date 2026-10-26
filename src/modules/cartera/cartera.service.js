@@ -207,14 +207,31 @@ export async function propuestaRecibo(terceroId, db = pool) {
       WHERE cp.tercero_id = $1`,
     [terceroId],
   )).rows[0] ?? null;
+  // 24-oct-2026 · Una factura manual puede traer SU ReteICA (la que se eligió al armarla):
+  // esa manda sobre la condición general del cliente. Se busca en los tributos del documento.
+  const ids = docs.map((d) => d.documento_id).filter(Boolean);
+  const propias = new Map();
+  if (ids.length) {
+    const r = await db.query(
+      `SELECT DISTINCT ON (di.documento_id) di.documento_id, r.id, r.codigo, r.nombre, r.tarifa, r.cuenta_id
+         FROM sst.documento_item_tributos t
+         JOIN sst.documento_items di ON di.id = t.item_id
+         JOIN sst.retenciones r ON r.id = t.retencion_id AND r.tipo = 'RETEICA' AND r.activa
+        WHERE di.documento_id = ANY($1::uuid[])
+        ORDER BY di.documento_id, r.codigo`,
+      [ids],
+    );
+    for (const x of r.rows) propias.set(x.documento_id, x);
+  }
   return {
     reteica,
     facturas: docs.map((d) => {
       // Proporcional a lo que falta: si ya se abonó la mitad, la ReteICA sugerida es la mitad.
       const fraccion = aCentavos(d.valor) ? aCentavos(d.saldo) / aCentavos(d.valor) : 0;
       const base = Math.round(aCentavos(d.subtotal ?? d.valor) * fraccion);
-      const sugerida = reteica ? Math.round((base * Number(reteica.tarifa)) / 100 / 100) * 100 : 0;
-      return { ...d, base_reteica: deCentavos(base), reteica_sugerida: deCentavos(sugerida) };
+      const rete = propias.get(d.documento_id) ?? reteica;
+      const sugerida = rete ? Math.round((base * Number(rete.tarifa)) / 100 / 100) * 100 : 0;
+      return { ...d, base_reteica: deCentavos(base), reteica_sugerida: deCentavos(sugerida), reteica_id: rete?.id ?? null };
     }),
   };
 }

@@ -32,6 +32,11 @@ async function banco(db, id) {
   if (!b) throw badRequest('Elija la cuenta de banco de donde sale la plata (una cuenta marcada como banco en el plan).');
   return b;
 }
+/**
+ * 24-oct-2026 · Las dos cuentas de un anticipo, a la vista: la del anticipo a
+ * proveedores (donde queda el débito, p. ej. 1330…) y el banco del que salió la plata.
+ */
+const CUENTAS_ANTICIPO = `ca.codigo AS cuenta_codigo, ca.nombre AS cuenta_nombre, cb.codigo AS banco_codigo, cb.nombre AS banco_nombre`;
 const nombreTercero = async (db, id) => (await db.query(`SELECT ${NOMBRE} AS n FROM sst.terceros t WHERE id = $1`, [id])).rows[0]?.n;
 
 // ─── Anticipos ────────────────────────────────────────────────────────────────
@@ -63,12 +68,30 @@ export async function crearAnticipo(b = {}, usuarioId = null, { client = null } 
   });
 }
 
+/**
+ * 24-oct-2026 · La cuenta a la que irá un anticipo, para mostrarla ANTES de registrarlo
+ * (JD&D quiere ver «a qué cuenta va» en el formulario, no enterarse después en el libro).
+ */
+export async function cuentaDeAnticipo(terceroId, db = pool) {
+  try {
+    const id = (await resolvedorDeCuentas(db, terceroId || null))('CE_ANTICIPO');
+    return (await db.query(`SELECT id, codigo, nombre FROM sst.cuentas_contables WHERE id = $1`, [id])).rows[0] ?? null;
+  } catch (err) {
+    // Sin la regla contable no hay cuenta que mostrar: se dice qué falta en vez de fallar la pantalla.
+    return { id: null, codigo: null, nombre: null, aviso: err.message };
+  }
+}
+
 export async function obtenerAnticipo(id, db = pool) {
   const a = (await db.query(
     `SELECT a.id, a.tercero_id, ${NOMBRE} AS tercero_nombre, to_char(a.fecha, 'YYYY-MM-DD') AS fecha, a.valor, a.saldo,
-            a.observaciones, a.estado, a.motivo_anulacion, 'RP-' || cp.numero AS numero
+            a.observaciones, a.estado, a.motivo_anulacion, 'RP-' || cp.numero AS numero,
+            ${CUENTAS_ANTICIPO}
        FROM sst.anticipos_proveedor a JOIN sst.terceros t ON t.id = a.tercero_id
-       LEFT JOIN sst.comprobantes cp ON cp.id = a.comprobante_id WHERE a.id = $1`,
+       LEFT JOIN sst.comprobantes cp ON cp.id = a.comprobante_id
+       LEFT JOIN sst.cuentas_contables ca ON ca.id = a.cuenta_id
+       LEFT JOIN sst.cuentas_contables cb ON cb.id = a.cuenta_banco_id
+      WHERE a.id = $1`,
     [id],
   )).rows[0];
   if (!a) throw notFound('Ese anticipo no existe.');
@@ -78,9 +101,11 @@ export async function obtenerAnticipo(id, db = pool) {
 export async function listarAnticipos({ terceroId = null, conSaldo = false } = {}, db = pool) {
   return (await db.query(
     `SELECT a.id, a.tercero_id, ${NOMBRE} AS tercero_nombre, to_char(a.fecha, 'YYYY-MM-DD') AS fecha, a.valor, a.saldo, a.estado,
-            'RP-' || cp.numero AS numero
+            'RP-' || cp.numero AS numero, ${CUENTAS_ANTICIPO}
        FROM sst.anticipos_proveedor a JOIN sst.terceros t ON t.id = a.tercero_id
        LEFT JOIN sst.comprobantes cp ON cp.id = a.comprobante_id
+       LEFT JOIN sst.cuentas_contables ca ON ca.id = a.cuenta_id
+       LEFT JOIN sst.cuentas_contables cb ON cb.id = a.cuenta_banco_id
       WHERE ($1::uuid IS NULL OR a.tercero_id = $1) AND (NOT $2 OR (a.saldo > 0 AND a.estado = 'CONTABILIZADO'))
       ORDER BY a.fecha, a.creado_en`,
     [terceroId, conSaldo],
@@ -88,10 +113,10 @@ export async function listarAnticipos({ terceroId = null, conSaldo = false } = {
 }
 
 /** Un anticipo se anula solo si no se ha cruzado (con cruces, primero se anula el egreso). */
-export async function anularAnticipo(id, motivo, usuarioId = null) {
+export async function anularAnticipo(id, motivo, usuarioId = null, { client = null } = {}) {
   const texto = String(motivo ?? '').trim();
   if (texto.length < 5) throw badRequest('Escriba el motivo de la anulación.');
-  return withTransaction(async (db) => {
+  return conTransaccion(client, async (db) => {
     const a = (await db.query(`SELECT id, estado, valor, saldo, comprobante_id FROM sst.anticipos_proveedor WHERE id = $1 FOR UPDATE`, [id])).rows[0];
     if (!a) throw notFound('Ese anticipo no existe.');
     if (a.estado !== 'CONTABILIZADO') throw conflict('El anticipo ya está anulado.');

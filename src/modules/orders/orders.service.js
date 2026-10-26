@@ -196,7 +196,7 @@ export async function generateOrderDocuments(orderId, client = pool, { guardar =
   // encuesta siguen apuntando a `profesional_asignado_id`, que es quien trabaja.
   const firmanteId = order.profesional_formatos_id || order.profesional_asignado_id;
   const professional = firmanteId
-    ? await conFirma((await client.query(`SELECT * FROM sst.profesionales WHERE id=$1`, [firmanteId])).rows[0])
+    ? await conFirma((await client.query(`SELECT p.*, COALESCE(p.documento_identidad, u.documento_identidad) AS documento_identidad FROM sst.profesionales p LEFT JOIN sst.usuarios u ON u.id = p.usuario_id WHERE p.id=$1`, [firmanteId])).rows[0])
     : null;
 
   // Se leen aquí y no se reciben por parámetro para que el formato salga con lo
@@ -224,7 +224,7 @@ export async function generateOrderDocuments(orderId, client = pool, { guardar =
     for (const e of ejecutores) {
       const ficha = order.profesional_formatos_id
         ? professional
-        : await conFirma((await client.query(`SELECT * FROM sst.profesionales WHERE id=$1`, [e.id])).rows[0]);
+        : await conFirma((await client.query(`SELECT p.*, COALESCE(p.documento_identidad, u.documento_identidad) AS documento_identidad FROM sst.profesionales p LEFT JOIN sst.usuarios u ON u.id = p.usuario_id WHERE p.id=$1`, [e.id])).rows[0]);
       juegos.push({
         profesional: ficha,
         franjas: todas.filter((f) => (f.profesional_id ?? order.profesional_asignado_id) === e.id),

@@ -303,6 +303,17 @@ router.get('/:id', asyncHandler(async (req, res) => {
   res.json({ data: r.rows[0] });
 }));
 
+/**
+ * 24-oct-2026 · Cédula del asesor: la imprime el registro de asistencia de ARL SURA.
+ * Se guarda sin puntos ni espacios; vacío = sin cédula.
+ */
+function validarDocumento(v) {
+  const t = String(v ?? '').replace(/[\s.]/g, '').toUpperCase();
+  if (!t) return null;
+  if (!/^[0-9A-Z-]{5,15}$/.test(t)) throw badRequest('La cédula debe tener entre 5 y 15 caracteres (números, sin puntos).');
+  return t;
+}
+
 // CFG-01 · Crear (admin)
 router.post('/', requireRole('admin'), asyncHandler(async (req, res) => {
   const { estado = 'Activo' } = req.body || {};
@@ -316,12 +327,13 @@ router.post('/', requireRole('admin'), asyncHandler(async (req, res) => {
   const telefono = validarTelefono(req.body?.telefono);
   const especialidad = validarTextoOpcional(req.body?.especialidad, 'La especialidad');
   const valorHora = validarValorHora(req.body?.valor_hora);
+  const documento = validarDocumento(req.body?.documento_identidad);
 
   await assertContactoDisponible({ correo, telefono });
   const r = await pool.query(
-    `INSERT INTO sst.profesionales (nombre, correo, telefono, especialidad, valor_hora, estado)
-     VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
-    [nombre, correo, telefono, especialidad, valorHora, estado]
+    `INSERT INTO sst.profesionales (nombre, correo, telefono, especialidad, valor_hora, estado, documento_identidad)
+     VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+    [nombre, correo, telefono, especialidad, valorHora, estado, documento]
   );
   await enlazarCuenta(r.rows[0].id, r.rows[0].correo);
   res.status(201).json({ data: r.rows[0] });
@@ -343,6 +355,9 @@ router.put('/:id', requireRole('admin'), asyncHandler(async (req, res) => {
     ? null
     : validarTextoOpcional(req.body.especialidad, 'La especialidad');
   const valorHora = req.body?.valor_hora === undefined ? null : validarValorHora(req.body.valor_hora);
+  // Cédula: ausente = no se toca; texto vacío = se borra.
+  const documentoPedido = req.body?.documento_identidad !== undefined;
+  const documento = documentoPedido ? validarDocumento(req.body.documento_identidad) : null;
   // Misma regla que en el alta: si no se valida aquí, la restricción se saltaría
   // creando el profesional con otro correo y editándolo después.
   await assertContactoDisponible({ correo, telefono, excluirId: req.params.id });
@@ -353,9 +368,10 @@ router.put('/:id', requireRole('admin'), asyncHandler(async (req, res) => {
        telefono = COALESCE($4, telefono),
        especialidad = COALESCE($5, especialidad),
        valor_hora = COALESCE($6, valor_hora),
-       estado = COALESCE($7, estado)
+       estado = COALESCE($7, estado),
+       documento_identidad = CASE WHEN $8::boolean THEN $9 ELSE documento_identidad END
      WHERE id=$1 RETURNING *`,
-    [req.params.id, nombre, correo, telefono, especialidad, valorHora, estado]
+    [req.params.id, nombre, correo, telefono, especialidad, valorHora, estado, documentoPedido, documento]
   );
   if (!r.rows[0]) throw notFound('Profesional no encontrado');
   // Si cambió el correo, el enlace anterior puede haber dejado de ser cierto:
