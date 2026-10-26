@@ -18,6 +18,7 @@
  */
 
 import { horasTexto } from '../utils/formato.js';
+import { referenciaOrden } from '../utils/referencia-orden.js';
 
 /** Escapa el texto según RFC 5545: la coma, el punto y coma y la barra son separadores. */
 function escapar(valor) {
@@ -133,11 +134,18 @@ export function construirInvitaciones({
   const lugar = [orden.direccion, orden.ciudad_ejecucion].filter(Boolean).join(', ');
   const descripcion = [
     `Orden de servicio: ${orden.codigo}`,
+    // P2 (26-oct-2026) · Cronograma y secuencia (Bolívar) o número de orden
+    // (demás ARL), como en el registro de asistencia AT-028.
+    orden.codigo_cronograma ? `Cronograma: ${orden.codigo_cronograma} · Secuencia: ${orden.secuencia}` : null,
+    !orden.codigo_cronograma && orden.numero_orden ? `N.º de orden: ${orden.numero_orden}` : null,
     (orden.arl_id ? `ARL: ${orden.arl_nombre || '—'}` : `Cliente: ${orden.pagador_nombre || '—'}`),
     `Empresa: ${orden.empresa_nombre || '—'}`,
+    // La actividad a desarrollar es `tipo_actividad` (la «Descripción» del SIPAB),
+    // no `descripcion`, que guarda las observaciones enteras (decisión del 20-oct).
+    orden.tipo_actividad ? `Actividad a desarrollar: ${orden.tipo_actividad}` : null,
     `Horas: ${horasTexto(orden.horas_asignadas)}`,
     orden.contacto_sst_nombre ? `Contacto SST: ${orden.contacto_sst_nombre} ${orden.contacto_sst_telefono || ''}`.trim() : null,
-    orden.descripcion ? `\nActividad: ${orden.descripcion}` : null,
+    orden.descripcion ? `\nObservaciones: ${orden.descripcion}` : null,
   ].filter(Boolean).join('\n');
 
   const evento = (t) => [
@@ -147,7 +155,7 @@ export function construirInvitaciones({
     `DTSTAMP:${aFechaIcs(new Date())}`,
     `DTSTART:${aFechaIcs(t.inicio)}`,
     `DTEND:${aFechaIcs(t.fin)}`,
-    `SUMMARY:${escapar(`${orden.codigo} · ${orden.empresa_nombre || 'Visita SST'}${t.etiqueta}`)}`,
+    `SUMMARY:${escapar(`${referenciaOrden(orden)} · ${orden.empresa_nombre || 'Visita SST'}${t.etiqueta}`)}`,
     `DESCRIPTION:${escapar(descripcion)}`,
     lugar ? `LOCATION:${escapar(lugar)}` : null,
     t.cancelado ? 'STATUS:CANCELLED' : 'STATUS:CONFIRMED',

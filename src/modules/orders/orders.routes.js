@@ -1611,6 +1611,12 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
         (esRepro
           ? `La OS ${o.codigo} (${o.pagador_nombre ?? o.arl_nombre}) para ${o.empresa_nombre} fue REPROGRAMADA.\n`
           : `Se te asignó la OS ${o.codigo} (${o.pagador_nombre ?? o.arl_nombre}) para ${o.empresa_nombre}.\n`) +
+        // P2 · Cronograma y secuencia (Bolívar) o número de orden (demás ARL), y
+        // la actividad a desarrollar, también en la versión de texto plano.
+        (o.codigo_cronograma
+          ? `Cronograma: ${o.codigo_cronograma} · Secuencia: ${o.secuencia}\n`
+          : o.numero_orden ? `N.º de orden: ${o.numero_orden}\n` : '') +
+        (o.tipo_actividad ? `Actividad a desarrollar: ${o.tipo_actividad}\n` : '') +
         // Con la visita partida, una sola "fecha programada" se queda corta: lo
         // que el profesional necesita saber es cada franja.
         (varias
@@ -1653,8 +1659,19 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
           ),
           tablaDatos([
             filaDato('Orden', o.codigo),
+            // P2 (26-oct-2026) · El asesor se guía por el cronograma y la
+            // secuencia de Bolívar (como en el registro de asistencia AT-028), o
+            // por el número de orden en las demás ARL. `filaDato` omite las nulas,
+            // así que solo sale lo que la orden tiene.
+            filaDato('Cronograma', o.codigo_cronograma),
+            filaDato('Secuencia', o.secuencia),
+            filaDato('N.º de orden', o.codigo_cronograma ? null : o.numero_orden),
             filaDato(o.arl_id ? 'ARL' : 'Cliente', o.pagador_nombre ?? o.arl_nombre),
             filaDato('Empresa', o.empresa_nombre),
+            // P2 · La actividad a desarrollar es `tipo_actividad` (la «Descripción»
+            // del SIPAB, p. ej. «AUTOCUIDADO»), no `descripcion`, que guarda las
+            // observaciones enteras (decisión del 20-oct).
+            filaDato('Actividad a desarrollar', o.tipo_actividad),
             filaDato('Horas', horasDest),
             // Los viáticos de la orden son del asesor principal.
             filaDato('Viáticos aprobados', dest.principal ? viaticosTexto : null),
@@ -2165,6 +2182,12 @@ router.post('/:id/reject', requireRole('admin'), asyncHandler(async (req, res) =
             `Hola ${prof.nombre},\n\n` +
             `Revisamos los soportes de la OS ${expandida.codigo} (${expandida.pagador_nombre ?? expandida.arl_nombre}) ` +
             `para ${expandida.empresa_nombre} y hay algo que corregir:\n\n` +
+            // P2 · Cronograma/secuencia o número de orden, y la actividad, también
+            // en el texto plano del correo de soportes devueltos.
+            (expandida.codigo_cronograma
+              ? `Cronograma: ${expandida.codigo_cronograma} · Secuencia: ${expandida.secuencia}\n`
+              : expandida.numero_orden ? `N.º de orden: ${expandida.numero_orden}\n` : '') +
+            (expandida.tipo_actividad ? `Actividad a desarrollar: ${expandida.tipo_actividad}\n\n` : '') +
             `${motivo.trim()}\n\n` +
             `Documento(s) por volver a subir: ${listaDocs}.\n` +
             `Los demás quedaron aceptados: no hay que repetirlos.\n\n` +
@@ -2189,8 +2212,14 @@ router.post('/:id/reject', requireRole('admin'), asyncHandler(async (req, res) =
               // es el dato que el profesional vuelve a mirar al abrir el correo.
               tablaDatos([
                 filaDato('Orden', expandida.codigo),
+                // P2 · Mismos datos de referencia que el correo de asignación: el
+                // asesor identifica la orden por su cronograma/secuencia o número.
+                filaDato('Cronograma', expandida.codigo_cronograma),
+                filaDato('Secuencia', expandida.secuencia),
+                filaDato('N.º de orden', expandida.codigo_cronograma ? null : expandida.numero_orden),
                 filaDato(expandida.arl_id ? 'ARL' : 'Cliente', expandida.pagador_nombre ?? expandida.arl_nombre),
                 filaDato('Empresa', expandida.empresa_nombre),
+                filaDato('Actividad a desarrollar', expandida.tipo_actividad),
                 filaDato('Por volver a subir', listaDocs),
                 filaDato('Estado', 'PROGRAMADA'),
               ]),
