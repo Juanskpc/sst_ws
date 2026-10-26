@@ -225,6 +225,25 @@ router.put('/settings/precuenta-dia-corte', requireRole('admin'), asyncHandler(a
   });
 }));
 
+/**
+ * P3 (26-oct-2026) · Permitir enviar los formatos de una orden PROGRAMADA a
+ * medias (p. ej. 16 de 21 h, repartidas entre dos asesores), sin esperar a
+ * repartir todas sus horas.
+ *
+ * Nace activado (JD&D lo pidió para destrabar una orden urgente): sin esto,
+ * `cuadranLasHoras` obliga a cubrir el 100 % de las horas antes de mandar nada
+ * al asesor. Se guarda como clave global porque es una regla de operación de la
+ * empresa, no una preferencia por usuario; la lee el endpoint de asignación.
+ */
+router.put('/settings/envio-parcial', requireRole('admin'), asyncHandler(async (req, res) => {
+  const { value } = req.body || {};
+  if (typeof value !== 'boolean') throw badRequest('El valor debe ser verdadero o falso.');
+  res.json({
+    data: await guardarConfig('envio_parcial_permitido', value,
+      'Permite enviar formatos con la programación incompleta (una orden repartida a medias).'),
+  });
+}));
+
 // ---------------------------------------------------------------------------
 // CFG-04 · Tipos de orden y su valor hora ("Valores por hora según actividad")
 //

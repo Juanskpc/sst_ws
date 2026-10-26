@@ -64,3 +64,42 @@ LEFT JOIN LATERAL (
     FROM sst.vw_encuestas v
    WHERE v.profesional_id = p.id
 ) e ON true;
+
+-- ───────────────────────────────────────────────────────────────────────────
+-- P3 (26-oct-2026) · Envío parcial de una orden programada a medias.
+-- `vw_ordenes_expandidas` (SELECT o.*) gana `minutos_programados` = suma de las
+-- franjas, para que la bandeja distinga una PROGRAMADA completa de una enviada a
+-- medias sin pedir las franjas de cada orden. Nada depende de esta vista como
+-- vista (el schema la dropa sin CASCADE), así que basta recrearla.
+-- ───────────────────────────────────────────────────────────────────────────
+DROP VIEW IF EXISTS sst.vw_ordenes_expandidas;
+CREATE VIEW sst.vw_ordenes_expandidas AS
+SELECT o.*,
+       a.nombre         AS arl_nombre,
+       a.formato_origen AS arl_formato,
+       COALESCE(a.nombre, tp_pag.razon_social,
+                NULLIF(btrim(concat_ws(' ', tp_pag.nombres, tp_pag.apellidos)), '')) AS pagador_nombre,
+       p.nombre         AS profesional_nombre,
+       p.correo         AS profesional_correo,
+       pf.nombre        AS profesional_formatos_nombre,
+       tp.nombre        AS tipo_orden,
+       tp.valor_hora    AS tipo_orden_valor_hora,
+       tv.nombre        AS viaticos_tipo,
+       tv.valor         AS viaticos_tipo_valor,
+       COALESCE((SELECT SUM(EXTRACT(EPOCH FROM (fv.hora_fin - fv.hora_inicio)) / 60)::int
+                   FROM sst.franjas_visita fv WHERE fv.orden_id = o.id), 0) AS minutos_programados
+FROM sst.ordenes_servicio o
+LEFT JOIN sst.arls a          ON a.id = o.arl_id
+LEFT JOIN sst.terceros tp_pag ON tp_pag.id = o.pagador_tercero_id
+LEFT JOIN sst.profesionales p ON p.id = o.profesional_asignado_id
+LEFT JOIN sst.profesionales pf ON pf.id = o.profesional_formatos_id
+LEFT JOIN sst.tipos_orden tp  ON tp.id = o.tipo_orden_id
+LEFT JOIN sst.tipos_viatico tv ON tv.id = o.viaticos_tipo_id;
+
+-- Ajuste global: permitir enviar formatos con la programación incompleta. Nace
+-- activado (JD&D lo pidió para destrabar una orden urgente). `configuracion` es
+-- clave/valor jsonb; el booleano va como jsonb `true`.
+INSERT INTO sst.configuracion (clave, valor, descripcion)
+VALUES ('envio_parcial_permitido', 'true'::jsonb,
+        'Permite enviar formatos con la programación incompleta (una orden repartida a medias).')
+ON CONFLICT (clave) DO NOTHING;

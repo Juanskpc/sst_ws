@@ -3113,7 +3113,13 @@ SELECT o.*,
        -- la orden y el informe de facturación la enseñan junto a la cifra, y sin
        -- el nombre un importe suelto no dice de qué es.
        tv.nombre        AS viaticos_tipo,
-       tv.valor         AS viaticos_tipo_valor
+       tv.valor         AS viaticos_tipo_valor,
+       -- P3 (26-oct-2026) · Minutos ya repartidos en franjas, para distinguir una
+       -- orden PROGRAMADA completa de una enviada a medias («programación parcial
+       -- · faltan N h»). Se calcula aquí para que la bandeja lo tenga por fila sin
+       -- pedir las franjas de cada orden por separado.
+       COALESCE((SELECT SUM(EXTRACT(EPOCH FROM (fv.hora_fin - fv.hora_inicio)) / 60)::int
+                   FROM sst.franjas_visita fv WHERE fv.orden_id = o.id), 0) AS minutos_programados
 FROM sst.ordenes_servicio o
 LEFT JOIN sst.arls a          ON a.id = o.arl_id
 LEFT JOIN sst.terceros tp_pag ON tp_pag.id = o.pagador_tercero_id

@@ -1075,8 +1075,10 @@ async function pdfDeSoloLectura(buffer) {
  */
 router.post('/:id/assign/preview', requireRole('admin'), asyncHandler(async (req, res) => {
   const result = await enTransaccionDescartable((client) => aplicarAsignacion(req, client, { vistaPrevia: true }));
-  if (!result.completa) {
-    throw badRequest('Reparta todas las horas de la visita para ver los formatos: con media agenda no se envía nada.');
+  // P3 · Con envío parcial (`enviar_parcial`) la vista previa muestra los formatos
+  // de lo programado; sin él, sigue exigiendo repartir todas las horas.
+  if (!result.enviado) {
+    throw badRequest('Reparta todas las horas de la visita para ver los formatos, o use «Enviar lo programado» si va a enviar la orden a medias.');
   }
   const formatos = [];
   for (const d of result.docs) {
@@ -1190,6 +1192,21 @@ async function aplicarAsignacion(req, client, { vistaPrevia = false } = {}) {
   }
   // Solo se programa cuando la visita está repartida por completo.
   const completa = cuadranLasHoras(franjas, horasOrden);
+
+  // P3 (26-oct-2026) · Envío parcial: se pueden mandar los formatos de una orden
+  // repartida a medias (p. ej. 16 de 21 h, entre dos asesores) sin cubrir todas
+  // sus horas. Es una decisión del ciclo de estados, así que va tras una doble
+  // llave: la empresa lo permite (ajuste global `envio_parcial_permitido`, que
+  // nace activado) Y quien asigna lo pide explícitamente (`enviar_parcial`). Sin
+  // franjas no hay nada que enviar, y una visita completa no es «parcial».
+  const permiteParcial =
+    (await client.query(`SELECT valor FROM sst.configuracion WHERE clave='envio_parcial_permitido'`))
+      .rows[0]?.valor !== false;
+  const parcial =
+    !completa && req.body?.enviar_parcial === true && permiteParcial && franjas.length > 0 && objetivoMin > 0;
+  // Programar (y por tanto generar formatos, congelar soportes y avisar) ocurre
+  // cuando la visita está completa O cuando se envía lo programado a propósito.
+  const programar = completa || parcial;
 
   // ASG · El profesional a cuyo nombre salen los formatos. Solo tiene sentido
   // si está REGISTRADO ante la ARL de esta orden: el punto entero de la
@@ -1307,10 +1324,20 @@ async function aplicarAsignacion(req, client, { vistaPrevia = false } = {}) {
     }
   }
 
-  // EST · El estado lo decide si la visita está COMPLETA, no el hecho de haber
-  // elegido profesional: una orden de 10 h con 6 h repartidas sigue teniendo
-  // trabajo pendiente y debe seguir apareciendo entre las que hay que programar.
-  if (esReprogramacion && completa) {
+  // EST · El estado lo decide si la visita está programable —completa o parcial a
+  // propósito—, no el hecho de haber elegido profesional: una orden de 10 h con 6
+  // h repartidas SIN envío parcial sigue teniendo trabajo pendiente y debe seguir
+  // apareciendo entre las que hay que programar.
+  // P3 · Con envío parcial la orden pasa (o se queda) PROGRAMADA aunque falten
+  // horas; se deja constancia de que es parcial para no confundirla con una
+  // completa en el historial.
+  const repartidoMin = minutosDeFranjas(franjas);
+  const faltanMin = Math.max(0, objetivoMin - repartidoMin);
+  const notaParcial = parcial
+    ? ` Programación parcial: ${horasTexto(repartidoMin / 60)} de ${horasTexto(horasOrden)} ` +
+      `(faltan ${horasTexto(faltanMin / 60)}).`
+    : '';
+  if (esReprogramacion && programar) {
     // EST-03 · La reprogramación no cambia el estado, pero sí debe quedar en
     // la auditoría: sin esto, mover la visita de fecha sería invisible.
     const cambioProf = actual.rows[0].profesional_asignado_id !== profesionalId;
@@ -1320,27 +1347,32 @@ async function aplicarAsignacion(req, client, { vistaPrevia = false } = {}) {
       [
         req.params.id, req.user.sub,
         `Reprogramación: ${cambioProf ? 'cambio de profesional y ' : ''}nueva fecha ` +
-        `${fechaCO(fechaProgramada)}.`,
+        `${fechaCO(fechaProgramada)}.${notaParcial}`,
       ]
     );
-  } else if (esReprogramacion && !completa) {
+  } else if (esReprogramacion && !programar) {
     // Se le quitaron horas a una visita ya programada: vuelve a la bandeja.
     await changeStatus({
       orderId: req.params.id, newStatus: 'SIN PROGRAMAR', userId: req.user.sub,
-      motivo: `Reprogramación incompleta: ${horasTexto(minutosDeFranjas(franjas) / 60)} de ` +
+      motivo: `Reprogramación incompleta: ${horasTexto(repartidoMin / 60)} de ` +
               `${horasTexto(horasOrden)} repartidas.`,
     }, client);
-  } else if (completa) {
+  } else if (programar) {
     // EST · SIN PROGRAMAR → PROGRAMADA (valida transición + auditoría).
-    await changeStatus({ orderId: req.params.id, newStatus: 'PROGRAMADA', userId: req.user.sub }, client);
+    await changeStatus({
+      orderId: req.params.id, newStatus: 'PROGRAMADA', userId: req.user.sub,
+      motivo: parcial ? notaParcial.trim() : undefined,
+    }, client);
   }
-  // Caso restante (SIN PROGRAMAR + visita incompleta): se guardan profesional y
-  // franjas, y la OS se queda donde está a la espera de las horas que faltan.
+  // Caso restante (SIN PROGRAMAR + visita incompleta sin envío parcial): se
+  // guardan profesional y franjas, y la OS se queda donde está a la espera de las
+  // horas que faltan.
 
   // FOR · genera formatos auto-diligenciados (al reprogramar salen con los
-  // datos nuevos). Solo si la visita está completa: un formato con media
-  // agenda impresa habría que rehacerlo, y quedaría archivado en
-  // `documentos_generados` como si fuera bueno.
+  // datos nuevos). Solo si la visita se va a enviar (completa o envío parcial):
+  // un formato con media agenda que NADIE pidió habría que rehacerlo, y quedaría
+  // archivado en `documentos_generados` como si fuera bueno. Con envío parcial sí
+  // se quiere: son los formatos de las franjas que de verdad se van a trabajar.
   // Vista previa de formatos (29-sep) · lo que el administrador escribió en la
   // casilla de observaciones de cada formato. Se guarda en la orden ANTES de
   // generar, que es de donde lo lee `generateOrderDocuments`. Si no viene en el
@@ -1359,7 +1391,7 @@ async function aplicarAsignacion(req, client, { vistaPrevia = false } = {}) {
   }
 
   // En la vista previa se generan igual, pero sin subirlos ni registrarlos.
-  const docs = completa
+  const docs = programar
     ? await generateOrderDocuments(req.params.id, client, { guardar: !vistaPrevia })
     : [];
 
@@ -1370,7 +1402,7 @@ async function aplicarAsignacion(req, client, { vistaPrevia = false } = {}) {
   // ya va camino de su correo con una lista concreta de documentos, y cambiar
   // una regla la semana que viene no puede alterar lo que se le pidió hoy.
   const entrega = entregaDeLaOrden(await getOrderExpanded(req.params.id, client));
-  if (completa) {
+  if (programar) {
     await client.query(
       `UPDATE sst.ordenes_servicio SET soportes_requeridos = $2 WHERE id = $1`,
       [req.params.id, entrega.soportes],
@@ -1421,6 +1453,10 @@ async function aplicarAsignacion(req, client, { vistaPrevia = false } = {}) {
   const orden = await getOrderExpanded(req.params.id, client);
   return {
     orden, profesional: prof.rows[0], docs, token, tokens, esReprogramacion, completa, entrega,
+    // P3 · `parcial` = se envió lo programado sin cubrir todas las horas;
+    // `enviado` = hubo correo/formatos (completa o parcial). `faltanMin` alimenta
+    // el aviso «faltan N h» de la respuesta.
+    parcial, enviado: programar, repartidoMin, faltanMin,
     formatosProf,
     secuenciaCalendario: guardada.rows[0].secuencia_calendario,
     franjas: await franjasDeOrden(req.params.id, client),
@@ -1432,10 +1468,12 @@ async function aplicarAsignacion(req, client, { vistaPrevia = false } = {}) {
 router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) => {
   const result = await withTransaction((client) => aplicarAsignacion(req, client));
 
-  // Visita a medio repartir: se guarda el avance, pero no se avisa a nadie. Un
-  // correo con media agenda mandaría al profesional a una visita que todavía se
-  // está armando, y el .ics le ocuparía unas horas que aún pueden cambiar.
-  if (!result.completa) {
+  // Visita a medio repartir SIN envío parcial: se guarda el avance, pero no se
+  // avisa a nadie. Un correo con media agenda mandaría al profesional a una visita
+  // que todavía se está armando, y el .ics le ocuparía unas horas que aún pueden
+  // cambiar. P3 · Si se pidió «enviar lo programado», `result.enviado` es true y
+  // se sigue por la rama de envío (correo + formatos + .ics de lo repartido).
+  if (!result.enviado) {
     // La forma de la respuesta es la MISMA que la del caso completo —`data` es
     // la orden y los indicadores van arriba—. Cuando divergían, el frontend
     // leía `correo_enviado` en la raíz, lo encontraba `undefined` y anunciaba
@@ -1772,11 +1810,20 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
       `vencido el ${result.formatosProf.vigente_hasta}. Los formatos salieron a su nombre; ` +
       'confirme la vigencia con la ARL o actualícela en Profesionales.'
     : null;
+  // P3 · Cuando se envió lo programado a medias, el aviso lo dice con las horas
+  // que quedan: la orden sigue necesitando que se repartan y se envíen después.
+  const colaParcial = result.parcial
+    ? ` Programación parcial: se envió ${horasTexto(result.repartidoMin / 60)} de ` +
+      `${horasTexto(result.orden.horas_asignadas)}; faltan ${horasTexto(result.faltanMin / 60)} por programar.`
+    : '';
   res.json({
-    message: correoEnviado
+    message: (correoEnviado
       ? `OS ${accion}, formatos generados y correo enviado.`
-      : `OS ${accion} y formatos generados, pero el correo al profesional no salió.`,
-    completa: true,
+      : `OS ${accion} y formatos generados, pero el correo al profesional no salió.`) + colaParcial,
+    completa: result.completa,
+    parcial: result.parcial,
+    minutos_programados: result.repartidoMin,
+    faltan_minutos: result.faltanMin,
     correo_enviado: correoEnviado,
     correo_error: correoError,
     // Qué se envió y qué se le pedirá de vuelta, para poder enseñarlo sin

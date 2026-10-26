@@ -31,6 +31,12 @@ const DRAFT_SELECT = `
          p.nombre AS profesional_nombre,
          o.estado::text AS os_estado, o.codigo AS os_codigo,
          o.fecha_programada AS os_fecha_programada,
+         -- P3 (26-oct-2026) · Horas de la OS y minutos ya repartidos en franjas,
+         -- para que la bandeja marque «programación parcial · faltan N h» en una
+         -- orden PROGRAMADA que se envió a medias.
+         o.horas_asignadas AS os_horas_asignadas,
+         COALESCE((SELECT SUM(EXTRACT(EPOCH FROM (fv.hora_fin - fv.hora_inicio)) / 60)::int
+                     FROM sst.franjas_visita fv WHERE fv.orden_id = o.id), 0) AS os_minutos_programados,
          o.profesional_asignado_id AS os_profesional_id,
          po.nombre AS os_profesional_nombre,
          -- Con la OS ya materializada, la empresa que vale es la suya: es la que
