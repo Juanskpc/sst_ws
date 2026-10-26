@@ -1,4 +1,5 @@
 import { pool } from '../../config/db.js';
+import { referenciaOrden } from '../../utils/referencia-orden.js';
 
 /**
  * Alertas de vencimiento de la Fase A, por la campanita (A0-08 y A0-09):
@@ -125,7 +126,10 @@ export async function revisarVencimientos(client = pool) {
     // Umbrales propios (7 y 3 días): con 30 días de aviso, el SIPAB de Bolívar
     // llenaría la campanita de órdenes que tienen todo el mes por delante.
     const ordenes = await client.query(
-      `SELECT o.id, o.codigo, o.empresa_nombre, (o.fecha_vencimiento - CURRENT_DATE) AS dias
+      // P1 · cronograma/secuencia y número de orden para nombrar la orden como el
+      // resto de avisos (función `referenciaOrden`), no por el código OS interno.
+      `SELECT o.id, o.codigo, o.codigo_cronograma, o.secuencia, o.numero_orden,
+              o.empresa_nombre, (o.fecha_vencimiento - CURRENT_DATE) AS dias
          FROM sst.ordenes_servicio o
         WHERE o.estado::text <> 'FINALIZADA' AND o.fecha_vencimiento IS NOT NULL
           AND (o.fecha_vencimiento - CURRENT_DATE) <= 7
@@ -134,10 +138,11 @@ export async function revisarVencimientos(client = pool) {
     );
     for (const o of ordenes.rows) {
       const umbral = o.dias < 0 ? 0 : o.dias <= 3 ? 3 : 7;
+      const cual = `La orden ${referenciaOrden(o)} (${o.empresa_nombre ?? 'sin empresa'})`;
       creadas += await avisar(client, {
         tipo: 'ORDEN_VENCE', operacion: true,
         titulo: umbral === 0 ? 'Orden de servicio vencida' : 'Orden de servicio por vencer',
-        mensaje: `${frase(o.dias, `La orden ${o.codigo} (${o.empresa_nombre ?? 'sin empresa'})`)} Aún no está finalizada.`,
+        mensaje: `${frase(o.dias, cual)} Aún no está finalizada.`,
         clave: `orden:${o.id}:${umbral}`,
         datos: { orden_id: o.id, dias: o.dias, umbral },
       });

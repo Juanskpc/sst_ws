@@ -1438,6 +1438,12 @@ CREATE VIEW sst.vw_encuestas AS
 SELECT e.id,
        e.orden_id,
        o.codigo                                   AS orden_codigo,
+       -- P1 (26-oct-2026) · Para que el aviso de encuesta respondida nombre la
+       -- orden como el resto: cronograma_secuencia en Bolívar, número de orden en
+       -- las demás ARL (función `referenciaOrden`).
+       o.codigo_cronograma,
+       o.secuencia,
+       o.numero_orden,
        COALESCE(e.empresa_nombre, o.empresa_nombre) AS empresa_nombre,
        COALESCE(e.arl_id, o.arl_id)               AS arl_id,
        a.nombre                                   AS arl_nombre,

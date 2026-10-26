@@ -21,6 +21,7 @@ import {
 } from '../../services/email-layout.service.js';
 import { enPesosCO, fechaDiaCO, fechaHoraCO, horaAmPm, horasTexto } from '../../utils/formato.js';
 import { parseNumeroCO, parseFechaCO } from '../../utils/parseo.js';
+import { referenciaConEmpresa } from '../../utils/referencia-orden.js';
 import { resolverEmpresaId } from '../companies/companies.service.js';
 import {
   casillasDeOrden, esCategoriaValida, esOpcional, etiquetaCategoria, listaEtiquetas, normalizarCategoria,
@@ -308,7 +309,18 @@ router.get('/', asyncHandler(async (req, res) => {
   if (q) {
     params.push(`%${q}%`);
     const p = `$${params.length}`;
-    clauses.push(`(empresa_nombre ILIKE ${p} OR codigo ILIKE ${p} OR nit_nic ILIKE ${p})`);
+    // P1 (26-oct-2026) · El cliente busca la orden por su cronograma_secuencia de
+    // Bolívar («1390041_26») o por el número de orden de las demás ARL, no solo
+    // por empresa/código/NIT. La lista MUESTRA la referencia con guion
+    // («1375383-128») pero el cliente la teclea con guion bajo: se unifican los
+    // dos separadores a uno solo para que ambas formas encuentren la orden.
+    params.push(`%${String(q).replace(/_/g, '-')}%`);
+    const pRef = `$${params.length}`;
+    clauses.push(
+      `(empresa_nombre ILIKE ${p} OR codigo ILIKE ${p} OR nit_nic ILIKE ${p}
+        OR numero_orden ILIKE ${p}
+        OR (coalesce(codigo_cronograma, '') || '-' || coalesce(secuencia, '')) ILIKE ${pRef})`,
+    );
   }
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
   const r = await pool.query(
@@ -1721,7 +1733,8 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
         userId: dest.profesional.usuario_id,
         tipo: result.esReprogramacion ? 'REPROGRAMACION' : 'ASIGNACION',
         titulo: result.esReprogramacion ? 'OS reprogramada' : 'Nueva OS asignada',
-        mensaje: `${result.orden.codigo} · ${result.orden.empresa_nombre || ''} · ${fecha}`,
+        // P1 · cronograma_secuencia (Bolívar) o número de orden (demás ARL).
+        mensaje: `${referenciaConEmpresa(result.orden)} · ${fecha}`,
         datos: { orden_id: result.orden.id },
       });
     } catch (e) {

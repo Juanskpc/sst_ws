@@ -11,6 +11,7 @@ import {
   enPesos, periodoLargo, resolverToken as resolverPrecuenta, responderPrecuenta,
 } from '../billing/billing.service.js';
 import { notify } from '../../services/notification.service.js';
+import { referenciaConEmpresa } from '../../utils/referencia-orden.js';
 import { comprimirSoporte } from '../../services/compress.service.js';
 import {
   casillasDeOrden, esOpcional, etiquetaCategoria, listaEtiquetas, normalizarCategoria,
@@ -357,12 +358,14 @@ router.post('/support/:token/files', uploadSupports, asyncHandler(async (req, re
   await notifyAdmins({
     tipo: 'SOPORTE_CARGADO',
     titulo: result.hayRechazo ? 'Soportes corregidos' : 'Soportes recibidos',
+    // P1 · El cliente se guía por «<cronograma>_<secuencia> EMPRESA» (Bolívar) o
+    // el número de orden (demás ARL), no por el código OS interno.
     mensaje: result.pendientes.length
-      ? `${result.orden.codigo} · ${result.orden.empresa_nombre || ''} · llegó un envío; falta el de ` +
+      ? `${referenciaConEmpresa(result.orden)} · llegó un envío; falta el de ` +
         `${result.pendientes.map((x) => x.nombre).join(', ')}`
       : result.hayRechazo
-        ? `${result.orden.codigo} · ${result.orden.empresa_nombre || ''} volvió a enviar lo que se le devolvió · revíselo`
-        : `${result.orden.codigo} · ${result.orden.empresa_nombre || ''} quedó EJECUTADA · revise los soportes`,
+        ? `${referenciaConEmpresa(result.orden)} volvió a enviar lo que se le devolvió · revíselo`
+        : `${referenciaConEmpresa(result.orden)} quedó EJECUTADA · revise los soportes`,
     datos: { orden_id: result.orden.id },
   });
 
@@ -416,7 +419,10 @@ router.post('/survey/:token', asyncHandler(async (req, res) => {
   await notifyAdmins({
     tipo: 'ENCUESTA_RESPONDIDA',
     titulo: 'Encuesta respondida',
-    mensaje: `${e.orden_codigo} · ${e.empresa_nombre || ''} calificó la actividad ${e.satisfaccion}/5` +
+    // P1 · Misma referencia que el resto de avisos (cronograma_secuencia o número
+    // de orden); `vw_encuestas` expone `orden_codigo`, así que se mapea a `codigo`
+    // para el respaldo de la función compartida.
+    mensaje: `${referenciaConEmpresa({ ...e, codigo: e.orden_codigo })} calificó la actividad ${e.satisfaccion}/5` +
       (e.calificacion_profesional ? ` y a ${e.profesional_nombre || 'el profesional'} ${e.calificacion_profesional}/5` : ''),
     // El aviso lleva al profesional, no a la orden: lo que se quiere ver al
     // pulsarlo es cómo va calificado quien dictó la actividad, y eso vive en su
