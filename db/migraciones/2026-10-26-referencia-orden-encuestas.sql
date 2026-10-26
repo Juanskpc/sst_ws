@@ -8,6 +8,10 @@
 -- trampa 69), y con ella su dependiente `vw_profesionales_desempeno` (la vista
 -- del desempeño lee `vw_encuestas` en un LATERAL). Se recrean las dos, idénticas
 -- a `schema.sql`, salvo las tres columnas nuevas.
+--
+-- Todo va en una transacción (como las migraciones del 24-oct): si algo falla, no
+-- deja ninguna vista a medio recrear.
+BEGIN;
 
 DROP VIEW IF EXISTS sst.vw_encuestas CASCADE;
 CREATE VIEW sst.vw_encuestas AS
@@ -103,3 +107,5 @@ INSERT INTO sst.configuracion (clave, valor, descripcion)
 VALUES ('envio_parcial_permitido', 'true'::jsonb,
         'Permite enviar formatos con la programación incompleta (una orden repartida a medias).')
 ON CONFLICT (clave) DO NOTHING;
+
+COMMIT;
