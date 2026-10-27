@@ -1607,11 +1607,22 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
   // y dos personas subiendo a la vez se pisarían.
   const equipo = result.coasesores;
   const horasCo = equipo.reduce((t, c) => t + Number(c.horas), 0);
-  const horasPrincipal = Math.max(0, Number(o.horas_asignadas ?? 0) - horasCo);
+  // P3 · En un envío PARCIAL las horas de cada asesor son las de SUS franjas: el
+  // resto de la orden todavía no está programado. Con la resta de siempre, al
+  // principal de una orden de 21 h enviada con 8 + 8 le llegaba «le corresponden 13 h».
+  const horasFranjas = (profesionalId) => minutosDeFranjas(franjasDe(profesionalId)) / 60;
+  const horasPrincipal = result.parcial
+    ? horasFranjas(result.profesional.id)
+    : Math.max(0, Number(o.horas_asignadas ?? 0) - horasCo);
+  const horasCoasesor = (c) => (result.parcial ? horasFranjas(c.profesional_id) : Number(c.horas));
   const companeros = (excluirId) => [
     { id: result.profesional.id, nombre: result.profesional.nombre, horas: horasPrincipal },
-    ...equipo.map((c) => ({ id: c.profesional_id, nombre: c.nombre, horas: Number(c.horas) })),
+    ...equipo.map((c) => ({ id: c.profesional_id, nombre: c.nombre, horas: horasCoasesor(c) })),
   ].filter((p) => p.id !== excluirId).map((p) => `${p.nombre} (${horasTexto(p.horas)} h)`);
+  const notaParcial = result.parcial
+    ? `Por ahora se programaron ${horasTexto(result.repartidoMin / 60)} h de las ` +
+      `${horasTexto(o.horas_asignadas)} h de la orden; el resto se programará más adelante.`
+    : null;
 
   /** `dest`: a quién se le escribe, cuántas horas son suyas y si es el principal. */
   const enviarCorreoA = async (dest) => {
@@ -1626,14 +1637,16 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
     const fechaDest = suyas.length ? fechaCO(instanteCO(suyas[0].fecha, suyas[0].hora_inicio)) : fecha;
     const docsDest = docsDe(dest.profesional.id);
     const { listaAdjuntos, queHacerConEllos } = adjuntosDe(docsDest);
-    const horasDest = equipo.length ? horasTexto(dest.horas) : horasTexto(o.horas_asignadas);
+    const horasDest = equipo.length || result.parcial ? horasTexto(dest.horas) : horasTexto(o.horas_asignadas);
     const notaEquipo = equipo.length
       ? `Esta orden la ejecutan varios asesores, cada uno con su horario y sus horas. ` +
-        `De las ${horasTexto(o.horas_asignadas)} h de la orden, a usted le corresponden ${horasTexto(dest.horas)} h, ` +
+        (result.parcial
+          ? `${notaParcial} A usted le corresponden ${horasTexto(dest.horas)} h, `
+          : `De las ${horasTexto(o.horas_asignadas)} h de la orden, a usted le corresponden ${horasTexto(dest.horas)} h, `) +
         `en el horario que aparece en este correo. ` +
         `Va con: ${companeros(dest.profesional.id).join(', ')}. ` +
         `Cada asesor sube sus propios soportes, por el enlace de su correo.`
-      : null;
+      : notaParcial;
     await sendEmail({
       to: dest.profesional.correo,
       // El administrador que asigna va en copia para que la invitación entre
@@ -1766,7 +1779,7 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
     { profesional: result.profesional, horas: horasPrincipal, principal: true },
     ...equipo.map((c) => ({
       profesional: { id: c.profesional_id, nombre: c.nombre, correo: c.correo, usuario_id: c.usuario_id },
-      horas: Number(c.horas), principal: false,
+      horas: horasCoasesor(c), principal: false,
     })),
   ];
   for (const dest of destinatarios) {
