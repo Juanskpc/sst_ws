@@ -760,11 +760,13 @@ export async function obtenerPrecuenta(id, client = pool) {
     `SELECT x.orden_id, x.profesional_id, x.motivo, x.excluido_en, o.empresa_nombre,
             o.codigo_cronograma, o.secuencia, o.numero_orden, o.codigo,
             COALESCE(NULLIF(btrim(o.tema_actividad), ''), o.tipo_actividad) AS actividad,
-            COALESCE(o.fecha_ejecucion, o.fecha_programada, o.actualizado_en)::date AS fecha_ejecucion
+            h.fecha_ejecucion
        FROM sst.cobro_exclusiones x
        JOIN sst.ordenes_servicio o ON o.id = x.orden_id
+       -- La misma fecha de trabajo que la cuenta (la de la última visita).
+       JOIN sst.vw_horas_ejecutadas h ON h.orden_id = x.orden_id AND h.profesional_id = x.profesional_id
       WHERE x.profesional_id = $1
-        AND COALESCE(o.fecha_ejecucion, o.fecha_programada, o.actualizado_en)::date BETWEEN $2::date AND $3::date
+        AND h.fecha_ejecucion BETWEEN $2::date AND $3::date
       ORDER BY fecha_ejecucion, o.codigo`,
     [pc.profesional_id, inicio, fin],
   );

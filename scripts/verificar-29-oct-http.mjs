@@ -45,6 +45,10 @@ try {
   ordenes.push(await crear('OS-ZZ-2901', '67', 'Plan estratégico de seguridad vial', 19));
   ordenes.push(await crear('OS-ZZ-2902', '68', null, 2));
   ordenes.push(await crear('OS-ZZ-2903', '69', 'Pausas activas', 3));
+  // Visitada en FEBRERO, soportes subidos en marzo (fecha_ejecucion de marzo): no puede caer en la cuenta de marzo.
+  const vieja = await crear('OS-ZZ-2904', '70', 'Visita de febrero', 2);
+  ordenes.push(vieja);
+  await q(`INSERT INTO sst.franjas_visita (orden_id, fecha, hora_inicio, hora_fin) VALUES ($1, '2099-02-20', '08:00', '10:00')`, [vieja]);
   const [o1, o2] = ordenes;
 
   console.log('— Generar —');
@@ -58,6 +62,9 @@ try {
   ok(l1.orden_referencia === '9134803-67', 'referencia «9134803-67»', l1.orden_referencia);
   ok(l1.actividad === 'Plan estratégico de seguridad vial', 'actividad = tema del registro de asistencia', l1.actividad);
   ok(l2.actividad === 'CAP SEGURIDAD VIAL', 'sin tema, el título de la ARL', l2.actividad);
+  ok(!d.items.some((i) => i.orden_id === vieja), 'la visita de febrero NO entra en la cuenta de marzo');
+  const feb = (await http('GET', '/precuentas/resumen?anio=2099')).body.data.find((f) => f.profesional_id === prof && f.periodo === '2099-02');
+  ok(feb && !feb.precuenta_id && feb.total_horas === 2, 'queda por cobrar en febrero', JSON.stringify(feb?.total_horas));
 
   console.log('— Horas, manual y quitar —');
   r = await http('PATCH', `/precuentas/${pcId}/items`, { items: [{ id: l1.id, horas: 9 }] });
@@ -79,7 +86,7 @@ try {
   ok(!d.items.some((i) => i.orden_id === o2), 'la apartada NO vuelve');
   ok(Number(d.total_monto) === totalAntes, 'mismo total', String(d.total_monto));
   const resumen = (await http('GET', '/precuentas/resumen?anio=2099')).body.data;
-  ok(!resumen.some((f) => f.profesional_id === prof && !f.precuenta_id), 'no queda trabajo pendiente suelto');
+  ok(!resumen.some((f) => f.profesional_id === prof && f.periodo === PERIODO && !f.precuenta_id), 'no queda trabajo de marzo pendiente suelto');
 
   console.log('— Devolver al cobro —');
   r = await http('DELETE', `/precuentas/exclusiones/${o2}/${prof}`);
