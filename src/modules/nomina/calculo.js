@@ -147,15 +147,25 @@ export function porcentajeFondoSolidaridad(ibc, smmlv) {
  * @param {number} [e.novedades.bonificacion]       bonificación salarial
  * @param {{dias:number}} [e.novedades.prima]       días del semestre que se pagan (180 = semestre completo)
  * @param {{dias:number}} [e.novedades.cesantias]   días del año que se liquidan (360 = año completo); paga también los intereses
+ * @param {number} [e.diasPeriodo]                 días del mes con contrato (30 si trabajó todo el mes; menos si ingresó o se retiró en él)
+ * @param {number} [e.novedades.diasLaborados]     30-oct-2026, contadora: los días a liquidar escritos a mano; mandan sobre `diasPeriodo`
+ * @param {{incluir:boolean, valor?:number}} [e.novedades.auxilioTransporte]  30-oct-2026: pagar o no el auxilio, y cuánto; sin esto, la regla de los 2 mínimos
+ * @param {number} [e.novedades.salud]             30-oct-2026: valor de salud escrito a mano (sin esto, 4 % de la base)
+ * @param {number} [e.novedades.pension]           30-oct-2026: valor de pensión escrito a mano (sin esto, 4 % de la base)
  * @param {{tipo:string, valor:number, descripcion?:string}[]} [e.novedades.otrosDevengados]   tipo: clave de OTROS_DEVENGADOS
  * @param {{tipo:string, valor:number, descripcion?:string}[]} [e.novedades.otrasDeducciones]  tipo: clave de OTRAS_DEDUCCIONES
  */
-export function liquidar({ salario, periodo, salarioIntegral = false, novedades = {}, parametros = null }) {
+export function liquidar({ salario, periodo, salarioIntegral = false, novedades = {}, parametros = null, diasPeriodo = 30 }) {
   const { smmlv, auxilioTransporte } = parametros ?? parametrosDe(periodo.anio);
   const sal = Number(salario);
   if (!(sal > 0)) throw new Error('El salario debe ser mayor que cero.');
   const dia = sal / 30; // el mes laboral tiene 30 días, también febrero y los de 31
   const hora = sal / horasMes(periodo.anio, periodo.mes);
+
+  // ── Días del mes a liquidar: 30 si trabajó el mes entero; si ingresó o se retiró en él, los
+  // que tuvo contrato (entra el 19 → 12 días). La contadora puede escribirlos a mano (30-oct-2026).
+  const diasMes = novedades.diasLaborados > 0 ? novedades.diasLaborados : diasPeriodo;
+  if (!(diasMes >= 1 && diasMes <= 30)) throw new Error('Los días a liquidar deben estar entre 1 y 30.');
 
   // ── Días: los de vacaciones disfrutadas, licencia e incapacidad no son días laborados.
   const vacaciones = (novedades.vacaciones ?? []).filter((v) => v.dias > 0);
@@ -164,8 +174,8 @@ export function liquidar({ salario, periodo, salarioIntegral = false, novedades 
   const diasAusente = vacaciones.filter((v) => !v.compensadas).reduce((s, v) => s + v.dias, 0)
     + licencias.reduce((s, l) => s + l.dias, 0)
     + incapacidades.reduce((s, i) => s + i.dias, 0);
-  if (diasAusente > 30) throw new Error('Las novedades suman más de 30 días en el mes.');
-  const diasTrabajados = 30 - diasAusente;
+  if (diasAusente > diasMes) throw new Error(`Las novedades suman más días (${diasAusente}) que los ${diasMes} a liquidar.`);
+  const diasTrabajados = diasMes - diasAusente;
 
   // ── Devengados
   const sueldo = r0(dia * diasTrabajados);
@@ -210,8 +220,10 @@ export function liquidar({ salario, periodo, salarioIntegral = false, novedades 
   // Auxilio de transporte (Ley 15 de 1959): para quien gana hasta 2 salarios mínimos,
   // proporcional a los días efectivamente laborados. No es salario para la seguridad
   // social, pero SÍ es base de la prima y las cesantías (Ley 1 de 1963, art. 7).
-  const conAuxilio = !salarioIntegral && sal <= 2 * smmlv;
-  const auxilio = conAuxilio ? r0(auxilioTransporte / 30 * diasTrabajados) : 0;
+  // 30-oct-2026: la contadora puede forzar que se pague (o no) y corregir el valor.
+  const auxManual = novedades.auxilioTransporte;
+  const conAuxilio = auxManual ? auxManual.incluir === true : !salarioIntegral && sal <= 2 * smmlv;
+  const auxilio = !conAuxilio ? 0 : auxManual?.valor != null ? r0(auxManual.valor) : r0(auxilioTransporte / 30 * diasTrabajados);
   const basePrestaciones = sal + (conAuxilio ? auxilioTransporte : 0);
 
   // Prima de servicios (CST art. 306): un mes de salario por año, mitad en junio y mitad
@@ -240,15 +252,16 @@ export function liquidar({ salario, periodo, salarioIntegral = false, novedades 
     + vacacionesLiq.reduce((s, v) => s + v.valor, 0)
     + licenciasLiq.reduce((s, l) => s + l.valor, 0)
     + incapacidadesLiq.reduce((s, i) => s + i.valor, 0);
-  const diasCotizados = 30 - licencias.filter((l) => !TIPOS_LICENCIA[l.tipo].remunerada).reduce((s, l) => s + l.dias, 0);
+  const diasCotizados = diasMes - licencias.filter((l) => !TIPOS_LICENCIA[l.tipo].remunerada).reduce((s, l) => s + l.dias, 0);
   const baseCotizacion = salarial - compensadas;
   const ibc = r0(Math.min(Math.max(salarioIntegral ? baseCotizacion * 0.7 : baseCotizacion, smmlv / 30 * diasCotizados), 25 * smmlv));
 
   // ── Deducciones del trabajador (Ley 100, art. 204 y 20): salud 4 % y pensión 4 %.
   const pctFsp = porcentajeFondoSolidaridad(ibc, smmlv);
   const deducciones = {
-    salud: { porcentaje: 4, valor: r0(ibc * 0.04) },
-    pension: { porcentaje: 4, valor: r0(ibc * 0.04) },
+    // 30-oct-2026: si la contadora escribe el valor, manda ese (el porcentaje sigue siendo el 4 % de ley).
+    salud: { porcentaje: 4, valor: novedades.salud != null ? r0(novedades.salud) : r0(ibc * 0.04), manual: novedades.salud != null },
+    pension: { porcentaje: 4, valor: novedades.pension != null ? r0(novedades.pension) : r0(ibc * 0.04), manual: novedades.pension != null },
     fondoSolidaridad: pctFsp ? { porcentaje: pctFsp, valor: r0(ibc * pctFsp / 100) } : null,
     otras: (novedades.otrasDeducciones ?? []).filter((o) => o.valor > 0).map((o) => {
       if (!OTRAS_DEDUCCIONES[o.tipo]) throw new Error(`Tipo de deducción desconocido: ${o.tipo}.`);
@@ -267,7 +280,7 @@ export function liquidar({ salario, periodo, salarioIntegral = false, novedades 
   if (totalDeducido > totalDevengado) throw new Error('Las deducciones superan lo devengado: el neto a pagar no puede ser negativo.');
 
   return {
-    diasTrabajados, ibc, devengados, deducciones,
+    diasTrabajados, diasMes, ibc, devengados, deducciones,
     totales: { devengado: totalDevengado, deducido: totalDeducido, neto: r0(totalDevengado - totalDeducido) },
   };
 }

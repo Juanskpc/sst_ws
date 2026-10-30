@@ -92,6 +92,20 @@ try {
   await debeFallar(() => previaLiquidacion({ ...base, mes: 9, novedades: { otrasDeducciones: [{ tipo: 'LIBRANZA', valor: 100000 }] } }), 'libranza sin descripción');
   await debeFallar(() => previaLiquidacion({ ...base, mes: 9, novedades: { otrasDeducciones: [{ tipo: 'OTRA', valor: 9_000_000 }] } }), 'deducciones mayores que lo devengado');
 
+  // ── 30-oct-2026 · Pedido de la contadora: días a mano, auxilio forzado y salud/pensión escritas.
+  const aMano = (await previaLiquidacion({ ...base, mes: 9, novedades: { diasLaborados: 12, salud: 40000, pension: '41000' } })).liquidacion;
+  comprobar(aMano.diasTrabajados === 12 && aMano.devengados.sueldo === 960000 && aMano.devengados.auxilioTransporte === 99638,
+    `12 días a mano: sueldo ${aMano.devengados.sueldo} y auxilio ${aMano.devengados.auxilioTransporte} proporcionales`);
+  comprobar(aMano.deducciones.salud.valor === 40000 && aMano.deducciones.pension.valor === 41000 && aMano.deducciones.salud.manual, 'salud y pensión escritas a mano mandan');
+  const sinAux = (await previaLiquidacion({ ...base, mes: 9, novedades: { auxilioTransporte: { incluir: false } } })).liquidacion;
+  const auxFijo = (await previaLiquidacion({ ...base, mes: 9, novedades: { auxilioTransporte: { incluir: true, valor: 200000 } } })).liquidacion;
+  comprobar(sinAux.devengados.auxilioTransporte === 0 && auxFijo.devengados.auxilioTransporte === 200000, 'el auxilio se puede quitar o fijar a mano');
+  await debeFallar(() => previaLiquidacion({ ...base, mes: 9, novedades: { diasLaborados: 10, vacaciones: [{ dias: 12 }] } }), 'ausencias que pasan los días a liquidar');
+  await actualizarEmpleado(emp.id, { ...emp, fecha_ingreso: '2026-09-19' }, usuario);
+  const nueva = (await previaLiquidacion({ ...base, mes: 9, novedades: {} })).liquidacion;
+  comprobar(nueva.diasMes === 12 && nueva.diasTrabajados === 12, 'quien ingresa el 19 liquida 12 días solos (del 19 al 30)');
+  await actualizarEmpleado(emp.id, { ...emp, fecha_ingreso: '2024-02-01' }, usuario);
+
   const l1 = await crearLiquidacion({ ...base, mes: 9, novedades: nov }, usuario);
   comprobar(l1.estado === 'BORRADOR' && Number(l1.neto) === 2770437, 'borrador de septiembre guardado');
   await debeFallar(() => crearLiquidacion({ ...base, mes: 9, novedades: {} }, usuario), 'segunda nómina del mismo mes');

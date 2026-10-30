@@ -111,6 +111,18 @@ export function normalizarNovedades(raw = {}) {
   if (otrosDevengados.length) n.otrosDevengados = otrosDevengados;
   const otrasDeducciones = conValor(raw.otrasDeducciones, OTRAS_DEDUCCIONES, 'Otras deducciones');
   if (otrasDeducciones.length) n.otrasDeducciones = otrasDeducciones;
+
+  // 30-oct-2026 · Pedido de la contadora: los días a liquidar (quien entra a mitad de mes), el
+  // auxilio de transporte y la salud y la pensión se pueden escribir a mano. Vacío = automático.
+  const vacio = (v) => v == null || v === '';
+  if (!vacio(raw.diasLaborados)) n.diasLaborados = entero(raw.diasLaborados, 'Los días a liquidar', { max: 30 });
+  const aux = raw.auxilioTransporte;
+  if (aux && typeof aux.incluir === 'boolean') {
+    n.auxilioTransporte = { incluir: aux.incluir };
+    if (aux.incluir && !vacio(aux.valor)) n.auxilioTransporte.valor = dinero(aux.valor, 'El auxilio de transporte');
+  }
+  if (!vacio(raw.salud)) n.salud = dinero(raw.salud, 'La salud');
+  if (!vacio(raw.pension)) n.pension = dinero(raw.pension, 'La pensión');
   return n;
 }
 
@@ -131,9 +143,25 @@ async function validarPeriodo(anio, mes, empleado) {
   return { anio: a, mes: m, parametros };
 }
 
+/**
+ * Días del mes con contrato, en mes comercial de 30: quien entra el 19 liquida 12 (del 19 al 30);
+ * quien se retira el 10, 10. El día 31 cuenta como 30 y el último de febrero también.
+ */
+export function diasConContrato(anio, mes, fechaIngreso, fechaRetiro) {
+  const ym = `${anio}-${String(mes).padStart(2, '0')}`;
+  const finMes = Number(ultimoDia(anio, mes).slice(8));
+  const comercial = (dia) => (dia >= finMes ? 30 : Math.min(dia, 30));
+  const desde = fechaIngreso?.startsWith(ym) ? comercial(Number(fechaIngreso.slice(8))) : 1;
+  const hasta = fechaRetiro?.startsWith(ym) ? comercial(Number(fechaRetiro.slice(8))) : 30;
+  return Math.max(1, hasta - desde + 1);
+}
+
 function calcular(empleado, periodo, novedades) {
   try {
-    return liquidar({ salario: Number(empleado.salario), periodo, salarioIntegral: empleado.salario_integral, novedades, parametros: periodo.parametros });
+    return liquidar({
+      salario: Number(empleado.salario), periodo, salarioIntegral: empleado.salario_integral, novedades, parametros: periodo.parametros,
+      diasPeriodo: diasConContrato(periodo.anio, periodo.mes, empleado.fecha_ingreso, empleado.fecha_retiro),
+    });
   } catch (err) {
     // Los errores de calculo.js son de datos (más de 30 días de novedades, tipo desconocido…), no del servidor.
     throw badRequest(err.message);
