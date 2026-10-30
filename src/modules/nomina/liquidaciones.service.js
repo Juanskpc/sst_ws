@@ -128,6 +128,7 @@ export function normalizarNovedades(raw = {}) {
 
 // ─── Cálculo ────────────────────────────────────────────────────────────────
 
+const MESES = ['enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio', 'julio', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre'];
 const ultimoDia = (anio, mes) => new Date(Date.UTC(anio, mes, 0)).toISOString().slice(0, 10);
 
 async function validarPeriodo(anio, mes, empleado) {
@@ -138,7 +139,7 @@ async function validarPeriodo(anio, mes, empleado) {
   if (!parametros) throw badRequest(`No están cargados el salario mínimo y el auxilio de transporte de ${a}. Agréguelos en Nómina → Parámetros.`);
   const [hoyAnio, hoyMes] = hoyCO().split('-').map(Number);
   if (a > hoyAnio || (a === hoyAnio && m > hoyMes)) throw badRequest('No se puede liquidar un mes que todavía no ha empezado.');
-  if (empleado.fecha_ingreso > ultimoDia(a, m)) throw badRequest(`${empleado.nombre} ingresó el ${empleado.fecha_ingreso}: no trabajó en ese mes.`);
+  if (empleado.fecha_ingreso > ultimoDia(a, m)) throw badRequest(`${empleado.nombre} ingresó el ${empleado.fecha_ingreso}: no trabajó en ${MESES[m - 1]} de ${a}. Cambie el mes arriba.`);
   if (empleado.fecha_retiro && empleado.fecha_retiro < `${a}-${String(m).padStart(2, '0')}-01`) throw badRequest(`${empleado.nombre} se retiró el ${empleado.fecha_retiro}: no trabajó en ese mes.`);
   return { anio: a, mes: m, parametros };
 }
