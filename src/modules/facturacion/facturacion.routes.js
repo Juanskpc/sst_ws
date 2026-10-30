@@ -18,6 +18,7 @@ import { generarPaquete, infoPaquete } from './paquete.service.js';
 import { pdfDeDocumento, pdfVistaPrevia } from './representacion.service.js';
 import { pool } from '../../config/db.js';
 import { hoyCO } from '../../utils/formato.js';
+import { cuposDocumentos } from './cupos.service.js';
 
 const router = Router();
 router.use(authRequired);
@@ -41,6 +42,11 @@ const uuidOpcional = (v, nombre) => {
 
 // Lo que se puede facturar hoy, por pagador. ?arl_id= (o ?pagador_tercero_id=,
 // un cliente particular de A3-01) lo acota a uno.
+/** 29-oct-2026 · Cupos de documentos electrónicos (facturación y nómina): «vas X de Y». */
+router.get('/cupos', LEER, asyncHandler(async (_req, res) => {
+  res.json({ data: await cuposDocumentos() });
+}));
+
 router.get('/por-facturar', LEER, asyncHandler(async (req, res) => {
   res.json({
     data: await relacionPorFacturar({
