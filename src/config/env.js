@@ -82,6 +82,20 @@ export const env = {
     username: process.env.FACTUS_USERNAME || '',
     password: process.env.FACTUS_PASSWORD || '',
   },
+  // 8-oct-2026 · Nómina electrónica. En producción la nómina sale con la MISMA cuenta
+  // del proveedor que la facturación, así que estas variables no se ponen y se usan las
+  // FACTUS_* de arriba. Existen para el ambiente de pruebas: el proveedor solo cuenta las
+  // pruebas de nómina hechas con las credenciales de pruebas propias del NIT, que no son
+  // las genéricas con las que se prueba la facturación.
+  factusNomina: {
+    url: (process.env.FACTUS_NOMINA_URL || process.env.FACTUS_URL || '').replace(/\/+$/, ''),
+    clientId: (process.env.FACTUS_NOMINA_CLIENT_ID || process.env.FACTUS_CLIENT_ID || '').trim(),
+    clientSecret: (process.env.FACTUS_NOMINA_CLIENT_SECRET || process.env.FACTUS_CLIENT_SECRET || '').trim(),
+    username: (process.env.FACTUS_NOMINA_USERNAME || process.env.FACTUS_USERNAME || '').trim(),
+    password: (process.env.FACTUS_NOMINA_PASSWORD || process.env.FACTUS_PASSWORD || '').trim(),
+    /** ¿Se pusieron credenciales propias de nómina (y no las de facturación por defecto)? */
+    propias: Boolean(process.env.FACTUS_NOMINA_USERNAME),
+  },
 
   // Gemini NO es el motor principal de extracción (ese es OpenAI). Esta config
   // solo alimenta los componentes auxiliares PENDIENTES DE MIGRACIÓN a OpenAI:

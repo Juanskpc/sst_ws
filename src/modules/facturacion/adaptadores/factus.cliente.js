@@ -69,8 +69,16 @@ export function esSandbox() {
   return env.factus.url.includes('sandbox');
 }
 
-let token = null; // { accessToken, refreshToken, venceEn }
-let renovando = null; // promesa en vuelo, para que dos peticiones no pidan dos tokens
+/**
+ * 8-oct-2026 · Dos cuentas posibles ante el proveedor: la de facturación (por defecto) y
+ * la de nómina ('nomina', ver `env.factusNomina`). Cada una lleva su propio token.
+ */
+const cuentaDe = (perfil) => (perfil === 'nomina' ? env.factusNomina : env.factus);
+const sesiones = new Map(); // perfil → { token: { accessToken, refreshToken, venceEn }, renovando }
+function sesionDe(perfil) {
+  if (!sesiones.has(perfil)) sesiones.set(perfil, { token: null, renovando: null }); // `renovando`: promesa en vuelo, para que dos peticiones no pidan dos tokens
+  return sesiones.get(perfil);
+}
 
 function exigirConfiguracion() {
   if (!estaConfigurado()) {
@@ -119,13 +127,13 @@ function errorDeRespuesta(status, cuerpo) {
   });
 }
 
-async function pedirToken(cuerpo) {
-  const r = await llamar(`${env.factus.url}/oauth/token`, {
+async function pedirToken(cuenta, cuerpo) {
+  const r = await llamar(`${cuenta.url}/oauth/token`, {
     method: 'POST',
     headers: { Accept: 'application/json', 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
-      client_id: env.factus.clientId,
-      client_secret: env.factus.clientSecret,
+      client_id: cuenta.clientId,
+      client_secret: cuenta.clientSecret,
       ...cuerpo,
     }),
   });
@@ -145,44 +153,46 @@ async function pedirToken(cuerpo) {
   };
 }
 
-async function obtenerToken({ forzar = false } = {}) {
+async function obtenerToken({ forzar = false, perfil = 'facturacion' } = {}) {
   exigirConfiguracion();
-  if (!forzar && token && token.venceEn - Date.now() > MARGEN_RENOVACION_MS) return token.accessToken;
+  const cuenta = cuentaDe(perfil);
+  const sesion = sesionDe(perfil);
+  if (!forzar && sesion.token && sesion.token.venceEn - Date.now() > MARGEN_RENOVACION_MS) return sesion.token.accessToken;
 
-  renovando ??= (async () => {
+  sesion.renovando ??= (async () => {
     try {
       let nuevo = null;
-      if (token?.refreshToken) {
+      if (sesion.token?.refreshToken) {
         try {
-          nuevo = await pedirToken({ grant_type: 'refresh_token', refresh_token: token.refreshToken });
+          nuevo = await pedirToken(cuenta, { grant_type: 'refresh_token', refresh_token: sesion.token.refreshToken });
         } catch {
           nuevo = null; // refresh caducado o revocado: se cae al password grant
         }
       }
-      nuevo ??= await pedirToken({
+      nuevo ??= await pedirToken(cuenta, {
         grant_type: 'password',
-        username: env.factus.username,
-        password: env.factus.password,
+        username: cuenta.username,
+        password: cuenta.password,
       });
-      token = nuevo;
-      return token.accessToken;
+      sesion.token = nuevo;
+      return sesion.token.accessToken;
     } finally {
-      renovando = null;
+      sesion.renovando = null;
     }
   })();
-  return renovando;
+  return sesion.renovando;
 }
 
-/** Olvida el token cacheado (para las pruebas y para forzar un nuevo login). */
+/** Olvida los tokens cacheados (para las pruebas y para forzar un nuevo login). */
 export function olvidarToken() {
-  token = null;
+  sesiones.clear();
 }
 
 /** Última cifra de `X-RateLimit-Remaining` que devolvió Factus (el sandbox anda por 120/min). */
 export let peticionesRestantes = null;
 
-function armarUrl(ruta, query) {
-  const url = new URL(`${env.factus.url}${ruta.startsWith('/') ? ruta : `/${ruta}`}`);
+function armarUrl(base, ruta, query) {
+  const url = new URL(`${base}${ruta.startsWith('/') ? ruta : `/${ruta}`}`);
   for (const [k, v] of Object.entries(query || {})) {
     // Se descartan vacíos: `undefined` escrito como texto llegaría a Factus como filtro real.
     if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, String(v));
@@ -201,16 +211,17 @@ function armarUrl(ruta, query) {
  * @param {'GET'|'POST'|'PUT'|'PATCH'|'DELETE'} metodo
  * @param {string} ruta ej. `/v2/numbering-ranges`
  * @param {object} [cuerpo] se envía como JSON
- * @param {{ query?: object }} [opciones]
+ * @param {{ query?: object, perfil?: 'facturacion'|'nomina' }} [opciones]
  */
 export async function request(metodo, ruta, cuerpo, opciones = {}) {
   // Antes de armar la URL: sin FACTUS_URL `new URL` lanzaría un TypeError y el
   // módulo respondería 500 en vez del 503 "no configurado".
   exigirConfiguracion();
-  const url = armarUrl(ruta, opciones.query);
+  const perfil = opciones.perfil ?? 'facturacion';
+  const url = armarUrl(cuentaDe(perfil).url, ruta, opciones.query);
 
   for (let intento = 0; intento < 2; intento++) {
-    const accessToken = await obtenerToken({ forzar: intento > 0 });
+    const accessToken = await obtenerToken({ forzar: intento > 0, perfil });
     const r = await llamar(url, {
       method: metodo,
       headers: {
@@ -225,7 +236,7 @@ export async function request(metodo, ruta, cuerpo, opciones = {}) {
     if (restantes !== null) peticionesRestantes = Number(restantes);
 
     if (r.status === 401 && intento === 0) {
-      token = null; // el token que teníamos ya no vale: se pide uno nuevo
+      sesionDe(perfil).token = null; // el token que teníamos ya no vale: se pide uno nuevo
       continue;
     }
 

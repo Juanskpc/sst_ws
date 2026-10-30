@@ -106,7 +106,9 @@ export class PuertoFacturacionElectronica {
    * Volumen mínimo (un solo empleado, ver docs/2-arquitectura/facturacion-electronica.md §8.E) —
    * incluido aquí solo para dejar completo el contrato de los tres tipos de
    * documento DIAN (D-8), no porque vaya a construirse antes que los otros dos.
-   * @param {{empleado: object, periodoPago: {desde: string, hasta: string}, devengados: object, deducciones: object}} datos
+   * A5-01 (8-oct-2026): un documento por trabajador y periodo mensual, a partir de la
+   * liquidación de `nomina/calculo.js`. La forma exacta de `datos` está en el adaptador.
+   * @param {{referenceCode: string, periodo: {anio: number, mes: number}, pago: object, trabajador: object, liquidacion: object}} datos
    *  @returns {Promise<ResultadoEmision>} */
   // eslint-disable-next-line no-unused-vars
   async emitirNominaElectronica(datos) {
