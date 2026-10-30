@@ -61,7 +61,7 @@ function lineasDesdePrecuenta(items) {
     const valorHora = Number(it.valor_hora_snapshot);
     const monto = aCentavos(it.monto);
     const exacto = aCentavos(Math.round(horas * valorHora * 100) / 100) === monto;
-    const quien = [it.orden_codigo, it.empresa_nombre, it.arl_nombre].filter(Boolean).join(' · ');
+    const quien = [it.orden_referencia || it.orden_codigo, it.empresa_nombre, it.arl_nombre].filter(Boolean).join(' · ');
     if (monto > 0) {
       lineas.push({
         orden_id: it.orden_id,

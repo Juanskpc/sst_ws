@@ -18,11 +18,14 @@
  * es justamente `(arl_id, codigo_cronograma, secuencia)`), así la función sirve
  * aunque solo reciba las columnas de `ordenes_servicio` sin el `arl_nombre` de
  * la vista expandida.
+ *
+ * `separador`: la cuenta de cobro (29-oct-2026) escribe «134803-67», que es como
+ * JD&D la pidió ahí; avisos y correos siguen con «_».
  */
-export function referenciaOrden(orden) {
+export function referenciaOrden(orden, { separador = '_' } = {}) {
   const cronograma = String(orden?.codigo_cronograma ?? '').trim();
   const secuencia = String(orden?.secuencia ?? '').trim();
-  if (cronograma && secuencia) return `${cronograma}_${secuencia}`;
+  if (cronograma && secuencia) return `${cronograma}${separador}${secuencia}`;
   const numero = String(orden?.numero_orden ?? '').trim();
   if (numero) return numero;
   return String(orden?.codigo ?? '').trim();

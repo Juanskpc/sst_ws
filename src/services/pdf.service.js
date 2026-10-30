@@ -215,7 +215,7 @@ export async function generatePrecuentaPdf(precuenta) {
     const fecha = m ? `${m[3]}/${m[2]}/${m[1]}`
       : d ? `${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')}/${d.getFullYear()}` : '—';
     const celdas = [
-      fecha, it.orden_codigo || '—', it.actividad || '—', it.empresa_nombre || '—', it.arl_nombre || '—',
+      fecha, it.orden_referencia || it.orden_codigo || '—', it.actividad || '—', it.empresa_nombre || '—', it.arl_nombre || '—',
       String(Number(it.horas) || 0), pesos(it.valor_hora_snapshot),
       Number(it.viaticos) > 0 ? pesos(it.viaticos) : '—', pesos(it.monto),
     ];
@@ -238,7 +238,11 @@ export async function generatePrecuentaPdf(precuenta) {
       });
     });
     // Un valor hora ajustado a mano se marca: quien lee la cuenta ve que no es la tarifa de siempre.
-    if (it.ajuste_manual) {
+    // 29-oct-2026 · Horas editadas: se marcan igual, debajo de la cifra.
+    if (it.horas_original != null && Number(it.horas_original) !== Number(it.horas)) {
+      page.drawText('ajustado', { x: COLS[5].x + COLS[5].ancho - font.widthOfTextAtSize('ajustado', 6.2), y: y - INTERLINEA, size: 6.2, font, color: gray });
+    }
+    if (it.ajuste_manual && it.valor_hora_original != null) {
       page.drawText('ajustado', { x: COLS[6].x + COLS[6].ancho - font.widthOfTextAtSize('ajustado', 6.2), y: y - INTERLINEA, size: 6.2, font, color: gray });
     }
     y -= alto;

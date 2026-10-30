@@ -5,8 +5,8 @@ import { authRequired, requireRole } from '../../middleware/auth.js';
 import { badRequest } from '../../utils/httpError.js';
 import { generatePrecuentaPdf } from '../../services/pdf.service.js';
 import {
-  ESTADOS_PRECUENTA, ajustarItemsPrecuenta, aniosConTrabajo, avisarCorteDeCobro, enviarPrecuenta, generarPrecuentas,
-  obtenerPrecuenta, resumenPorMes, urlPrecuenta,
+  ESTADOS_PRECUENTA, agregarLineaManual, ajustarItemsPrecuenta, aniosConTrabajo, avisarCorteDeCobro, enviarPrecuenta,
+  generarPrecuentas, obtenerPrecuenta, quitarLineaPrecuenta, restaurarExclusion, resumenPorMes, urlPrecuenta,
 } from './billing.service.js';
 
 const router = Router();
@@ -129,11 +129,32 @@ router.post('/generate', requireRole('admin'), asyncHandler(async (req, res) => 
 
 /**
  * 24-oct-2026 · Ajusta el valor hora y los viáticos de las líneas antes de enviar la cuenta.
- * Cuerpo: { items: [{ id, valor_hora?, viaticos? }] }.
+ * Cuerpo: { items: [{ id, horas?, valor_hora?, viaticos? }] } (29-oct: también las horas).
  */
 router.patch('/:id/items', requireRole('admin'), asyncHandler(async (req, res) => {
   const data = await ajustarItemsPrecuenta(req.params.id, req.body?.items, req.user.sub);
   res.json({ message: 'Valores de la cuenta actualizados.', data });
+}));
+
+/**
+ * 29-oct-2026 · Línea manual (sin orden) en una cuenta abierta.
+ * Cuerpo: { actividad, horas, valor_hora, viaticos?, empresa_nombre?, orden_referencia?, arl_nombre?, fecha_ejecucion? }.
+ */
+router.post('/:id/items', requireRole('admin'), asyncHandler(async (req, res) => {
+  const data = await agregarLineaManual(req.params.id, req.body || {}, req.user.sub);
+  res.status(201).json({ message: 'Línea agregada a la cuenta.', data });
+}));
+
+/** 29-oct-2026 · Quita una línea; si es de una orden, la aparta del cobro de ese asesor. Cuerpo: { motivo? }. */
+router.delete('/:id/items/:itemId', requireRole('admin'), asyncHandler(async (req, res) => {
+  const data = await quitarLineaPrecuenta(req.params.id, req.params.itemId, req.body?.motivo, req.user.sub);
+  res.json({ message: 'Línea quitada de la cuenta.', data });
+}));
+
+/** 29-oct-2026 · Devuelve al cobro una orden apartada (reaparece como trabajo por cobrar). */
+router.delete('/exclusiones/:ordenId/:profesionalId', requireRole('admin'), asyncHandler(async (req, res) => {
+  await restaurarExclusion(req.params.ordenId, req.params.profesionalId);
+  res.json({ message: 'La orden vuelve a estar por cobrar. Genere la cuenta para incluirla.' });
 }));
 
 /** PRE-04 · Envía la pre-cuenta al profesional (PDF + enlace de aceptación). */

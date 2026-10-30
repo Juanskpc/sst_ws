@@ -9,6 +9,7 @@ import {
   boton, enlaceCrudo,
 } from '../../services/email-layout.service.js';
 import { enPesosCO, fechaDiaCO, horasConUnidad } from '../../utils/formato.js';
+import { referenciaOrden } from '../../utils/referencia-orden.js';
 
 /** Estados de una pre-cuenta. Desde aceptada/rechazada no se regenera sola. */
 export const ESTADOS_PRECUENTA = ['generada', 'enviada', 'aceptada', 'rechazada'];
@@ -357,10 +358,16 @@ export async function generarPrecuentas({ periodo, profesionalId = null, precuen
   params.push(rehacer?.id ?? null);
   const iRehacer = params.length;
   const trabajo = await pool.query(
-    `SELECT h.*, p.valor_hora AS valor_hora_base
+    // 29-oct-2026 · De la orden salen además su referencia ante la ARL y el tema del registro de asistencia.
+    `SELECT h.*, p.valor_hora AS valor_hora_base,
+            o.codigo_cronograma, o.secuencia, o.numero_orden, o.codigo, o.tema_actividad
        FROM sst.vw_horas_ejecutadas h
        JOIN sst.profesionales p ON p.id = h.profesional_id
+       JOIN sst.ordenes_servicio o ON o.id = h.orden_id
       WHERE h.soportes_aceptados_en IS NOT NULL
+        -- 29-oct-2026 · Apartada del cobro de este asesor (ya pagada por fuera de ORBITA).
+        AND NOT EXISTS (SELECT 1 FROM sst.cobro_exclusiones x
+                         WHERE x.orden_id = h.orden_id AND x.profesional_id = h.profesional_id)
         AND h.fecha_ejecucion BETWEEN $1::date AND $2::date${filtroProf}
         AND NOT EXISTS (
           SELECT 1
@@ -404,13 +411,19 @@ export async function generarPrecuentas({ periodo, profesionalId = null, precuen
 
     // 24-oct-2026 · Lo que se ajustó A MANO (valor hora o viáticos) sobrevive a «generar» otra vez:
     // si no, cada recálculo borraría el trabajo de quien revisó la cuenta.
+    // 29-oct-2026 · También las horas editadas y las líneas MANUALES (sin orden), que se vuelven a
+    // insertar tal cual.
     const manuales = new Map();
+    let lineasManuales = [];
     if (existente) {
       const r = await pool.query(
-        `SELECT orden_id, valor_hora_snapshot, viaticos, valor_hora_original FROM sst.precuenta_items WHERE precuenta_id=$1 AND ajuste_manual`,
+        `SELECT * FROM sst.precuenta_items WHERE precuenta_id=$1 AND (ajuste_manual OR manual)`,
         [existente.id],
       );
-      for (const m of r.rows) manuales.set(m.orden_id, m);
+      for (const m of r.rows) {
+        if (m.manual) lineasManuales.push(m);
+        else manuales.set(m.orden_id, m);
+      }
     }
 
     // Valora cada orden ANTES de abrir la transacción (son consultas de lectura).
@@ -431,8 +444,8 @@ export async function generarPrecuentas({ periodo, profesionalId = null, precuen
         hasta: fin,
         valorHoraBase: o.valor_hora_base,
       });
-      const horas = Number(o.horas) || 0;
       const manual = manuales.get(o.orden_id);
+      const horas = manual ? Number(manual.horas) || 0 : Number(o.horas) || 0;
       const valorFinal = manual ? Number(manual.valor_hora_snapshot) : valorHora;
       const monto = Math.round(horas * valorFinal);
       const viaticos = manual ? Math.round(Number(manual.viaticos) || 0) : Math.round(Number(o.viaticos_valor) || 0);
@@ -443,17 +456,31 @@ export async function generarPrecuentas({ periodo, profesionalId = null, precuen
         viaticos,
         orden_id: o.orden_id,
         orden_codigo: o.orden_codigo,
+        // 29-oct-2026 · Como la conoce la ARL («134803-67»): el código OS no le dice nada a JD&D ni al asesor.
+        orden_referencia: referenciaOrden(o, { separador: '-' }) || o.orden_codigo,
         empresa_nombre: o.empresa_nombre,
         arl_nombre: o.arl_nombre,
-        actividad: o.tipo_orden || o.tipo_actividad || o.actividad_economica,
+        // 29-oct-2026 · La actividad es el «Tema y/o actividad a realizar» del registro de asistencia
+        // (AT-028: tema escrito a mano, si no el título de la ARL), no el tipo de orden («Capacitación»).
+        actividad: o.tema_actividad?.trim() || o.tipo_actividad?.trim() || o.tipo_orden || o.actividad_economica,
         fecha_ejecucion: o.fecha_ejecucion,
         horas,
+        horas_original: manual ? manual.horas_original : null,
         valor_hora_snapshot: valorFinal,
-        valor_hora_original: manual ? (manual.valor_hora_original ?? valorHora) : null,
+        valor_hora_original: manual ? (manual.valor_hora_original ?? (Number(manual.valor_hora_snapshot) !== valorHora ? valorHora : null)) : null,
         ajuste_manual: !!manual,
+        manual: false,
         monto,
         origen_tarifa: manual ? 'manual' : origen,
+        ajustado_por: manual?.ajustado_por ?? null,
       });
+    }
+    // Las líneas manuales cuentan en los totales igual que las de una orden.
+    for (const m of lineasManuales) {
+      totalHoras += Number(m.horas) || 0;
+      totalHonorarios += Math.round(Number(m.monto) || 0);
+      totalViaticos += Math.round(Number(m.viaticos) || 0);
+      items.push({ ...m, manual: true });
     }
 
     // PRE-02 · Una cuenta de cobro en cero no es una cuenta de cobro. Pasa
@@ -517,11 +544,13 @@ export async function generarPrecuentas({ periodo, profesionalId = null, precuen
         await client.query(
           `INSERT INTO sst.precuenta_items
              (precuenta_id, orden_id, orden_codigo, empresa_nombre, arl_nombre, actividad,
-              fecha_ejecucion, horas, valor_hora_snapshot, monto, viaticos, origen_tarifa, ajuste_manual, valor_hora_original)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+              fecha_ejecucion, horas, valor_hora_snapshot, monto, viaticos, origen_tarifa, ajuste_manual, valor_hora_original,
+              orden_referencia, manual, horas_original, ajustado_por)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
           [pc.id, it.orden_id, it.orden_codigo, it.empresa_nombre, it.arl_nombre, it.actividad,
            it.fecha_ejecucion, it.horas, it.valor_hora_snapshot, it.monto, it.viaticos, it.origen_tarifa,
-           it.ajuste_manual, it.valor_hora_original]
+           it.ajuste_manual, it.valor_hora_original, it.orden_referencia, it.manual, it.horas_original ?? null,
+           it.ajustado_por ?? null]
         );
       }
       return pc;
@@ -538,61 +567,182 @@ export async function generarPrecuentas({ periodo, profesionalId = null, precuen
 }
 
 /**
+ * Una cuenta solo se toca mientras el profesional no la tiene delante: lo que ya vio no se mueve por
+ * debajo. Bloquea la fila hasta el final de la transacción.
+ */
+async function cuentaEditable(client, id) {
+  const pc = (await client.query(
+    `SELECT id, estado, profesional_id, periodo FROM sst.precuentas WHERE id=$1 FOR UPDATE`, [id],
+  )).rows[0];
+  if (!pc) throw notFound('Cuenta de cobro no encontrada');
+  if (pc.estado === 'aceptada') throw badRequest('El profesional ya aceptó esta cuenta: no se puede cambiar.');
+  if (pc.estado === 'enviada') {
+    throw badRequest('La cuenta ya se envió al profesional. Devuélvala a «generada» antes de cambiarla.');
+  }
+  return pc;
+}
+
+/**
+ * Rehace los totales desde las líneas. Una cuenta rechazada vuelve a «generada» (queda lista para
+ * enviar de nuevo, igual que al rehacerla).
+ */
+async function recalcularTotales(client, id) {
+  const t = (await client.query(
+    `SELECT COALESCE(sum(horas),0) AS horas, COALESCE(sum(monto),0) AS honorarios, COALESCE(sum(viaticos),0) AS viaticos
+       FROM sst.precuenta_items WHERE precuenta_id=$1`,
+    [id],
+  )).rows[0];
+  if (Number(t.honorarios) <= 0) throw badRequest('Los honorarios no pueden quedar en cero: una cuenta en cero no se emite.');
+  await client.query(
+    `UPDATE sst.precuentas
+        SET total_horas=$2, total_monto=$3, total_viaticos=$4, estado='generada', actualizado_en=now(),
+            enviado_en = CASE WHEN estado = 'rechazada' THEN NULL ELSE enviado_en END,
+            respondido_en = CASE WHEN estado = 'rechazada' THEN NULL ELSE respondido_en END
+      WHERE id=$1`,
+    [id, Number(t.horas), Number(t.honorarios) + Number(t.viaticos), Number(t.viaticos)],
+  );
+}
+
+/** Número de un campo del cuerpo: vacío = «no se tocó» (devuelve `actual`). */
+function numeroCampo(valor, actual) {
+  return valor == null || valor === '' ? Number(actual) || 0 : Number(valor);
+}
+
+/**
  * 24-oct-2026 (petición de JD&D) · Ajusta el valor hora y los viáticos de las líneas de una cuenta
  * ANTES de enviarla: el valor de la hora ya no es siempre el mismo (una risoterapia se pacta en
  * $120.000 o $150.000 con el asesor) y a veces hay que sumar viáticos que la orden no traía.
  *
- * `cambios`: [{ id, valor_hora?, viaticos? }]. Solo se puede mientras la cuenta no se haya enviado
- * ni aceptado: lo que el profesional ya vio no se mueve por debajo. Una cuenta rechazada vuelve a
- * «generada» (queda lista para enviar de nuevo, igual que al rehacerla).
+ * 29-oct-2026 · También las HORAS: la orden sale por 19 h y con el asesor se negociaron 9. Lo que
+ * traía la orden queda en `horas_original`. En una línea manual se corrige además su descripción.
+ *
+ * `cambios`: [{ id, horas?, valor_hora?, viaticos?, actividad?, empresa_nombre?, orden_referencia? }].
+ * Solo mientras la cuenta no se haya enviado ni aceptado (`cuentaEditable`).
  */
 export async function ajustarItemsPrecuenta(id, cambios = [], userId = null, { client: externo = null } = {}) {
   if (!Array.isArray(cambios) || !cambios.length) throw badRequest('No hay cambios que guardar.');
   return (externo ? (fn) => fn(externo) : withTransaction)(async (client) => {
-    const pc = (await client.query(`SELECT id, estado FROM sst.precuentas WHERE id=$1 FOR UPDATE`, [id])).rows[0];
-    if (!pc) throw notFound('Cuenta de cobro no encontrada');
-    if (pc.estado === 'aceptada') throw badRequest('El profesional ya aceptó esta cuenta: no se puede cambiar.');
-    if (pc.estado === 'enviada') {
-      throw badRequest('La cuenta ya se envió al profesional. Devuélvala a «generada» antes de cambiar sus valores.');
-    }
+    await cuentaEditable(client, id);
     for (const c of cambios) {
       const it = (await client.query(
-        `SELECT id, horas, valor_hora_snapshot, viaticos, valor_hora_original FROM sst.precuenta_items WHERE id=$1 AND precuenta_id=$2`,
+        `SELECT * FROM sst.precuenta_items WHERE id=$1 AND precuenta_id=$2`,
         [c.id, id],
       )).rows[0];
       if (!it) throw badRequest('Una de las líneas no pertenece a esta cuenta.');
-      const valorHora = c.valor_hora == null || c.valor_hora === '' ? Number(it.valor_hora_snapshot) : Number(c.valor_hora);
-      const viaticos = c.viaticos == null || c.viaticos === '' ? Number(it.viaticos) || 0 : Number(c.viaticos);
+      const horas = numeroCampo(c.horas, it.horas);
+      const valorHora = numeroCampo(c.valor_hora, it.valor_hora_snapshot);
+      const viaticos = numeroCampo(c.viaticos, it.viaticos);
+      if (!Number.isFinite(horas) || horas <= 0) {
+        throw badRequest('Las horas deben ser un número mayor a cero. Para no pagar una orden, quítela de la cuenta.');
+      }
       if (!Number.isFinite(valorHora) || valorHora < 0) throw badRequest('El valor hora debe ser un número igual o mayor a cero.');
       if (!Number.isFinite(viaticos) || viaticos < 0) throw badRequest('Los viáticos deben ser un número igual o mayor a cero.');
-      const monto = Math.round(Number(it.horas) * valorHora);
+      const cambioHoras = horas !== Number(it.horas);
       const cambioValor = Math.round(valorHora) !== Math.round(Number(it.valor_hora_snapshot));
       const cambioViaticos = Math.round(viaticos) !== Math.round(Number(it.viaticos) || 0);
-      if (!cambioValor && !cambioViaticos) continue;
+      // La descripción solo se reescribe en una línea manual: la de una orden sale de la orden.
+      const texto = (campo) => (it.manual && c[campo] != null ? String(c[campo]).trim().slice(0, 300) || null : it[campo]);
+      const actividad = texto('actividad');
+      const empresa = texto('empresa_nombre');
+      const referencia = texto('orden_referencia');
+      const cambioTexto = actividad !== it.actividad || empresa !== it.empresa_nombre || referencia !== it.orden_referencia;
+      if (!cambioHoras && !cambioValor && !cambioViaticos && !cambioTexto) continue;
+      if (it.manual && !actividad) throw badRequest('La línea manual necesita la descripción de la actividad.');
       await client.query(
         `UPDATE sst.precuenta_items
-            SET valor_hora_snapshot=$2, monto=$3, viaticos=$4, ajuste_manual=true,
-                valor_hora_original=COALESCE(valor_hora_original, $5), origen_tarifa='manual', ajustado_por=$6
+            SET horas=$2, valor_hora_snapshot=$3, monto=$4, viaticos=$5,
+                -- Una línea manual ya es manual de nacimiento: no se marca como «ajustada».
+                ajuste_manual = NOT manual,
+                horas_original = CASE WHEN manual OR NOT $9::boolean THEN horas_original ELSE COALESCE(horas_original, $6) END,
+                valor_hora_original = CASE WHEN manual OR NOT $10::boolean THEN valor_hora_original ELSE COALESCE(valor_hora_original, $7) END,
+                origen_tarifa='manual', ajustado_por=$8,
+                actividad=$11, empresa_nombre=$12, orden_referencia=$13
           WHERE id=$1`,
-        [it.id, valorHora, monto, Math.round(viaticos), it.valor_hora_snapshot, userId],
+        [it.id, horas, valorHora, Math.round(horas * valorHora), Math.round(viaticos), it.horas, it.valor_hora_snapshot,
+          userId, cambioHoras, cambioValor, actividad, empresa, referencia],
       );
     }
-    const t = (await client.query(
-      `SELECT COALESCE(sum(horas),0) AS horas, COALESCE(sum(monto),0) AS honorarios, COALESCE(sum(viaticos),0) AS viaticos
-         FROM sst.precuenta_items WHERE precuenta_id=$1`,
-      [id],
-    )).rows[0];
-    if (Number(t.honorarios) <= 0) throw badRequest('Los honorarios no pueden quedar en cero: una cuenta en cero no se emite.');
-    await client.query(
-      `UPDATE sst.precuentas
-          SET total_horas=$2, total_monto=$3, total_viaticos=$4, estado='generada', actualizado_en=now(),
-              enviado_en = CASE WHEN estado = 'rechazada' THEN NULL ELSE enviado_en END,
-              respondido_en = CASE WHEN estado = 'rechazada' THEN NULL ELSE respondido_en END
-        WHERE id=$1`,
-      [id, Number(t.horas), Number(t.honorarios) + Number(t.viaticos), Number(t.viaticos)],
-    );
+    await recalcularTotales(client, id);
     return obtenerPrecuenta(id, client);
   });
+}
+
+/**
+ * 29-oct-2026 (petición de JD&D) · Línea MANUAL, sin orden: la gestión de Maryzabel y Natalia
+ * Botina en Comtexaco y Gmaz no llega como orden de la ARL, pero se paga en la misma cuenta.
+ * Sobrevive a «generar» otra vez (se reinserta tal cual).
+ */
+export async function agregarLineaManual(id, b = {}, userId = null, { client: externo = null } = {}) {
+  const actividad = String(b.actividad ?? '').trim().slice(0, 300);
+  if (!actividad) throw badRequest('Escriba la actividad que se le paga al asesor.');
+  const horas = Number(b.horas);
+  const valorHora = Number(b.valor_hora);
+  const viaticos = numeroCampo(b.viaticos, 0);
+  if (!Number.isFinite(horas) || horas <= 0) throw badRequest('Las horas deben ser un número mayor a cero.');
+  if (!Number.isFinite(valorHora) || valorHora <= 0) throw badRequest('El valor hora debe ser mayor a cero.');
+  if (!Number.isFinite(viaticos) || viaticos < 0) throw badRequest('Los viáticos deben ser un número igual o mayor a cero.');
+  const fecha = /^\d{4}-\d{2}-\d{2}$/.test(String(b.fecha_ejecucion ?? '')) ? b.fecha_ejecucion : null;
+  const opcional = (v) => String(v ?? '').trim().slice(0, 300) || null;
+  return (externo ? (fn) => fn(externo) : withTransaction)(async (client) => {
+    const pc = await cuentaEditable(client, id);
+    const { inicio, fin } = rangoPeriodo(pc.periodo);
+    if (fecha && (fecha < inicio || fecha > fin)) {
+      throw badRequest(`La fecha debe caer dentro del mes de la cuenta (${periodoLargo(pc.periodo)}).`);
+    }
+    await client.query(
+      `INSERT INTO sst.precuenta_items
+         (precuenta_id, orden_id, manual, orden_referencia, actividad, empresa_nombre, arl_nombre, fecha_ejecucion,
+          horas, valor_hora_snapshot, monto, viaticos, origen_tarifa, ajustado_por)
+       VALUES ($1, NULL, true, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'manual', $11)`,
+      [id, opcional(b.orden_referencia), actividad, opcional(b.empresa_nombre), opcional(b.arl_nombre), fecha ?? fin,
+        horas, valorHora, Math.round(horas * valorHora), Math.round(viaticos), userId],
+    );
+    await recalcularTotales(client, id);
+    return obtenerPrecuenta(id, client);
+  });
+}
+
+/**
+ * 29-oct-2026 (petición de JD&D) · Quita una línea de la cuenta.
+ *
+ * El 20-oct se subieron soportes de órdenes ya PAGADAS por fuera de ORBITA (hacía falta el formato
+ * para facturar) y, al aceptarlas, entraron en la cuenta de octubre del asesor. Quitar una línea de
+ * orden la APARTA del cobro de ese asesor (`sst.cobro_exclusiones`): no vuelve al regenerar ni
+ * cuenta como pendiente, hasta que alguien la vuelva a incluir. Una línea manual simplemente se borra.
+ */
+export async function quitarLineaPrecuenta(id, itemId, motivo = null, userId = null, { client: externo = null } = {}) {
+  return (externo ? (fn) => fn(externo) : withTransaction)(async (client) => {
+    const pc = await cuentaEditable(client, id);
+    const it = (await client.query(
+      `SELECT * FROM sst.precuenta_items WHERE id=$1 AND precuenta_id=$2`, [itemId, id],
+    )).rows[0];
+    if (!it) throw badRequest('La línea no pertenece a esta cuenta.');
+    if (!it.manual && it.orden_id) {
+      await client.query(
+        `INSERT INTO sst.cobro_exclusiones (orden_id, profesional_id, motivo, excluido_por)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (orden_id, profesional_id)
+           DO UPDATE SET motivo = EXCLUDED.motivo, excluido_por = EXCLUDED.excluido_por, excluido_en = now()`,
+        [it.orden_id, pc.profesional_id, String(motivo ?? '').trim().slice(0, 300) || 'Ya pagada por fuera de ORBITA', userId],
+      );
+    }
+    await client.query(`DELETE FROM sst.precuenta_items WHERE id=$1`, [itemId]);
+    // Si era la última línea con honorarios, `recalcularTotales` lo impide (y se deshace todo).
+    await recalcularTotales(client, id);
+    return obtenerPrecuenta(id, client);
+  });
+}
+
+/**
+ * Vuelve a incluir en el cobro una orden apartada. No la mete en ninguna cuenta: reaparece como
+ * trabajo por cobrar y entra la próxima vez que se genere.
+ */
+export async function restaurarExclusion(ordenId, profesionalId, client = pool) {
+  const r = await client.query(
+    `DELETE FROM sst.cobro_exclusiones WHERE orden_id=$1 AND profesional_id=$2 RETURNING orden_id`,
+    [ordenId, profesionalId],
+  );
+  if (!r.rows[0]) throw notFound('Esa orden no estaba apartada del cobro.');
 }
 
 /** Pre-cuenta + sus ítems, o 404. */
@@ -600,10 +750,33 @@ export async function obtenerPrecuenta(id, client = pool) {
   const pc = (await client.query(`SELECT * FROM sst.vw_precuentas WHERE id=$1`, [id])).rows[0];
   if (!pc) throw notFound('Cuenta de cobro no encontrada');
   const items = await client.query(
-    `SELECT * FROM sst.precuenta_items WHERE precuenta_id=$1 ORDER BY fecha_ejecucion, orden_codigo`,
+    // Las manuales al final: primero lo que respalda una orden.
+    `SELECT * FROM sst.precuenta_items WHERE precuenta_id=$1 ORDER BY manual, fecha_ejecucion, orden_codigo`,
     [id]
   );
-  return { ...pc, items: items.rows };
+  // 29-oct-2026 · Las órdenes de este asesor y mes apartadas del cobro, para poder devolverlas.
+  const { inicio, fin } = rangoPeriodo(pc.periodo);
+  const excluidas = await client.query(
+    `SELECT x.orden_id, x.profesional_id, x.motivo, x.excluido_en, o.empresa_nombre,
+            o.codigo_cronograma, o.secuencia, o.numero_orden, o.codigo,
+            COALESCE(NULLIF(btrim(o.tema_actividad), ''), o.tipo_actividad) AS actividad,
+            COALESCE(o.fecha_ejecucion, o.fecha_programada, o.actualizado_en)::date AS fecha_ejecucion
+       FROM sst.cobro_exclusiones x
+       JOIN sst.ordenes_servicio o ON o.id = x.orden_id
+      WHERE x.profesional_id = $1
+        AND COALESCE(o.fecha_ejecucion, o.fecha_programada, o.actualizado_en)::date BETWEEN $2::date AND $3::date
+      ORDER BY fecha_ejecucion, o.codigo`,
+    [pc.profesional_id, inicio, fin],
+  );
+  return {
+    ...pc,
+    items: items.rows,
+    excluidas: excluidas.rows.map(({ codigo_cronograma, secuencia, numero_orden, codigo, ...x }) => ({
+      ...x,
+      orden_codigo: codigo,
+      orden_referencia: referenciaOrden({ codigo_cronograma, secuencia, numero_orden, codigo }, { separador: '-' }),
+    })),
+  };
 }
 
 /**
@@ -634,7 +807,8 @@ const MAX_ORDENES_CORREO = 8;
 
 function lineasOrdenes(items = []) {
   const lineas = items.slice(0, MAX_ORDENES_CORREO).map((it) => [
-    it.orden_codigo,
+    it.orden_referencia || it.orden_codigo,
+    it.actividad,
     it.empresa_nombre,
     diaEjecucion(it.fecha_ejecucion),
     horasConUnidad(it.horas),

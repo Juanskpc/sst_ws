@@ -3274,3 +3274,40 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_centro_costo_arl ON sst.centros_costo (arl_
 ALTER TABLE sst.precuenta_items ADD COLUMN IF NOT EXISTS ajuste_manual BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE sst.precuenta_items ADD COLUMN IF NOT EXISTS valor_hora_original NUMERIC(12,2);
 ALTER TABLE sst.precuenta_items ADD COLUMN IF NOT EXISTS ajustado_por UUID REFERENCES sst.usuarios(id) ON DELETE SET NULL;
+
+-- 2026-10-29-cuenta-cobro-lineas.sql (los rellenos de datos viven solo en la migración)
+ALTER TABLE sst.precuenta_items ALTER COLUMN orden_id DROP NOT NULL;
+ALTER TABLE sst.precuenta_items ADD COLUMN IF NOT EXISTS manual BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE sst.precuenta_items ADD COLUMN IF NOT EXISTS orden_referencia TEXT;
+-- Horas que traía la orden antes de editarlas (para ver cuánto se movió).
+ALTER TABLE sst.precuenta_items ADD COLUMN IF NOT EXISTS horas_original NUMERIC(8,2);
+
+DO $$ BEGIN
+  ALTER TABLE sst.precuenta_items
+    ADD CONSTRAINT precuenta_items_orden_o_manual CHECK (orden_id IS NOT NULL OR manual);
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+CREATE TABLE IF NOT EXISTS sst.cobro_exclusiones (
+  orden_id       UUID NOT NULL REFERENCES sst.ordenes_servicio(id) ON DELETE CASCADE,
+  profesional_id UUID NOT NULL REFERENCES sst.profesionales(id) ON DELETE CASCADE,
+  motivo         TEXT,
+  excluido_por   UUID REFERENCES sst.usuarios(id) ON DELETE SET NULL,
+  excluido_en    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (orden_id, profesional_id)
+);
+
+-- Mismas columnas que antes (CREATE OR REPLACE basta): solo se suma la exclusión.
+CREATE OR REPLACE VIEW sst.vw_horas_por_cobrar AS
+SELECT h.* FROM sst.vw_horas_ejecutadas h
+ WHERE h.soportes_aceptados_en IS NOT NULL
+   -- 5-oct-2026 · "Ya cobrada" se mira POR PROFESIONAL: con coasesores la misma
+   -- orden entra en la cuenta de cada uno, y que uno ya la tenga en la suya no
+   -- puede dar por cobradas las horas del otro.
+   AND NOT EXISTS (
+     SELECT 1 FROM sst.precuenta_items i
+       JOIN sst.precuentas pc ON pc.id = i.precuenta_id
+      WHERE i.orden_id = h.orden_id AND pc.profesional_id = h.profesional_id)
+   -- 29-oct-2026 · Apartada del cobro (ya pagada por fuera de ORBITA).
+   AND NOT EXISTS (
+     SELECT 1 FROM sst.cobro_exclusiones x
+      WHERE x.orden_id = h.orden_id AND x.profesional_id = h.profesional_id);

@@ -460,6 +460,7 @@ router.get('/precuenta/:token', asyncHandler(async (req, res) => {
       respondido_en: pc.respondido_en,
       items: pc.items.map((i) => ({
         orden_codigo: i.orden_codigo,
+        orden_referencia: i.orden_referencia,
         empresa_nombre: i.empresa_nombre,
         arl_nombre: i.arl_nombre,
         actividad: i.actividad,
