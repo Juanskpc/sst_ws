@@ -43,6 +43,27 @@ export const VALOR_POR_DEFECTO = 71457;
 /** Roles que aprueban el cobro: los de operación (decisión del 30-sep-2026). */
 export const ROLES_APRUEBAN = ['admin', 'administrativo'];
 
+/**
+ * 3-nov-2026 · Los HONORARIOS de una orden en SQL, con la MISMA regla que `calcular()`:
+ * con horas y valor hora, horas × valor hora; sin horas, el valor escrito. Lo usan el
+ * cruce con la prefactura y la facturación para comparar y cobrar exactamente lo que
+ * operación ve y aprueba en el modal de Cobro.
+ *
+ * Antes leían `valor_total` a secas, y el formulario de edición de la orden deja
+ * escribir ahí cualquier cifra: en OS-2026-0009 quedó el total CON transporte
+ * (197.695) mientras el modal, que multiplica, seguía enseñando 142.914 + 54.781.
+ * El cruce sumaba el transporte dos veces (252.476) y marcaba "Valor distinto" sin
+ * que nada en pantalla explicara por qué.
+ */
+export const sqlHonorarios = (a = 'o') =>
+  `(CASE WHEN ${a}.valor_unitario IS NOT NULL AND COALESCE(${a}.horas_asignadas, 0) <> 0
+         THEN round(${a}.horas_asignadas * ${a}.valor_unitario, 2)
+         ELSE ${a}.valor_total END)`;
+
+/** Honorarios + los cinco gastos `cobro_*`: el TOTAL del modal de Cobro, en SQL. */
+export const sqlTotalCobro = (a = 'o') =>
+  `(${sqlHonorarios(a)} + ${GASTOS.map((g) => `COALESCE(${a}.${g.columna}, 0)`).join(' + ')})`;
+
 const num = (v) => (v == null || v === '' ? null : Number(v));
 const sumar = (...vs) => Number(deCentavos(vs.reduce((s, v) => s + aCentavos(v ?? 0), 0)));
 /** Un peso de diferencia es redondeo, no un desacuerdo (mismo criterio que la prefactura). */
@@ -92,15 +113,24 @@ const SQL_ORDEN = `
  * cuando la orden no tiene. `precio_sugerido` NO entra en el total: un total
  * calculado con una tarifa que nadie ha confirmado no se puede aprobar.
  */
+/**
+ * Con horas y valor hora, los honorarios salen de multiplicar: así no quedan
+ * dos cifras que puedan contradecirse. Sin horas (actividad por unidad) manda
+ * el valor escrito. Misma regla que `sqlHonorarios`; la facturación la usa para
+ * no cobrar una cifra distinta de la que se aprobó.
+ */
+export function honorariosDe(o) {
+  const horas = num(o.horas_asignadas);
+  const valorHora = num(o.valor_unitario);
+  return valorHora != null && horas
+    ? Number(deCentavos(aCentavos(horas * valorHora)))
+    : num(o.valor_total);
+}
+
 function calcular(o) {
   const horas = num(o.horas_asignadas);
   const valorHora = num(o.valor_unitario);
-  // Con horas y valor hora, los honorarios salen de multiplicar: así no quedan
-  // dos cifras que puedan contradecirse. Sin horas (actividad por unidad) manda
-  // el valor escrito.
-  const honorarios = valorHora != null && horas
-    ? Number(deCentavos(aCentavos(horas * valorHora)))
-    : num(o.valor_total);
+  const honorarios = honorariosDe(o);
   const gastos = Object.fromEntries(GASTOS.map((g) => [g.clave, num(o[g.columna]) ?? 0]));
   const totalGastos = sumar(...Object.values(gastos));
   const total = honorarios != null ? sumar(honorarios, totalGastos) : null;

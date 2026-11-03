@@ -1,5 +1,6 @@
 import { pool, withTransaction } from '../../config/db.js';
 import { badRequest } from '../../utils/httpError.js';
+import { sqlTotalCobro } from '../orders/cobro-orden.service.js';
 
 /**
  * T0-09 · Los cinco resultados del cruce prefactura ↔ Orbita, en el orden en
@@ -31,6 +32,8 @@ function clasificar(fila, orden, numeroPrefactura) {
   if (orden.estado !== 'FINALIZADA') return { resultado: RESULTADOS.NO_FINALIZADA, orden };
   // 30-sep-2026 · `valor_total` llega aquí como honorarios + gastos de cobro
   // (ver las consultas): `valor_a_facturar` de Bolívar también los incluye.
+  // 3-nov-2026 · Es el MISMO total del modal de Cobro (`sqlTotalCobro`), no
+  // `valor_total` + gastos: lo que se compara es lo que operación ve y aprueba.
   if (orden.valor_total != null && difieren(orden.valor_total, fila.valor_a_facturar)) {
     return { resultado: RESULTADOS.VALOR_DISTINTO, orden };
   }
@@ -50,9 +53,7 @@ export async function cruzarFilas(filas, numeroPrefactura, client = pool, arl = 
   for (const fila of filas) {
     const r = await client.query(
       `SELECT o.id, o.codigo, o.estado, o.estado_arl::text AS estado_arl,
-              o.numero_prefactura, (o.valor_total + COALESCE(o.cobro_transporte,0) + COALESCE(o.cobro_alojamiento,0)
-                + COALESCE(o.cobro_alimentacion,0) + COALESCE(o.cobro_tiempo_muerto,0)
-                + COALESCE(o.cobro_material,0)) AS valor_total, o.empresa_nombre
+              o.numero_prefactura, ${sqlTotalCobro()} AS valor_total, o.empresa_nombre
          FROM sst.ordenes_servicio o
          JOIN sst.arls a ON a.id = o.arl_id
         WHERE ${filtroIdentidad}`,
@@ -131,9 +132,7 @@ export async function aplicarPrefactura({ datos, filasMarcadas, nombreArchivo, u
       const orden = (await client.query(
         `SELECT o.id, o.codigo, a.nombre AS arl_nombre, o.estado::text AS estado,
                 o.estado_arl::text AS estado_arl, o.numero_prefactura,
-                (o.valor_total + COALESCE(o.cobro_transporte,0) + COALESCE(o.cobro_alojamiento,0)
-                + COALESCE(o.cobro_alimentacion,0) + COALESCE(o.cobro_tiempo_muerto,0)
-                + COALESCE(o.cobro_material,0)) AS valor_total
+                ${sqlTotalCobro()} AS valor_total
            FROM sst.ordenes_servicio o JOIN sst.arls a ON a.id = o.arl_id
           WHERE ${filtroIdentidad} FOR UPDATE OF o`,
         [fila.codigo_cronograma, fila.secuencia]

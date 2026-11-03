@@ -3,6 +3,7 @@ import { zodResponseFormat } from 'openai/helpers/zod';
 import { PdfExtractor } from '../../infrastructure/text/pdf-extractor.js';
 import { cargarConfigOpenAIExtraccion } from '../../infrastructure/openai/openai-extraction.config.js';
 import { PrefacturaSchema } from './prefacturas.schema.js';
+import { leerImportesPorPosicion } from './prefacturas.tabla.js';
 import { SYSTEM_PROMPT_PREFACTURA, construirMensajePrefactura } from './prefacturas.prompt.js';
 import { parseFechaCO } from '../../utils/parseo.js';
 import { badRequest } from '../../utils/httpError.js';
@@ -74,10 +75,43 @@ export async function extraerPrefactura(buffer) {
   }
   const datos = choice.message.parsed;
 
+  // 3-nov-2026 · Los IMPORTES de cada fila se toman de su posición en la página,
+  // no de la IA: con las columnas revueltas del texto plano, el modelo cambiaba
+  // "Vlr Actividad" por "Vlr a Facturar" en las filas con transporte (ver
+  // `prefacturas.tabla.js`). La IA sigue leyendo encabezado, empresa y código de
+  // actividad; si una fila no se pudo leer por posición, se queda con lo suyo.
+  let porPosicion = new Map();
+  try {
+    porPosicion = await leerImportesPorPosicion(buffer);
+  } catch (causa) {
+    console.warn('[prefactura] no se pudieron leer los importes por posición; quedan los de la IA:', causa?.message);
+  }
+
+  const filas = datos.filas.map((f) => {
+    const codigo_cronograma = String(f.codigo_cronograma || '').trim();
+    const secuencia = String(f.secuencia || '').trim();
+    const leida = porPosicion.get(`${codigo_cronograma}|${secuencia}`);
+    const importes = leida ?? f;
+    return {
+      codigo_cronograma,
+      secuencia,
+      nit_empresa: f.nit_empresa,
+      razon_social: f.razon_social,
+      actividad_programa: f.actividad_programa,
+      valor_actividad: centavos(importes.valor_actividad),
+      alimentacion: centavos(importes.alimentacion),
+      alojamiento: centavos(importes.alojamiento),
+      transporte: centavos(importes.transporte),
+      material: centavos(importes.material),
+      tiempo_muerto: centavos(importes.tiempo_muerto),
+      valor_a_facturar: centavos(importes.valor_a_facturar),
+    };
+  });
+
   // T0-09 · Control determinista DESPUÉS de la IA: la suma de "valor a facturar"
   // debe cuadrar con el total del encabezado. No bloquea —la fila con el dato
   // torcido puede seguir siendo útil— pero la vista previa lo marca en rojo.
-  const sumaFilas = centavos(datos.filas.reduce((acc, f) => acc + (Number(f.valor_a_facturar) || 0), 0));
+  const sumaFilas = centavos(filas.reduce((acc, f) => acc + (Number(f.valor_a_facturar) || 0), 0));
   const valorTotal = centavos(datos.valor_total);
 
   return {
@@ -87,20 +121,7 @@ export async function extraerPrefactura(buffer) {
     fecha_corte: parseFechaCO(datos.fecha_corte),
     valor_total: valorTotal,
     nit_proveedor: datos.nit_proveedor,
-    filas: datos.filas.map((f) => ({
-      codigo_cronograma: String(f.codigo_cronograma || '').trim(),
-      secuencia: String(f.secuencia || '').trim(),
-      nit_empresa: f.nit_empresa,
-      razon_social: f.razon_social,
-      actividad_programa: f.actividad_programa,
-      valor_actividad: centavos(f.valor_actividad),
-      alimentacion: centavos(f.alimentacion),
-      alojamiento: centavos(f.alojamiento),
-      transporte: centavos(f.transporte),
-      material: centavos(f.material),
-      tiempo_muerto: centavos(f.tiempo_muerto),
-      valor_a_facturar: centavos(f.valor_a_facturar),
-    })),
+    filas,
     suma_filas: sumaFilas,
     cuadra: Math.abs(sumaFilas - valorTotal) < 1,
   };

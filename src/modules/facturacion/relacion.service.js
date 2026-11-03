@@ -1,6 +1,7 @@
 import { pool } from '../../config/db.js';
 import { badRequest } from '../../utils/httpError.js';
 import { aCentavos, deCentavos } from '../../utils/dinero.js';
+import { honorariosDe } from '../orders/cobro-orden.service.js';
 
 /**
  * A1-03 (FEL-01, FEL-02) · Relación a facturar y agrupación por pagador.
@@ -117,7 +118,11 @@ function valorReferencia(o) {
   const horas = Number(o.horas_asignadas) || 0;
   // Aprobado por operación: manda lo aprobado (honorarios de la orden). Los
   // gastos van aparte, en `gastos`, y el borrador los factura en su propio ítem.
-  if (o.cobro_aprobado_en && o.valor_total != null) return { valor: Number(o.valor_total), origen: 'APROBADO' };
+  // 3-nov-2026 · Los honorarios con la regla del modal de Cobro (horas × valor
+  // hora), no `valor_total` a secas: si alguien escribió ahí el total con gastos
+  // desde la edición de la orden, se facturaban honorarios inflados MÁS los gastos.
+  const aprobados = o.cobro_aprobado_en ? honorariosDe(o) : null;
+  if (aprobados != null) return { valor: aprobados, origen: 'APROBADO' };
   if (o.tarifa_valor != null) {
     const centavos = o.tarifa_unidad === 'UNIDAD' ? aCentavos(o.tarifa_valor) : aCentavos(horas * Number(o.tarifa_valor));
     return { valor: Number(deCentavos(centavos)), origen: 'TARIFA' };
