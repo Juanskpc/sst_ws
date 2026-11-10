@@ -547,6 +547,8 @@ export async function cambiarPagoBorrador(documentoId, body, usuarioId, dbClient
 const DOCUMENTO_SELECT = `
   d.id, d.tipo, d.estado, d.reference_code, d.numero, d.prefijo,
   d.tercero_id, COALESCE(t.razon_social, btrim(concat_ws(' ', t.nombres, t.apellidos))) AS tercero_nombre,
+  -- 10-nov-2026 · Para precargar el modal «Enviar la factura al cliente».
+  t.correo_facturacion AS tercero_correo_facturacion,
   d.prefactura_id,
   -- 20-oct-2026 · Una factura que une varias prefacturas no guarda una sola: las
   -- suyas salen de sus órdenes («161906, 162117, 162187»).
