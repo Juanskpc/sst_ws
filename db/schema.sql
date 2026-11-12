@@ -2051,7 +2051,7 @@ CREATE TABLE IF NOT EXISTS sst.emisor (
 CREATE TABLE IF NOT EXISTS sst.resoluciones_numeracion (
   id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   tipo_documento    TEXT NOT NULL
-                      CHECK (tipo_documento IN ('FACTURA', 'NOTA_CREDITO', 'DOC_SOPORTE', 'NOTA_AJUSTE_DS', 'NOMINA')),
+                      CHECK (tipo_documento IN ('FACTURA', 'NOTA_CREDITO', 'DOC_SOPORTE', 'NOTA_AJUSTE_DS', 'NOMINA', 'NOTA_AJUSTE_NOMINA')),
   prefijo           TEXT,
   -- Sin tope (NULL) es lo que Factus devuelve para los rangos de notas del sandbox.
   desde             BIGINT,
@@ -2063,12 +2063,19 @@ CREATE TABLE IF NOT EXISTS sst.resoluciones_numeracion (
   fecha_desde       DATE,
   fecha_hasta       DATE,
   -- id del rango en Factus; NULL si algún día se cargara una resolución a mano.
-  factus_rango_id   BIGINT UNIQUE,
+  -- Solo los de facturación: la emisión lo manda como numbering_range_id.
+  factus_rango_id   BIGINT,
+  -- De qué lista del proveedor vino: la de facturación o la de nómina (/payrolls), y el id del
+  -- rango como texto (en la de nómina no es numérico). Única por las dos (12-nov-2026).
+  factus_lista      TEXT NOT NULL DEFAULT 'FACTURACION'
+                      CONSTRAINT resoluciones_numeracion_factus_lista_check CHECK (factus_lista IN ('FACTURACION', 'NOMINA')),
+  rango_ref         TEXT,
   activa            BOOLEAN NOT NULL DEFAULT true,
   sincronizada_en   TIMESTAMPTZ,
   creado_en         TIMESTAMPTZ NOT NULL DEFAULT now(),
   actualizado_en    TIMESTAMPTZ NOT NULL DEFAULT now(),
-  CHECK (desde IS NULL OR hasta IS NULL OR desde <= hasta)
+  CHECK (desde IS NULL OR hasta IS NULL OR desde <= hasta),
+  CONSTRAINT resoluciones_numeracion_lista_ref_key UNIQUE (factus_lista, rango_ref)
 );
 CREATE INDEX IF NOT EXISTS idx_resoluciones_tipo ON sst.resoluciones_numeracion (tipo_documento, activa);
 

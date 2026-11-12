@@ -136,7 +136,9 @@ const FORMATOS = {
     casillas: () => CASILLAS_ASISTENCIA_COLPATRIA, valores: valoresAsistenciaColpatria,
     editables: () => EDITABLES_ASISTENCIA_AXA,
     // 16-oct · Primera raya «FIRMA EXPOSITOR(ES)» (la del profesional que dicta).
-    firma: [[0, 165, 138, 190, 26]],
+    // 12-nov · Más grande (JD&D): cruza la raya hacia abajo, como una firma a mano, sin
+    // llegar al renglón del siguiente profesional.
+    firma: [[0, 165, 133, 190, 34]],
   },
   fichaAxa: {
     archivo: 'colpatria/ficha-gestion.pdf', modo: 'acroform', alcance: 'orden',
@@ -221,9 +223,12 @@ const FORMATOS = {
     marcas: marcasRegistroEjecucionColmena,
     observaciones: { renglones: () => RENGLONES_OBS_REGISTRO_EJECUCION },
     editables: () => EDITABLES_REGISTRO_EJECUCION_COLMENA,
-    // 16-oct · Raya «FIRMA» del pie, junto al nombre del profesional ejecutor. Hay
-    // poco alto entre la raya y el recuadro de observaciones: la firma sale pequeña.
-    firma: [[0, 500, 95, 160, 15]],
+    // 16-oct · Raya «FIRMA» del pie, junto al nombre del profesional ejecutor.
+    // 12-nov · JD&D: «las firmas salen super pequeñas». Entre la raya y el recuadro
+    // de observaciones solo hay 14 pt, así que la firma ahora se monta sobre el borde
+    // inferior del recuadro, como una firma a mano (el 3.er renglón de observaciones
+    // se acortó para no chocar con ella). Por debajo no puede bajar: está el rótulo FIRMA.
+    firma: [[0, 497, 93, 166, 28]],
   },
   evaluacionColmena: {
     archivo: 'colmena/evaluacion.pdf', modo: 'plano', alcance: 'sesion',
@@ -825,7 +830,8 @@ const EDITABLES_EVALUACION_COLMENA = [
  * API hace que eso sea raro).
  */
 const RENGLONES_OBS_SPM38 = [[36, 503, 540], [36, 493, 540], [36, 483, 540], [36, 473, 540]];
-const RENGLONES_OBS_REGISTRO_EJECUCION = [[109, 132, 568], [109, 123, 568], [109, 114, 568]];
+// El 3.er renglón termina antes de la firma, que se monta sobre el recuadro (12-nov-2026).
+const RENGLONES_OBS_REGISTRO_EJECUCION = [[109, 132, 568], [109, 123, 568], [109, 114, 425]];
 const RENGLONES_OBS_AT028 = [[185, 99, 400], [32, 83, 555], [32, 67, 555]];
 
 /** Centro de los hexágonos de Modalidad y Tipo de actividad del PSP-F-006 V3. */

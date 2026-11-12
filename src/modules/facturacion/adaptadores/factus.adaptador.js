@@ -708,15 +708,32 @@ export class FactusAdaptador extends PuertoFacturacionElectronica {
 
   /** GET /v2/numbering-ranges/payrolls · rangos de nómina y de nota de ajuste de nómina. */
   async listarRangosNomina() {
-    const r = await request('GET', '/v2/numbering-ranges/payrolls', undefined, { perfil: 'nomina' });
-    const filas = Array.isArray(r.data) ? r.data : (r.data?.data ?? []);
-    return filas.map((x) => ({
-      proveedorId: x.id,
-      documentoProveedor: x.document,
-      esNotaAjuste: /ajuste/i.test(String(x.document)),
-      prefijo: x.prefix ?? null,
-      actual: Number(x.current ?? 0),
-      activo: Boolean(x.is_active) && !x.deleted_at,
-    }));
+    const filas = [];
+    for (let pagina = 1, ultima = 1; pagina <= ultima; pagina++) {
+      const r = await request('GET', '/v2/numbering-ranges/payrolls', undefined, { perfil: 'nomina', query: { page: pagina } });
+      filas.push(...(Array.isArray(r.data) ? r.data : (r.data?.data ?? [])));
+      ultima = r.data?.pagination?.last_page ?? 1;
+    }
+    // Mismos campos que `listarRangosNumeracion` para que la sincronización de
+    // Parametrización los guarde igual (12-nov-2026). Los rangos de nómina no llevan
+    // resolución de la DIAN: desde/hasta/fechas suelen venir vacíos.
+    return filas.map((x) => {
+      const esNotaAjuste = /ajuste/i.test(String(x.document)) || String(x.document).trim() === '27';
+      return {
+        // Aquí el id es texto (p. ej. "01m48rk686vkmcfb2rewgx2m57"), no un número.
+        proveedorId: String(x.id),
+        tipoDocumento: esNotaAjuste ? 'NOTA_AJUSTE_NOMINA' : 'NOMINA',
+        documentoProveedor: x.document,
+        esNotaAjuste,
+        prefijo: x.prefix ?? null,
+        desde: x.from == null ? null : Number(x.from),
+        hasta: x.to == null ? null : Number(x.to),
+        actual: Number(x.current ?? 0),
+        numeroResolucion: x.resolution_number || null,
+        fechaDesde: x.start_date ?? null,
+        fechaHasta: x.end_date ?? null,
+        activo: Boolean(x.is_active) && !x.deleted_at,
+      };
+    });
   }
 }

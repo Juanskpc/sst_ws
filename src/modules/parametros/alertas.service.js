@@ -42,7 +42,8 @@ export function umbralDeVencimiento(dias) {
 
 const nombreDocumento = {
   FACTURA: 'factura de venta', NOTA_CREDITO: 'nota crédito', DOC_SOPORTE: 'documento soporte',
-  NOTA_AJUSTE_DS: 'nota de ajuste', NOMINA: 'nómina electrónica',
+  NOTA_AJUSTE_DS: 'nota de ajuste del documento soporte', NOMINA: 'nómina electrónica',
+  NOTA_AJUSTE_NOMINA: 'nota de ajuste de nómina',
 };
 
 async function avisar(client, { tipo, titulo, mensaje, clave, datos, operacion = false }) {
