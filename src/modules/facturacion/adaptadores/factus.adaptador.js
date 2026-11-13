@@ -669,7 +669,8 @@ export class FactusAdaptador extends PuertoFacturacionElectronica {
         salary: dosDec(t.salario),
         entry_date: t.fechaIngreso,
         ...(t.fechaRetiro ? { retirement_date: t.fechaRetiro } : {}),
-        days_worked: dosDec(datos.liquidacion.diasTrabajados),
+        // Entero: el proveedor de producción rechaza "12.00" («debe ser un número entero»); el sandbox lo aceptaba (13-nov-2026).
+        days_worked: Math.round(Number(datos.liquidacion.diasTrabajados)),
       },
       accruals,
       deductions,
