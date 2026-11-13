@@ -294,7 +294,14 @@ export async function emitirLiquidacion(id, usuarioId) {
     return obtenerLiquidacion(id, client);
   });
 
-  const volverABorrador = (mensaje) => pool.query(`UPDATE sst.nomina_liquidaciones SET estado = 'BORRADOR', reference_code = NULL WHERE id = $1`, [id]).then(() => { throw badRequest(mensaje); });
+  // 13-nov-2026 · El motivo se GUARDA (errores) y va al registro del servidor: entre el 3 y el 12-nov la
+  // contadora intentó emitir 9 veces sin rango de nómina en el proveedor y el motivo solo se vio en su
+  // pantalla, sin rastro para revisarlo después. Al volver a emitir se limpia.
+  const volverABorrador = (mensaje) => {
+    console.error(`[nomina] Liquidación ${id} no emitida: ${mensaje}`);
+    return pool.query(`UPDATE sst.nomina_liquidaciones SET estado = 'BORRADOR', reference_code = NULL, errores = $2 WHERE id = $1`, [id, JSON.stringify([mensaje])])
+      .then(() => { throw badRequest(mensaje); });
+  };
   const empleado = await obtenerEmpleado(liq.empleado_id);
   const faltan = faltantesParaNomina(empleado);
   if (faltan.length) return volverABorrador(`A ${empleado.nombre} le falta ${faltan.join(', ')} para emitirle la nómina. Complete su ficha en Terceros.`);
