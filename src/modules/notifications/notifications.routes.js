@@ -44,10 +44,20 @@ router.get('/', asyncHandler(async (req, res) => {
   // 13-nov-2026 · Buscador de la campanita (JD&D: «son bastantes»). Busca en el título y el
   // mensaje de TODA la bandeja del recorte, no solo en las 50 últimas que se pintan sin buscar.
   const patron = patronBusqueda(req.query.q);
+  // También en la ORDEN del aviso (`datos.orden_id`): los avisos anteriores al 26-oct nombran la
+  // orden por su código interno («OS-2026-0066») y no por el número de la ARL, y JD&D busca los
+  // soportes «con número de orden o nombre de la empresa».
   const r = await pool.query(
-    `SELECT * FROM sst.notificaciones
+    `SELECT * FROM sst.notificaciones n
       WHERE usuario_id=$1 ${recorte(req.query.estado)}
-        ${patron ? `AND (titulo ILIKE $2 OR mensaje ILIKE $2)` : ''}
+        ${patron ? `AND (titulo ILIKE $2 OR mensaje ILIKE $2 OR EXISTS (
+          SELECT 1 FROM sst.ordenes_servicio o
+           WHERE o.id::text = n.datos->>'orden_id'
+             AND (o.numero_orden ILIKE $2
+                  OR regexp_replace(o.numero_orden, '\\s+', '', 'g') ILIKE $2
+                  OR (o.codigo_cronograma || '-' || coalesce(o.secuencia, '')) ILIKE $2
+                  OR o.codigo ILIKE $2
+                  OR o.empresa_nombre ILIKE $2)))` : ''}
       ORDER BY creado_en DESC LIMIT ${patron ? 100 : 50}`,
     patron ? [req.user.sub, patron] : [req.user.sub]
   );
