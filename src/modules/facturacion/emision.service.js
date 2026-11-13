@@ -6,6 +6,7 @@ import { proveedorFE } from './index.js';
 import { faltantesParaFacturar } from '../terceros/terceros.service.js';
 import { generarReferenceCode, obtenerBorrador } from './borrador.service.js';
 import { hoyCO } from '../../utils/formato.js';
+import { env } from '../../config/env.js';
 
 /**
  * A1-05 (FEL-10) · Emitir un documento contra Factus y conectar con el eje de
@@ -198,7 +199,8 @@ async function intentarEmision({ doc, items, retenciones, formaPagoCodigo, medio
     // así que nunca se manda "al aire"). "Reenviar al cliente" (envio.service.js)
     // es aparte, con el correo propio de Orbita, para reintentos o para
     // mandarlo a alguien distinto sin tocar la ficha del tercero.
-    enviarCorreo: true,
+    // 12-nov-2026 · Con el PDF propio, el correo lo pide ORBITA ya validada (envio.service.js).
+    enviarCorreo: !env.factus.correoConPdfPropio,
   });
 }
 
@@ -228,7 +230,17 @@ export function numeroCompleto(prefijo, numero) {
 async function finalizarValidado(documentoId, resultado, usuarioId) {
   const r = await finalizarValidadoTx(documentoId, resultado, usuarioId);
   await contabilizarTrasValidar(documentoId, usuarioId);
+  await enviarAlClienteTrasValidar(documentoId, usuarioId);
   return r;
+}
+
+/**
+ * 12-nov-2026 · El correo al cliente, con el PDF propio, sale por el proveedor una vez
+ * validado (ver `envio.service.js`). No lanza. Importación dinámica: envío importa de aquí.
+ */
+export async function enviarAlClienteTrasValidar(documentoId, usuarioId) {
+  const { enviarTrasValidar } = await import('./envio.service.js');
+  await enviarTrasValidar(documentoId, usuarioId);
 }
 
 /**

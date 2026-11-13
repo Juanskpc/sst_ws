@@ -7,10 +7,11 @@ import { proveedorFE } from './index.js';
 import { calcularDocumento } from './calculo.js';
 import { obtenerBorrador } from './borrador.service.js';
 import {
-  cargarDocumentoParaEmitir, construirReceptor, contabilizarTrasValidar, finalizarRechazado, numeroCompleto,
+  cargarDocumentoParaEmitir, construirReceptor, contabilizarTrasValidar, enviarAlClienteTrasValidar, finalizarRechazado, numeroCompleto,
   registrarFallaDeEnvio, registrarSinDecision, validarParaEmitir,
 } from './emision.service.js';
 import { hoyCO } from '../../utils/formato.js';
+import { env } from '../../config/env.js';
 
 /**
  * A2-01 (FEL-11) · Nota crédito sobre una factura VALIDADA.
@@ -244,7 +245,8 @@ async function intentarEmisionNota({ doc, items, retenciones, formaPagoCodigo, m
     montoAPagar: deCentavos(Math.round((Number(doc.subtotal) + Number(doc.total_iva)) * 100)),
     fechaVencimiento: doc.fecha_vencimiento,
     observacion: doc.observaciones || CAUSALES_NOTA_CREDITO[doc.causal],
-    enviarCorreo: true,
+    // 12-nov-2026 · Con el PDF propio, el correo lo pide ORBITA ya validada (envio.service.js).
+    enviarCorreo: !env.factus.correoConPdfPropio,
   });
 }
 
@@ -256,6 +258,8 @@ async function finalizarNotaValidada(notaId, resultado, usuarioId) {
   const r = await finalizarNotaValidadaTx(notaId, resultado, usuarioId);
   // B2-01 · Igual que la factura: se contabiliza después, sin arriesgar la validación.
   await contabilizarTrasValidar(notaId, usuarioId);
+  // 12-nov-2026 · Y el correo al cliente con el PDF propio (la NC93 salió sin retenciones).
+  await enviarAlClienteTrasValidar(notaId, usuarioId);
   return r;
 }
 

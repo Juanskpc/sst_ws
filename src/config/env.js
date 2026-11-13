@@ -81,6 +81,12 @@ export const env = {
     clientSecret: process.env.FACTUS_CLIENT_SECRET || '',
     username: process.env.FACTUS_USERNAME || '',
     password: process.env.FACTUS_PASSWORD || '',
+    // 12-nov-2026 · El correo al cliente de facturas y notas crédito sale con el PDF PROPIO
+    // de ORBITA (el del proveedor no imprime las retenciones). Se emite con send_email=false y,
+    // ya validado, ORBITA manda el correo oficial (asunto DIAN + ZIP con el AttachedDocument
+    // que da el proveedor) con nuestro PDF dentro del ZIP (envio.service.js). Con
+    // FACTUS_CORREO_PDF_PROPIO=false se vuelve al correo automático con el PDF del proveedor.
+    correoConPdfPropio: process.env.FACTUS_CORREO_PDF_PROPIO !== 'false',
   },
   // 8-oct-2026 · Nómina electrónica. En producción la nómina sale con la MISMA cuenta
   // del proveedor que la facturación, así que estas variables no se ponen y se usan las

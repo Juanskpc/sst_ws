@@ -266,6 +266,26 @@ export class FactusAdaptador extends PuertoFacturacionElectronica {
     return { base64 };
   }
 
+  /**
+   * 12-nov-2026 · GET /v2/bills/:number/email-content o /v2/credit-notes/:number/email-content
+   * (developers.factus.com.co → «Obtener contenido de correo»; confirmado en el sandbox): el
+   * correo OFICIAL para el adquiriente cuando se emite con `send_email: false`. Trae el asunto
+   * en el formato de la DIAN («NIT;Emisor;Número;Código tipo;…») y el ZIP con el PDF y el
+   * AttachedDocument. El POST /…/send-email que documenta el proveedor respondió en el sandbox
+   * «Method Not Allowed» (notas) y «Error de validación» (facturas): por eso el correo lo manda
+   * ORBITA con este contenido (envio.service.js).
+   * @param {{tipo: 'FACTURA'|'NOTA_CREDITO', numeroDocumento: string}} datos
+   * @returns {Promise<{asunto: string, zip: Buffer}>}
+   */
+  async contenidoCorreo({ tipo, numeroDocumento }) {
+    const recurso = tipo === 'NOTA_CREDITO' ? 'credit-notes' : 'bills';
+    const r = await request('GET', `/v2/${recurso}/${encodeURIComponent(numeroDocumento)}/email-content`);
+    const asunto = r.data?.subject;
+    const zip = r.data?.attached_document;
+    if (!asunto || !zip) throw new Error(`El proveedor tecnológico no devolvió el contenido del correo de ${numeroDocumento}`);
+    return { asunto: String(asunto), zip: Buffer.from(zip, 'base64') };
+  }
+
   // ─── A2-01 · Nota crédito ─────────────────────────────────────────────────
   // Endpoints de la documentación oficial (developers.factus.com.co/notas-credito,
   // leída el 29-sep-2026): POST /v2/credit-notes/validate, GET /v2/credit-notes/:number,

@@ -7,6 +7,7 @@ import { pool } from '../../config/db.js';
 import { storage } from '../../services/storage.service.js';
 import { obtenerBorrador } from './borrador.service.js';
 import { badRequest, conflict } from '../../utils/httpError.js';
+import { CAUSALES_NOTA_CREDITO } from './notas.service.js';
 
 /**
  * 7-oct-2026 (reunión con JD&D) · REPRESENTACIÓN GRÁFICA PROPIA de la factura.
@@ -18,8 +19,9 @@ import { badRequest, conflict } from '../../utils/httpError.js';
  * Una primera propuesta con otro diseño fue rechazada: aquí no se «mejora» nada.
  *
  * Desde el 8-oct-2026 es el PDF que se ve, se descarga, se reenvía y va en el paquete para
- * la ARL (`pdfDeDocumento`). El correo automático de la emisión lo sigue mandando el
- * proveedor tecnológico con su propio PDF.
+ * la ARL (`pdfDeDocumento`). Desde el 12-nov-2026 también es el que va en el correo de la
+ * emisión (el del proveedor no imprime las retenciones; ver `envio.service.js`) y el mismo
+ * formato sirve para la NOTA CRÉDITO (`clase: 'NOTA_CREDITO'`).
  */
 
 const ASSETS = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../assets/facturacion');
@@ -106,8 +108,11 @@ function mesesEntre(desde, hasta) {
  * @param enlaceQr el enlace de consulta de la DIAN (va en el QR).
  * @param lateral  el texto vertical del borde derecho (fabricante del software y proveedor tecnológico).
  * @param marcaAgua texto grande en diagonal sobre cada hoja (la vista previa de un borrador), o null.
+ * @param clase    'FACTURA' o 'NOTA_CREDITO' (12-nov-2026): mismo formato; cambian el título, la leyenda y CUFE→CUDE.
+ * @param referencia en una nota: { numero, causal } de la factura que corrige.
  */
-export async function pdfFactura({ doc, emisor, cliente, resolucion = null, enlaceQr = null, lateral = null, marcaAgua = null }) {
+export async function pdfFactura({ doc, emisor, cliente, resolucion = null, enlaceQr = null, lateral = null, marcaAgua = null, clase = 'FACTURA', referencia = null }) {
+  const esNota = clase === 'NOTA_CREDITO';
   const pdf = await PDFDocument.create();
   const [n, b] = await Promise.all([pdf.embedFont(StandardFonts.Helvetica), pdf.embedFont(StandardFonts.HelveticaBold)]);
   const rutaLogo = path.join(ASSETS, 'logo-jdd.jpg');
@@ -158,7 +163,7 @@ export async function pdfFactura({ doc, emisor, cliente, resolucion = null, enla
       .filter(Boolean).flatMap((l) => renglones(l, n, 6.6, 138)).forEach((l) => { centro(l, cx, y, { s: 6.6 }); y += 7.5; });
     if (qr) p.drawImage(qr, { x: 306.5, y: H - 113, width: 71.5, height: 71.5 });
     caja(382.5, 62.5, DER, 97.5);
-    centro('Factura electrónica de venta', (382.5 + DER) / 2, 78.5, { s: 9 });
+    centro(esNota ? 'Nota crédito electrónica' : 'Factura electrónica de venta', (382.5 + DER) / 2, 78.5, { s: 9 });
     centro(titulo, (382.5 + DER) / 2, 88, { f: b, s: 7.6 });
 
     // Adquirente
@@ -178,7 +183,7 @@ export async function pdfFactura({ doc, emisor, cliente, resolucion = null, enla
     caja(xF, 121, DER, 174.5);
     hor(xF, DER, 134.7); ver(xV, 134.7, 174.5);
     hor(xV, DER, 147.7); hor(xV, DER, 161.5);
-    centro('Fecha y hora Factura', (xF + DER) / 2, 130.2, { f: b, s: 6.6 });
+    centro(esNota ? 'Fecha y hora Nota' : 'Fecha y hora Factura', (xF + DER) / 2, 130.2, { f: b, s: 6.6 });
     const hora = new Date(new Date(doc.actualizado_en ?? doc.creado_en).getTime() - 5 * 3600e3).toISOString().slice(11, 16);
     centro('Generación', (xF + xV) / 2, 143.5, { f: b, s: 6.6 }); centro(`${fechaCO(doc.fecha_emision)}, ${hora}`, (xV + DER) / 2, 144, { s: 6.6 });
     centro('Expedición', (xF + xV) / 2, 157, { f: b, s: 6.6 }); centro(`${fechaCO(doc.fecha_emision)}, ${hora}`, (xV + DER) / 2, 157.5, { s: 6.6 });
@@ -261,16 +266,23 @@ export async function pdfFactura({ doc, emisor, cliente, resolucion = null, enla
   texto('Forma de pago:', IZQ, 535.5 + EXTRA, { f: b, s: 9 });
   texto(doc.forma_pago_nombre || '', 44, 545.5 + EXTRA, { s: 9 });
   texto('Medio de pago:', IZQ, 564.5 + EXTRA, { f: b, s: 9 });
-  texto(`${doc.medio_pago_nombre || 'Otro'} - ${doc.forma_pago_nombre || ''} - Cuota No. 001 vence el ${String(doc.fecha_vencimiento ?? '').slice(0, 10)} por`, 46, 574 + EXTRA, { s: 6.6 });
-  texto('$', 276, 574 + EXTRA, { s: 6.6 });
-  derecha(dinero(t.total_a_pagar), 345.5, 574 + EXTRA, { s: 6.6 });
+  if (esNota) {
+    // Una nota crédito no tiene cuota que vencer: solo el medio y la forma de pago.
+    texto(`${doc.medio_pago_nombre || 'Otro'} - ${doc.forma_pago_nombre || ''}`, 46, 574 + EXTRA, { s: 6.6 });
+  } else {
+    texto(`${doc.medio_pago_nombre || 'Otro'} - ${doc.forma_pago_nombre || ''} - Cuota No. 001 vence el ${String(doc.fecha_vencimiento ?? '').slice(0, 10)} por`, 46, 574 + EXTRA, { s: 6.6 });
+    texto('$', 276, 574 + EXTRA, { s: 6.6 });
+    derecha(dinero(t.total_a_pagar), 345.5, 574 + EXTRA, { s: 6.6 });
+  }
   texto('Observaciones:', IZQ, 603.5 + EXTRA, { f: b, s: 9 });
   if (doc.observaciones) renglones(doc.observaciones, n, 6.6, 480).slice(0, 8).forEach((l, i) => texto(l, 44, 613 + EXTRA + i * 7.6, { s: 6.6 }));
 
   // ── Leyenda legal, autorización de numeración y CUFE (centrados, como en el modelo)
   const cx = 297.6;
   const vigencia = mesesEntre(resolucion?.fecha_desde, resolucion?.fecha_hasta);
-  const legal = 'A esta factura de venta aplican las normas relativas a la letra de cambio (artículo 5 Ley 1231 de 2008). Con esta el Comprador declara haber recibido real y materialmente las mercancías o prestación de servicios descritos en este título - Valor.';
+  const legal = esNota
+    ? `Nota crédito que referencia la factura electrónica ${referencia?.numero ?? ''}.${referencia?.causal ? ` Concepto de corrección: ${referencia.causal}.` : ''}`
+    : 'A esta factura de venta aplican las normas relativas a la letra de cambio (artículo 5 Ley 1231 de 2008). Con esta el Comprador declara haber recibido real y materialmente las mercancías o prestación de servicios descritos en este título - Valor.';
   const autoriz = resolucion?.numero_resolucion
     ? `Número Autorización Electrónica ${resolucion.numero_resolucion} aprobado en ${String(resolucion.fecha_desde ?? '').replace(/-/g, '')} prefijo ${resolucion.prefijo ?? ''} desde el número ${resolucion.desde ?? ''} al ${resolucion.hasta ?? ''}${vigencia ? ` Vigencia: ${vigencia} Meses` : ''}`
     : '';
@@ -294,9 +306,11 @@ export async function pdfFactura({ doc, emisor, cliente, resolucion = null, enla
   const fiscal = [emisor.regimen, emisor.actividad ? `Actividad Económica ${emisor.actividad}` : null].filter(Boolean).join(' - ');
   if (fiscal) { centro(fiscal, cx, yl, { s: 5.7 }); yl += 6.5; }
   const cufe = doc.cufe ?? 'se genera al emitir ante la DIAN';
-  const wCufe = ancho('CUFE: ', { f: b, s: 5.7 }) + ancho(cufe, { s: 5.7 });
-  texto('CUFE:', cx - wCufe / 2, yl, { f: b, s: 5.7 });
-  texto(cufe, cx - wCufe / 2 + ancho('CUFE: ', { f: b, s: 5.7 }), yl, { s: 5.7 });
+  // La nota crédito se identifica con CUDE, no con CUFE (se guarda en la misma columna).
+  const rotulo = esNota ? 'CUDE: ' : 'CUFE: ';
+  const wCufe = ancho(rotulo, { f: b, s: 5.7 }) + ancho(cufe, { s: 5.7 });
+  texto(rotulo.trim(), cx - wCufe / 2, yl, { f: b, s: 5.7 });
+  texto(cufe, cx - wCufe / 2 + ancho(rotulo, { f: b, s: 5.7 }), yl, { s: 5.7 });
 
   return Buffer.from(await pdf.save());
 }
@@ -306,6 +320,7 @@ export async function pdfFactura({ doc, emisor, cliente, resolucion = null, enla
  * la misma frase que trae el PDF que entrega el proveedor tecnológico.
  */
 const LEYENDA_LATERAL = 'Software: ORBITA. Factura electrónica generada con software propio autorizado por la DIAN. Firma electrónica: ver en el XML.';
+const LEYENDA_LATERAL_NOTA = 'Software: ORBITA. Nota crédito electrónica generada con software propio autorizado por la DIAN. Firma electrónica: ver en el XML.';
 
 /**
  * 8-oct-2026 · El PDF propio de una factura ya validada, armado con lo que hay en la base.
@@ -313,11 +328,12 @@ const LEYENDA_LATERAL = 'Software: ORBITA. Factura electrónica generada con sof
  *
  * Devuelve `null` cuando no se puede armar (no es una factura validada, o falta la
  * empresa emisora en Parametrización): quien llama cae entonces al PDF guardado del
- * proveedor (`pdf_path`). Las notas crédito y los documentos soporte siguen con ese.
+ * proveedor (`pdf_path`). Desde el 12-nov-2026 también arma el de las notas crédito; los
+ * documentos soporte siguen con el del proveedor.
  */
 export async function pdfPropioFactura(documentoId, db = pool) {
   const doc = await obtenerBorrador(documentoId, db);
-  if (doc.tipo !== 'FACTURA' || !['VALIDADO', 'ANULADO'].includes(doc.estado) || !doc.cufe) return null;
+  if (!['FACTURA', 'NOTA_CREDITO'].includes(doc.tipo) || !['VALIDADO', 'ANULADO'].includes(doc.estado) || !doc.cufe) return null;
   return armarPdf(doc, db);
 }
 
@@ -350,7 +366,10 @@ async function armarPdf(doc, db, { marcaAgua = null } = {}) {
     `SELECT COALESCE(t.razon_social, btrim(concat_ws(' ', t.nombres, t.apellidos))) AS nombre, t.numero_documento, t.dv, t.direccion, t.telefono, m.nombre AS municipio
        FROM sst.terceros t LEFT JOIN sst.municipios m ON m.id = t.municipio_id WHERE t.id = $1`, [doc.tercero_id],
   )).rows[0];
-  const resolucion = (await db.query(
+  const esNota = doc.tipo === 'NOTA_CREDITO';
+  // La nota crédito no lleva resolución de numeración (el rango NC no tiene); en su lugar
+  // dice qué factura corrige y por qué.
+  const resolucion = esNota ? null : (await db.query(
     `SELECT numero_resolucion, fecha_desde::text, fecha_hasta::text, prefijo, desde, hasta FROM sst.resoluciones_numeracion
       WHERE tipo_documento = 'FACTURA' AND prefijo = $1 ORDER BY activa DESC LIMIT 1`, [doc.prefijo],
   )).rows[0] ?? null;
@@ -371,8 +390,16 @@ async function armarPdf(doc, db, { marcaAgua = null } = {}) {
     },
     resolucion,
     enlaceQr: doc.qr_url,
-    lateral: LEYENDA_LATERAL,
+    lateral: esNota ? LEYENDA_LATERAL_NOTA : LEYENDA_LATERAL,
     marcaAgua,
+    clase: doc.tipo,
+    referencia: esNota
+      ? {
+        numero: doc.referencia_numero && doc.referencia_prefijo && !String(doc.referencia_numero).startsWith(doc.referencia_prefijo)
+          ? `${doc.referencia_prefijo}${doc.referencia_numero}` : doc.referencia_numero,
+        causal: CAUSALES_NOTA_CREDITO[doc.causal] ?? null,
+      }
+      : null,
   });
 }
 
