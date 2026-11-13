@@ -4,7 +4,7 @@ import { asyncHandler } from '../../utils/asyncHandler.js';
 import { authRequired, requireRole } from '../../middleware/auth.js';
 import { hoyCO } from '../../utils/formato.js';
 import {
-  anularRecibo, antiguedad, conciliacion, crearReciboCaja, EDADES, estadoCuenta, listarCartera, listarRecibos,
+  anularRecibo, antiguedad, conciliacion, crearReciboCaja, EDADES, estadoCuenta, listarCartera, listarRecibos, modificarRecibo,
   obtenerRecibo, propuestaRecibo, sincronizarCartera,
 } from './cartera.service.js';
 import {
@@ -93,7 +93,8 @@ router.get('/conciliacion', LEER, asyncHandler(async (req, res) => {
 
 // Facturas abiertas del cliente con la ReteICA sugerida, para armar un recibo.
 router.get('/propuesta/:terceroId', LEER, asyncHandler(async (req, res) => {
-  res.json({ data: await propuestaRecibo(req.params.terceroId) });
+  // ?recibo_id= al modificar un recibo: sus facturas entran con el saldo que tendrían sin él.
+  res.json({ data: await propuestaRecibo(req.params.terceroId, undefined, { reciboId: req.query.recibo_id || null }) });
 }));
 
 router.get('/recibos', LEER, asyncHandler(async (req, res) => {
@@ -107,6 +108,11 @@ router.get('/recibos/:id', LEER, asyncHandler(async (req, res) => {
 
 router.post('/recibos', OPERAR, asyncHandler(async (req, res) => {
   res.status(201).json({ data: await crearReciboCaja(req.body, req.user.sub) });
+}));
+
+// 13-nov-2026 · Modificar un recibo contabilizado: conserva su número (RC-n) y deja el rastro.
+router.put('/recibos/:id', OPERAR, asyncHandler(async (req, res) => {
+  res.json({ data: await modificarRecibo(req.params.id, req.body, req.user.sub) });
 }));
 
 router.post('/recibos/:id/anular', OPERAR, asyncHandler(async (req, res) => {

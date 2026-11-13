@@ -6,6 +6,7 @@
 //   RC-1-105 Sandoná · el cliente retuvo RETEFUENTE al pagar (13551509)
 // y comprueba saldos, notas crédito, anulación y la conciliación cartera = libro.
 // Uso: node --import tsx scripts/verificar-cartera.mjs   (requiere el túnel)
+import { readFileSync } from 'node:fs';
 import { pool } from '../src/config/db.js';
 import { contabilizarEn } from '../src/modules/contabilidad/contabilizacion.service.js';
 import { sembrarReglasSiigo } from '../src/modules/contabilidad/reglas.service.js';
@@ -48,6 +49,11 @@ const rechaza = async (fn, fragmento, texto) => {
 
 try {
   await client.query('BEGIN');
+  // 13-nov-2026 · El detalle del recibo lee su historial de cambios: sin la migración, se aplica aquí (y se deshace).
+  if (!(await client.query(`SELECT to_regclass('sst.recibos_caja_cambios') IS NOT NULL AS si`)).rows[0].si) {
+    await client.query(readFileSync(new URL('../db/migraciones/2026-11-13-modificar-recibo-caja.sql', import.meta.url), 'utf8')
+      .replace(/^\s*BEGIN;\s*$/m, '').replace(/^\s*COMMIT;\s*$/m, ''));
+  }
   // Lo que ya hay en jdd_dev (asientos de la Fase A) también abre su cartera.
   await sincronizarCartera(client);
   const sem = await sembrarReglasSiigo(null, client);
@@ -119,7 +125,7 @@ try {
   await rechaza(() => crearReciboCaja({ tercero_id: bolivar, fecha: '2026-09-28', cuenta_banco_id: banco,
     aplicaciones: [{ cartera_documento_id: cParcial, valor_pagado: '1' }] }, null, { client }), 'otro cliente', 'no se aplica a una factura de otro cliente');
   await rechaza(() => crearReciboCaja({ tercero_id: axa, fecha: '2026-09-28', cuenta_banco_id: cAxa1,
-    aplicaciones: [{ cartera_documento_id: cParcial, valor_pagado: '1' }] }, null, { client }), 'cuenta de banco', 'exige una cuenta de banco');
+    aplicaciones: [{ cartera_documento_id: cParcial, valor_pagado: '1' }] }, null, { client }), 'donde entró la plata', 'exige una cuenta del disponible (caja o bancos)');
 
   const anulado = await anularRecibo(abono.id, 'Consignación duplicada', null, { client });
   igual([anulado.estado, (await q1(`SELECT saldo FROM sst.cartera_documentos WHERE id = $1`, [cParcial])).saldo], ['ANULADO', '1000000.00'],

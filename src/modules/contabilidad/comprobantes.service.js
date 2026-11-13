@@ -307,6 +307,40 @@ export async function actualizarBorrador(id, b = {}, usuarioId = null) {
 }
 
 /**
+ * 13-nov-2026 · Reescribe en el sitio el asiento de un RECIBO DE CAJA contabilizado
+ * (fecha, descripción y líneas), conservando su número. Es la única excepción a «lo
+ * contabilizado no se edita» y la base solo la deja pasar para el comprobante que esta
+ * transacción marcó (migración 2026-11-13-modificar-recibo-caja.sql). Va siempre dentro
+ * de la transacción del recibo: `client` es obligatorio.
+ */
+export async function reescribirComprobanteDeRecibo(id, b = {}, usuarioId = null, { client }) {
+  const c = (await client.query(
+    `SELECT id, estado, origen_tipo, to_char(fecha, 'YYYY-MM-DD') AS fecha FROM sst.comprobantes WHERE id = $1 FOR UPDATE`, [id],
+  )).rows[0];
+  if (!c) throw notFound('Ese comprobante no existe.');
+  if (c.origen_tipo !== 'RECIBO_CAJA') throw forbidden('Solo el asiento de un recibo de caja se modifica en el sitio.');
+  if (c.estado !== 'CONTABILIZADO') throw conflict(`El comprobante está ${c.estado.toLowerCase()}: no se modifica.`);
+  const fecha = validarFecha(b.fecha);
+  for (const f of [c.fecha, fecha]) {
+    if (await periodoCerrado(client, f)) throw badRequest(`El periodo ${etiquetaPeriodo(f)} está cerrado: el recibo no se puede modificar.`);
+  }
+  const { lineas, debito, credito } = await validarLineas(client, b.lineas);
+  if (lineas.length < 2) throw badRequest('El comprobante necesita al menos dos movimientos.');
+  if (debito !== credito) {
+    throw badRequest(`El comprobante no cuadra: débitos ${deCentavos(debito)} y créditos ${deCentavos(credito)}.`);
+  }
+  // La marca dura solo esta transacción (`true` = local): si algo falla, el ROLLBACK la quita.
+  await client.query(`SELECT set_config('sst.reescribir_comprobante', $1, true)`, [id]);
+  await client.query(
+    `UPDATE sst.comprobantes SET fecha = $2, descripcion = $3, total_debito = $4, total_credito = $4, actualizado_por = $5 WHERE id = $1`,
+    [id, fecha, b.descripcion ? String(b.descripcion).trim().slice(0, 1000) : null, deCentavos(debito), usuarioId],
+  );
+  await guardarLineas(client, id, lineas);
+  await client.query(`SELECT set_config('sst.reescribir_comprobante', '', true)`);
+  return obtenerComprobante(id, client);
+}
+
+/**
  * BORRADOR → CONTABILIZADO: valida el cuadre y el periodo, y le da su número.
  * Los mensajes salen de aquí; el trigger diferido repite las comprobaciones al commit.
  */

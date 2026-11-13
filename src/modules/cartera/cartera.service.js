@@ -2,7 +2,7 @@ import { pool, withTransaction } from '../../config/db.js';
 import { badRequest, conflict, notFound } from '../../utils/httpError.js';
 import { aCentavos, deCentavos } from '../../utils/dinero.js';
 import { hoyCO } from '../../utils/formato.js';
-import { anularComprobante, crearComprobante } from '../contabilidad/comprobantes.service.js';
+import { anularComprobante, crearComprobante, reescribirComprobanteDeRecibo } from '../contabilidad/comprobantes.service.js';
 
 /**
  * B3-01 (CXC-01..04, CNT-05) · Cuentas por cobrar y recibos de caja.
@@ -199,8 +199,28 @@ export async function conciliacion(db = pool, tipo = 'CXC') {
  * condición del pagador) sobre el subtotal de la factura, en pesos enteros —
  * así la registra Siigo (9.690, 35.720…). Es solo la sugerencia: se corrige.
  */
-export async function propuestaRecibo(terceroId, db = pool) {
-  const docs = await listarCartera({ terceroId }, db);
+export async function propuestaRecibo(terceroId, db = pool, { reciboId = null } = {}) {
+  // 13-nov-2026 · Al MODIFICAR un recibo, sus facturas entran con el saldo que tendrían sin
+  // él (aunque hoy estén saldadas), y `actual` trae lo que el recibo les aplicó para precargarlo.
+  const delRecibo = new Map();
+  if (reciboId) {
+    const r = await db.query(
+      `SELECT a.cartera_documento_id, a.valor_pagado, a.valor_retenciones,
+              COALESCE(array_agg(ar.retencion_id) FILTER (WHERE ar.id IS NOT NULL), '{}') AS retencion_ids
+         FROM sst.cartera_aplicaciones a
+         LEFT JOIN sst.cartera_aplicacion_retenciones ar ON ar.aplicacion_id = a.id
+        WHERE a.origen_tipo = 'RECIBO_CAJA' AND a.origen_id = $1 AND NOT a.anulada
+        GROUP BY a.id`,
+      [reciboId],
+    );
+    for (const x of r.rows) delRecibo.set(x.cartera_documento_id, x);
+  }
+  const docs = (await listarCartera({ terceroId, soloAbiertos: !reciboId }, db))
+    .map((d) => {
+      const a = delRecibo.get(d.id);
+      return a ? { ...d, saldo: deCentavos(aCentavos(d.saldo) + aCentavos(a.valor_pagado) + aCentavos(a.valor_retenciones)) } : d;
+    })
+    .filter((d) => aCentavos(d.saldo) > 0);
   const reteica = (await db.query(
     `SELECT r.id, r.codigo, r.nombre, r.tarifa, r.cuenta_id
        FROM sst.condiciones_pagador cp JOIN sst.retenciones r ON r.id = cp.reteica_pago_id AND r.activa
@@ -225,6 +245,7 @@ export async function propuestaRecibo(terceroId, db = pool) {
   }
   return {
     reteica,
+    actual: [...delRecibo.values()].filter((a) => docs.some((d) => d.id === a.cartera_documento_id)),
     facturas: docs.map((d) => {
       // Proporcional a lo que falta: si ya se abonó la mitad, la ReteICA sugerida es la mitad.
       const fraccion = aCentavos(d.valor) ? aCentavos(d.saldo) / aCentavos(d.valor) : 0;
@@ -243,105 +264,176 @@ const validarFecha = (v) => {
 };
 
 /**
- * Registra un recibo de caja y lo contabiliza (RC) en la misma transacción.
+ * Cuenta donde entró la plata: caja, bancos, ahorros… (13-nov-2026: cualquier cuenta del
+ * disponible, grupo 11, o una marcada como banco), siempre que reciba movimiento.
+ */
+async function cuentaDeIngreso(db, id) {
+  const c = id ? (await db.query(
+    `SELECT id, codigo FROM sst.cuentas_contables
+      WHERE id = $1 AND (es_banco OR codigo LIKE '11%') AND acepta_movimiento AND activa`, [id],
+  )).rows[0] : null;
+  if (!c) throw badRequest('Elija la cuenta donde entró la plata (caja o bancos: una cuenta auxiliar del grupo 11).');
+  return c;
+}
+
+/**
+ * Valida lo que llega del formulario y arma el asiento y las aplicaciones, sin escribir
+ * nada. La comparten el registro y la modificación.
  *
  * `aplicaciones`: [{ cartera_documento_id, valor_pagado, retenciones: [{ retencion_id, valor, base? }] }].
  * Lo consignado es la suma de lo pagado; por cada factura, pagado + retenido no
  * puede superar su saldo.
  */
+async function prepararRecibo(db, b) {
+  const fecha = validarFecha(b.fecha);
+  const terceroId = b.tercero_id;
+  if (!terceroId) throw badRequest('Elija el cliente que pagó.');
+  const banco = await cuentaDeIngreso(db, b.cuenta_banco_id);
+  const aplicaciones = Array.isArray(b.aplicaciones) ? b.aplicaciones.filter((a) => a && a.cartera_documento_id) : [];
+  if (!aplicaciones.length) throw badRequest('Elija al menos una factura que cancela el recibo.');
+
+  const retencionIds = [...new Set(aplicaciones.flatMap((a) => (a.retenciones ?? []).map((r) => r.retencion_id)).filter(Boolean))];
+  const retenciones = new Map((await db.query(
+    `SELECT r.id, r.codigo, r.nombre, r.cuenta_id, c.codigo AS cuenta_codigo
+       FROM sst.retenciones r LEFT JOIN sst.cuentas_contables c ON c.id = r.cuenta_id AND c.acepta_movimiento AND c.activa
+      WHERE r.id = ANY($1::uuid[])`,
+    [retencionIds],
+  )).rows.map((r) => [r.id, r]));
+
+  let consignado = 0;
+  const lineasRet = [];
+  const lineasCxc = [];
+  const aplicar = [];
+  const vistos = new Set();
+  for (const [i, a] of aplicaciones.entries()) {
+    if (vistos.has(a.cartera_documento_id)) throw badRequest('Una misma factura aparece dos veces en el recibo.');
+    vistos.add(a.cartera_documento_id);
+    const doc = (await db.query(
+      `SELECT id, tercero_id, numero, saldo, cuenta_id, documento_id FROM sst.cartera_documentos WHERE id = $1 AND tipo = 'CXC' FOR UPDATE`,
+      [a.cartera_documento_id],
+    )).rows[0];
+    if (!doc) throw badRequest(`Fila ${i + 1}: esa factura no está en la cartera.`);
+    if (doc.tercero_id !== terceroId) throw badRequest(`La factura ${doc.numero} es de otro cliente.`);
+    const pagado = a.valor_pagado == null || a.valor_pagado === '' ? 0 : aCentavos(a.valor_pagado);
+    if (!Number.isFinite(pagado) || pagado < 0) throw badRequest(`${doc.numero}: el valor pagado no es válido.`);
+    const rets = [];
+    for (const r of a.retenciones ?? []) {
+      const v = r.valor == null || r.valor === '' ? 0 : aCentavos(r.valor);
+      if (!v) continue;
+      if (!Number.isFinite(v) || v < 0) throw badRequest(`${doc.numero}: el valor retenido no es válido.`);
+      const def = retenciones.get(r.retencion_id);
+      if (!def) throw badRequest(`${doc.numero}: elija qué retención practicó el cliente.`);
+      if (!def.cuenta_id || !def.cuenta_codigo) {
+        throw badRequest(`La retención ${def.codigo} no tiene cuenta contable (Parametrización → Retenciones).`);
+      }
+      rets.push({ ...def, valor: v, base: r.base == null || r.base === '' ? null : aCentavos(r.base) });
+    }
+    const retenido = rets.reduce((s, r) => s + r.valor, 0);
+    const total = pagado + retenido;
+    if (!total) throw badRequest(`${doc.numero}: escriba lo que se pagó o lo que se retuvo.`);
+    if (total > aCentavos(doc.saldo)) {
+      throw badRequest(`${doc.numero}: lo pagado más lo retenido (${deCentavos(total)}) supera su saldo (${doc.saldo}).`);
+    }
+    consignado += pagado;
+    for (const r of rets) {
+      lineasRet.push({ cuenta_id: r.cuenta_id, tercero_id: terceroId, debito: deCentavos(r.valor), base: r.base != null ? deCentavos(r.base) : null,
+        descripcion: r.nombre, documento_cruce: doc.numero, documento_cruce_id: doc.documento_id });
+    }
+    lineasCxc.push({ cuenta_id: doc.cuenta_id, tercero_id: terceroId, credito: deCentavos(total), documento_cruce: doc.numero, documento_cruce_id: doc.documento_id });
+    aplicar.push({ doc, pagado, retenido, rets });
+  }
+  if (!consignado) throw badRequest('El recibo no tiene plata consignada: escriba lo que se pagó.');
+  const nombre = (await db.query(`SELECT ${NOMBRE} AS n FROM sst.terceros t WHERE id = $1`, [terceroId])).rows[0]?.n;
+  if (!nombre) throw badRequest('Ese cliente no existe.');
+  return {
+    fecha, terceroId, banco, consignado, aplicar,
+    observaciones: b.observaciones ? String(b.observaciones).trim().slice(0, 1000) : null,
+    descripcion: `Recibo de caja · ${nombre}`,
+    // Mismo orden que el auxiliar de Siigo: banco, clientes, retenciones.
+    lineas: [{ cuenta_id: banco.id, tercero_id: terceroId, debito: deCentavos(consignado), descripcion: 'Consignación' }, ...lineasCxc, ...lineasRet],
+  };
+}
+
+/** Escribe las aplicaciones del recibo y baja el saldo de cada factura. */
+async function guardarAplicaciones(db, reciboId, p) {
+  for (const a of p.aplicar) {
+    const ap = (await db.query(
+      `INSERT INTO sst.cartera_aplicaciones (cartera_documento_id, origen_tipo, origen_id, fecha, valor_pagado, valor_retenciones)
+       VALUES ($1, 'RECIBO_CAJA', $2, $3, $4, $5) RETURNING id`,
+      [a.doc.id, reciboId, p.fecha, deCentavos(a.pagado), deCentavos(a.retenido)],
+    )).rows[0];
+    for (const r of a.rets) {
+      await db.query(
+        `INSERT INTO sst.cartera_aplicacion_retenciones (aplicacion_id, retencion_id, cuenta_id, base, valor) VALUES ($1, $2, $3, $4, $5)`,
+        [ap.id, r.id, r.cuenta_id, r.base != null ? deCentavos(r.base) : null, deCentavos(r.valor)],
+      );
+    }
+    await db.query(`UPDATE sst.cartera_documentos SET saldo = saldo - $2 WHERE id = $1`, [a.doc.id, deCentavos(a.pagado + a.retenido)]);
+  }
+}
+
+/** Registra un recibo de caja y lo contabiliza (RC) en la misma transacción. */
 export async function crearReciboCaja(b = {}, usuarioId = null, { client = null } = {}) {
   return conTransaccion(client, async (db) => {
-    const fecha = validarFecha(b.fecha);
-    const terceroId = b.tercero_id;
-    if (!terceroId) throw badRequest('Elija el cliente que pagó.');
-    const banco = (await db.query(
-      `SELECT id, codigo FROM sst.cuentas_contables WHERE id = $1 AND es_banco AND acepta_movimiento AND activa`, [b.cuenta_banco_id],
-    )).rows[0];
-    if (!banco) throw badRequest('Elija la cuenta de banco donde entró la plata (una cuenta marcada como banco en el plan).');
-    const aplicaciones = Array.isArray(b.aplicaciones) ? b.aplicaciones.filter((a) => a && a.cartera_documento_id) : [];
-    if (!aplicaciones.length) throw badRequest('Elija al menos una factura que cancela el recibo.');
-
-    const retencionIds = [...new Set(aplicaciones.flatMap((a) => (a.retenciones ?? []).map((r) => r.retencion_id)).filter(Boolean))];
-    const retenciones = new Map((await db.query(
-      `SELECT r.id, r.codigo, r.nombre, r.cuenta_id, c.codigo AS cuenta_codigo
-         FROM sst.retenciones r LEFT JOIN sst.cuentas_contables c ON c.id = r.cuenta_id AND c.acepta_movimiento AND c.activa
-        WHERE r.id = ANY($1::uuid[])`,
-      [retencionIds],
-    )).rows.map((r) => [r.id, r]));
-
-    let consignado = 0;
-    const lineasRet = [];
-    const lineasCxc = [];
-    const aplicar = [];
-    const vistos = new Set();
-    for (const [i, a] of aplicaciones.entries()) {
-      if (vistos.has(a.cartera_documento_id)) throw badRequest('Una misma factura aparece dos veces en el recibo.');
-      vistos.add(a.cartera_documento_id);
-      const doc = (await db.query(
-        `SELECT id, tercero_id, numero, saldo, cuenta_id, documento_id FROM sst.cartera_documentos WHERE id = $1 AND tipo = 'CXC' FOR UPDATE`,
-        [a.cartera_documento_id],
-      )).rows[0];
-      if (!doc) throw badRequest(`Fila ${i + 1}: esa factura no está en la cartera.`);
-      if (doc.tercero_id !== terceroId) throw badRequest(`La factura ${doc.numero} es de otro cliente.`);
-      const pagado = a.valor_pagado == null || a.valor_pagado === '' ? 0 : aCentavos(a.valor_pagado);
-      if (!Number.isFinite(pagado) || pagado < 0) throw badRequest(`${doc.numero}: el valor pagado no es válido.`);
-      const rets = [];
-      for (const r of a.retenciones ?? []) {
-        const v = r.valor == null || r.valor === '' ? 0 : aCentavos(r.valor);
-        if (!v) continue;
-        if (!Number.isFinite(v) || v < 0) throw badRequest(`${doc.numero}: el valor retenido no es válido.`);
-        const def = retenciones.get(r.retencion_id);
-        if (!def) throw badRequest(`${doc.numero}: elija qué retención practicó el cliente.`);
-        if (!def.cuenta_id || !def.cuenta_codigo) {
-          throw badRequest(`La retención ${def.codigo} no tiene cuenta contable (Parametrización → Retenciones).`);
-        }
-        rets.push({ ...def, valor: v, base: r.base == null || r.base === '' ? null : aCentavos(r.base) });
-      }
-      const retenido = rets.reduce((s, r) => s + r.valor, 0);
-      const total = pagado + retenido;
-      if (!total) throw badRequest(`${doc.numero}: escriba lo que se pagó o lo que se retuvo.`);
-      if (total > aCentavos(doc.saldo)) {
-        throw badRequest(`${doc.numero}: lo pagado más lo retenido (${deCentavos(total)}) supera su saldo (${doc.saldo}).`);
-      }
-      consignado += pagado;
-      for (const r of rets) {
-        lineasRet.push({ cuenta_id: r.cuenta_id, tercero_id: terceroId, debito: deCentavos(r.valor), base: r.base != null ? deCentavos(r.base) : null,
-          descripcion: r.nombre, documento_cruce: doc.numero, documento_cruce_id: doc.documento_id });
-      }
-      lineasCxc.push({ cuenta_id: doc.cuenta_id, tercero_id: terceroId, credito: deCentavos(total), documento_cruce: doc.numero, documento_cruce_id: doc.documento_id });
-      aplicar.push({ doc, pagado, retenido, rets });
-    }
-    if (!consignado) throw badRequest('El recibo no tiene plata consignada: escriba lo que se pagó.');
-
+    const p = await prepararRecibo(db, b);
     const recibo = (await db.query(
       `INSERT INTO sst.recibos_caja (tercero_id, fecha, cuenta_banco_id, valor_consignado, observaciones, creado_por)
        VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-      [terceroId, fecha, banco.id, deCentavos(consignado), b.observaciones ? String(b.observaciones).trim().slice(0, 1000) : null, usuarioId],
+      [p.terceroId, p.fecha, p.banco.id, deCentavos(p.consignado), p.observaciones, usuarioId],
     )).rows[0];
-    const nombre = (await db.query(`SELECT ${NOMBRE} AS n FROM sst.terceros t WHERE id = $1`, [terceroId])).rows[0].n;
-    // Mismo orden que el auxiliar de Siigo: banco, clientes, retenciones.
     const comp = await crearComprobante({
-      tipo: 'RC', fecha, descripcion: `Recibo de caja · ${nombre}`,
-      lineas: [{ cuenta_id: banco.id, tercero_id: terceroId, debito: deCentavos(consignado), descripcion: 'Consignación' }, ...lineasCxc, ...lineasRet],
+      tipo: 'RC', fecha: p.fecha, descripcion: p.descripcion, lineas: p.lineas,
       origen_tipo: 'RECIBO_CAJA', origen_id: recibo.id, contabilizar: true,
     }, usuarioId, { client: db });
     await db.query(`UPDATE sst.recibos_caja SET comprobante_id = $2 WHERE id = $1`, [recibo.id, comp.id]);
-
-    for (const a of aplicar) {
-      const ap = (await db.query(
-        `INSERT INTO sst.cartera_aplicaciones (cartera_documento_id, origen_tipo, origen_id, fecha, valor_pagado, valor_retenciones)
-         VALUES ($1, 'RECIBO_CAJA', $2, $3, $4, $5) RETURNING id`,
-        [a.doc.id, recibo.id, fecha, deCentavos(a.pagado), deCentavos(a.retenido)],
-      )).rows[0];
-      for (const r of a.rets) {
-        await db.query(
-          `INSERT INTO sst.cartera_aplicacion_retenciones (aplicacion_id, retencion_id, cuenta_id, base, valor) VALUES ($1, $2, $3, $4, $5)`,
-          [ap.id, r.id, r.cuenta_id, r.base != null ? deCentavos(r.base) : null, deCentavos(r.valor)],
-        );
-      }
-      await db.query(`UPDATE sst.cartera_documentos SET saldo = saldo - $2 WHERE id = $1`, [a.doc.id, deCentavos(a.pagado + a.retenido)]);
-    }
+    await guardarAplicaciones(db, recibo.id, p);
     return obtenerRecibo(recibo.id, db);
+  });
+}
+
+/**
+ * 13-nov-2026 · Modifica un recibo contabilizado CONSERVANDO su número: cliente, fecha,
+ * cuenta, facturas, valores, retenciones y observaciones. Devuelve a cada factura lo que
+ * el recibo le había aplicado, valida lo nuevo contra esos saldos, reescribe el asiento RC
+ * en el sitio y deja el antes y el después en sst.recibos_caja_cambios.
+ */
+export async function modificarRecibo(id, b = {}, usuarioId = null, { client = null } = {}) {
+  return conTransaccion(client, async (db) => {
+    const r = (await db.query(`SELECT id, estado, comprobante_id FROM sst.recibos_caja WHERE id = $1 FOR UPDATE`, [id])).rows[0];
+    if (!r) throw notFound('Ese recibo no existe.');
+    if (r.estado !== 'CONTABILIZADO') throw conflict('El recibo está anulado: no se modifica.');
+    const antes = await obtenerRecibo(id, db);
+
+    // 1) Las facturas recuperan lo que este recibo les había bajado.
+    const aps = (await db.query(
+      `DELETE FROM sst.cartera_aplicaciones WHERE origen_tipo = 'RECIBO_CAJA' AND origen_id = $1 AND NOT anulada
+       RETURNING cartera_documento_id, valor_pagado + valor_retenciones AS total`,
+      [id],
+    )).rows;
+    for (const a of aps) {
+      await db.query(`UPDATE sst.cartera_documentos SET saldo = saldo + $2 WHERE id = $1`, [a.cartera_documento_id, a.total]);
+    }
+
+    // 2) Lo nuevo se valida contra esos saldos y se escribe con el mismo número.
+    const p = await prepararRecibo(db, b);
+    await reescribirComprobanteDeRecibo(r.comprobante_id, { fecha: p.fecha, descripcion: p.descripcion, lineas: p.lineas }, usuarioId, { client: db });
+    await db.query(
+      `UPDATE sst.recibos_caja
+          SET tercero_id = $2, fecha = $3, cuenta_banco_id = $4, valor_consignado = $5, observaciones = $6,
+              modificado_por = $7, modificado_en = now()
+        WHERE id = $1`,
+      [id, p.terceroId, p.fecha, p.banco.id, deCentavos(p.consignado), p.observaciones, usuarioId],
+    );
+    await guardarAplicaciones(db, id, p);
+
+    // 3) Rastro del cambio (sin el historial anterior dentro de cada foto).
+    const despues = await obtenerRecibo(id, db);
+    const foto = ({ cambios: _c, ...x }) => x;
+    await db.query(
+      `INSERT INTO sst.recibos_caja_cambios (recibo_id, usuario_id, motivo, antes, despues) VALUES ($1, $2, $3, $4, $5)`,
+      [id, usuarioId, b.motivo ? String(b.motivo).trim().slice(0, 500) || null : null, JSON.stringify(foto(antes)), JSON.stringify(foto(despues))],
+    );
+    return obtenerRecibo(id, db);
   });
 }
 
@@ -350,7 +442,7 @@ export async function obtenerRecibo(id, db = pool) {
     `SELECT rc.id, rc.tercero_id, ${NOMBRE} AS tercero_nombre, to_char(rc.fecha, 'YYYY-MM-DD') AS fecha,
             rc.cuenta_banco_id, cb.codigo AS cuenta_banco_codigo, cb.nombre AS cuenta_banco_nombre,
             rc.valor_consignado, rc.observaciones, rc.estado, rc.motivo_anulacion, rc.comprobante_id,
-            CASE WHEN cp.numero IS NULL THEN NULL ELSE 'RC-' || cp.numero END AS numero
+            CASE WHEN cp.numero IS NULL THEN NULL ELSE 'RC-' || cp.numero END AS numero, rc.modificado_en
        FROM sst.recibos_caja rc
        JOIN sst.terceros t ON t.id = rc.tercero_id
        JOIN sst.cuentas_contables cb ON cb.id = rc.cuenta_banco_id
@@ -360,8 +452,8 @@ export async function obtenerRecibo(id, db = pool) {
   )).rows[0];
   if (!r) throw notFound('Ese recibo no existe.');
   const aplicaciones = (await db.query(
-    `SELECT a.id, c.numero, a.valor_pagado, a.valor_retenciones, a.anulada,
-            COALESCE(json_agg(json_build_object('retencion', rt.codigo, 'nombre', rt.nombre, 'valor', ar.valor)) FILTER (WHERE ar.id IS NOT NULL), '[]') AS retenciones
+    `SELECT a.id, a.cartera_documento_id, c.numero, a.valor_pagado, a.valor_retenciones, a.anulada,
+            COALESCE(json_agg(json_build_object('retencion_id', ar.retencion_id, 'retencion', rt.codigo, 'nombre', rt.nombre, 'valor', ar.valor)) FILTER (WHERE ar.id IS NOT NULL), '[]') AS retenciones
        FROM sst.cartera_aplicaciones a
        JOIN sst.cartera_documentos c ON c.id = a.cartera_documento_id
        LEFT JOIN sst.cartera_aplicacion_retenciones ar ON ar.aplicacion_id = a.id
@@ -370,7 +462,14 @@ export async function obtenerRecibo(id, db = pool) {
       GROUP BY a.id, c.numero ORDER BY c.numero`,
     [id],
   )).rows;
-  return { ...r, aplicaciones };
+  // 13-nov-2026 · Quién lo modificó y cuándo (lo más reciente primero).
+  const cambios = (await db.query(
+    `SELECT to_char(k.creado_en AT TIME ZONE 'America/Bogota', 'YYYY-MM-DD HH24:MI') AS fecha, u.nombre AS usuario, k.motivo
+       FROM sst.recibos_caja_cambios k LEFT JOIN sst.usuarios u ON u.id = k.usuario_id
+      WHERE k.recibo_id = $1 ORDER BY k.creado_en DESC`,
+    [id],
+  )).rows;
+  return { ...r, aplicaciones, cambios };
 }
 
 export async function listarRecibos({ terceroId = null, desde = null, hasta = null } = {}) {
