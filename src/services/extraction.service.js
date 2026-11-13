@@ -2,6 +2,7 @@ import { CAMPOS_BORRADOR, CANONICAL_FIELDS, classifyPdfArl } from './gemini.serv
 import { extractPdfWithOpenAI } from './openai-extraction.bridge.js';
 import { esAxa, normalizarTipoActividadBolivar } from '../utils/bolivar.js';
 import { leerRejillaExcel } from '../utils/excel-grid.js';
+import { esOrdenCompraSura, leerOrdenCompraSura } from './sura-orden-pdf.js';
 
 /**
  * Confianza general de la OS (0-100): promedio de la confianza de los campos que
@@ -672,7 +673,8 @@ export async function readSheetPreview(buffer, { maxRows = 300, maxCols = 40 } =
 
 /**
  * Orquesta la extracción según ARL/formato.
- *  - Excel (Bolívar): determinista → múltiples OS por archivo.
+ *  - Excel (Bolívar SIPAB o reporte de tareas de Sura): determinista → múltiples OS por archivo.
+ *  - PDF orden de compra de Sura: determinista (13-nov-2026) → 1 OS por archivo.
  *  - PDF (AXA/Colmena): clasifica la ARL (aún Gemini — PENDIENTE DE MIGRACIÓN)
  *    y extrae los campos con **OpenAI** (motor principal, vía
  *    `extractPdfWithOpenAI`) → 1 OS por archivo.
@@ -698,6 +700,18 @@ export async function runExtraction({ buffer, mime, filename, arlHint }) {
       records: records.map((r) => ({ ...r, engine: 'excel-determinista' })),
     };
   }
+  // 13-nov-2026 · La orden de compra de Sura en PDF se lee sin IA (sura-orden-pdf.js), como su
+  // Excel. Va antes que el clasificador, que solo distingue AXA de Colmena y la tomaba por una
+  // de ellas. Si no se encuentra el número de orden, sigue por la IA ya como ARL SURA.
+  if (await esOrdenCompraSura(buffer)) {
+    const orden = await leerOrdenCompraSura(buffer);
+    if (orden) {
+      return { arlNombre: 'ARL SURA', arlConfidence: 99, records: [{ ...orden, engine: 'pdf-determinista' }] };
+    }
+    const { fields, engine } = await extractPdfWithOpenAI(buffer);
+    return { arlNombre: 'ARL SURA', arlConfidence: 95, records: [{ fields, engine }] };
+  }
+
   // PDF: clasificar ARL por contenido si no viene forzada por el usuario.
   let arlNombre;
   let arlConfidence;

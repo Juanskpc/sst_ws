@@ -98,7 +98,8 @@ export async function classifyPdfArl(buffer) {
   // IA-01/IA-03: clasificación por contenido con confianza (reemplaza la antigua
   // heurística aleatoria por paridad de bytes).
   const content = await classifyByContent(buffer);
-  if (!env.gemini.enabled) return content;
+  // Gemini solo sabe responder AXA o Colmena: si el contenido ya dice Sura, no se le pregunta.
+  if (!env.gemini.enabled || content.arlNombre === 'ARL SURA') return content;
   try {
     const ai = await getClient();
     const resp = await ai.models.generateContent({
@@ -217,6 +218,12 @@ async function extractPdfTextForArl(buffer) {
 /** Clasifica AXA Colpatria vs Colmena por keywords en el texto, con confianza 0-100. */
 async function classifyByContent(buffer) {
   const text = (await extractPdfTextForArl(buffer)).toLowerCase();
+  // 13-nov-2026 · ARL SURA también manda PDF. Su orden de compra la reconoce antes
+  // sura-orden-pdf.js; esto cubre cualquier otro PDF de Sura, que antes salía como AXA o Colmena.
+  const sura = (text.match(/suramericana|arl sura/g) || []).length;
+  if (sura > 0 && sura >= (text.match(/axa|colpatria|colmena/g) || []).length) {
+    return { arlNombre: 'ARL SURA', confidence: 95 };
+  }
   const axa = (text.match(/axa|colpatria/g) || []).length;
   const colmena = (text.match(/colmena/g) || []).length;
   const total = axa + colmena;
