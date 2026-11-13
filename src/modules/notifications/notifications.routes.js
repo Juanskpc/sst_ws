@@ -25,16 +25,31 @@ function recorte(estado) {
   }
 }
 
+/**
+ * Patrón ILIKE de lo que se escribió en el buscador, o null si no hay nada que buscar.
+ * Se escapan % y \ y el guion y el guion bajo valen lo mismo («1390041_26» encuentra
+ * «1390041-26», como en el buscador de Órdenes): ambos pasan a `_`, un carácter cualquiera.
+ */
+function patronBusqueda(q) {
+  const texto = String(q ?? '').trim().slice(0, 100);
+  if (!texto) return null;
+  return `%${texto.replace(/[\\%]/g, (c) => `\\${c}`).replace(/[-_]/g, '_')}%`;
+}
+
 // M11 · Campanita: notificaciones del usuario autenticado.
 router.get('/', asyncHandler(async (req, res) => {
   // Fase A · No hay cron: abrir la campanita dispara (una vez al día) la revisión de
   // resoluciones de numeración y paquete del proveedor por vencer. No espera ni falla.
   revisarVencimientosDiario().catch(() => {});
+  // 13-nov-2026 · Buscador de la campanita (JD&D: «son bastantes»). Busca en el título y el
+  // mensaje de TODA la bandeja del recorte, no solo en las 50 últimas que se pintan sin buscar.
+  const patron = patronBusqueda(req.query.q);
   const r = await pool.query(
     `SELECT * FROM sst.notificaciones
       WHERE usuario_id=$1 ${recorte(req.query.estado)}
-      ORDER BY creado_en DESC LIMIT 50`,
-    [req.user.sub]
+        ${patron ? `AND (titulo ILIKE $2 OR mensaje ILIKE $2)` : ''}
+      ORDER BY creado_en DESC LIMIT ${patron ? 100 : 50}`,
+    patron ? [req.user.sub, patron] : [req.user.sub]
   );
   // El contador de cada pestaña viaja con la lista: pedirlo aparte sería un
   // viaje más para pintar tres números que ya están en la misma tabla.
