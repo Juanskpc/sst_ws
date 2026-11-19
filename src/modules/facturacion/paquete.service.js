@@ -252,18 +252,34 @@ async function cargar(documentoId, db = pool) {
   )).rows[0];
   if (!f) throw notFound('Esa factura no existe.');
   const ordenes = (await db.query(
-    `SELECT o.id, o.codigo, o.empresa_nombre, o.secuencia, o.codigo_cronograma, o.numero_orden, o.numero_prefactura,
+    `SELECT o.id, o.codigo, o.empresa_nombre, o.secuencia, o.codigo_cronograma, o.numero_orden,
+            COALESCE(o.numero_prefactura, pf.numero_prefactura) AS numero_prefactura,
             -- 20-oct-2026 (contadora) · La actividad es la «Descripción» del SIPAB (tipo_actividad,
             -- p. ej. "PRIMEROS AUXILIOS"), no descripcion, que guarda las Observaciones enteras
             -- (contacto, requisitos, «ACTIVIDAD CARGADA EN PROCESO DE LOTE»…).
             COALESCE(NULLIF(btrim(o.tipo_actividad), ''), NULLIF(btrim(o.tema_actividad), ''), o.descripcion) AS actividad, o.tipo_actividad,
             o.url_archivo_original,
             -- La factura de Bolívar va en UNA línea sin orden (20-oct-2026): el valor de cada
-            -- orden es entonces el que aprobó operación (el mismo de su fila de prefactura).
+            -- orden es el de su fila de prefactura (valor_a_facturar, con transporte y demás
+            -- gastos), que es exactamente lo que sumó la línea única de la factura.
+            -- 19-nov-2026 · Antes se tomaba cobro_aprobado_total (lo que aprobó operación),
+            -- que puede no traer los gastos o estar vacío: el TOTAL del anexo no cuadraba
+            -- con la factura (8.238.575 frente a 16.129.617).
             COALESCE((SELECT NULLIF(sum(i.total_linea), 0) FROM sst.documento_items i WHERE i.documento_id = $1 AND i.orden_id = o.id),
-                     o.cobro_aprobado_total, 0) AS valor,
+                     pf.valor_a_facturar, o.cobro_aprobado_total, 0) AS valor,
             (SELECT count(*)::int FROM sst.archivos_soporte s WHERE s.orden_id = o.id) AS soportes
        FROM sst.documento_ordenes dor JOIN sst.ordenes_servicio o ON o.id = dor.orden_id
+       -- La fila de prefactura de la orden (enlazada, o por cronograma+secuencia si la orden se
+       -- importó después de cargar la prefactura). Si sale en varias, manda la de su prefactura.
+       LEFT JOIN LATERAL (
+         SELECT f.valor_a_facturar, p.numero_prefactura
+           FROM sst.prefactura_filas f JOIN sst.prefacturas p ON p.id = f.prefactura_id
+          WHERE f.orden_id = o.id
+             OR (f.orden_id IS NULL AND f.codigo_cronograma = o.codigo_cronograma AND f.secuencia = o.secuencia)
+          ORDER BY (p.numero_prefactura = o.numero_prefactura) DESC NULLS LAST, (f.orden_id = o.id) DESC NULLS LAST,
+                   p.fecha_corte DESC NULLS LAST
+          LIMIT 1
+       ) pf ON true
       WHERE dor.documento_id = $1
       ORDER BY o.codigo_cronograma NULLS LAST, o.secuencia NULLS LAST, o.codigo`,
     [documentoId],
