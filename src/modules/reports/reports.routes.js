@@ -8,6 +8,9 @@ import { getOrderExpanded } from '../orders/orders.service.js';
 import { executiveSummary, interpretSearch } from '../../services/gemini.service.js';
 import { avisarCorteDeCobro } from '../billing/billing.service.js';
 import { etiquetaTipoActividadBolivar } from '../../utils/bolivar.js';
+import { VISTAS_SISTEMA, permisosDeRol } from '../auth/auth.service.js';
+import { sqlTotalCobro } from '../orders/cobro-orden.service.js';
+import { hoyCO } from '../../utils/formato.js';
 
 const router = Router();
 router.use(authRequired);
@@ -156,6 +159,142 @@ router.get('/dashboard', asyncHandler(async (_req, res) => {
       kpis: kpis.rows[0],
       por_arl: byArl.rows,
       estados_mes: monthly.rows,
+    },
+  });
+}));
+
+/**
+ * 20-nov-2026 · Rediseño · «Requiere su atención» del Inicio (DESIGN §7 y §8).
+ *
+ * Antes el Inicio pedía `GET /orders` SIN filtros (200 órdenes completas) solo
+ * para pintar una tabla de «recientes» que repetía la vista Órdenes. Ahora el
+ * Inicio no lleva tabla: abre con lo pendiente y su conteo, y esos conteos salen
+ * de aquí, ya agregados, en UNA consulta.
+ *
+ * Cada conteo usa la MISMA definición que la vista donde se resuelve, para que
+ * la cifra del Inicio y la de la pestaña a la que lleva no discrepen nunca:
+ *
+ *  · La bandeja es la de Órdenes: borradores PENDIENTE_VALIDACION o VALIDADA y
+ *    no deshabilitados (`GET /drafts?estado=PENDIENTE_VALIDACION,VALIDADA`).
+ *  · «Sin programar» = el borrador que nunca se validó o cuya OS sigue en SIN
+ *    PROGRAMAR (`enVista('sin-programar')` de validation.ts).
+ *  · La fecha de vencimiento manda la de la OS; sin OS, la que leyó la IA (lo
+ *    mismo que superpone `camposDesdeOS`). «Vencida» = antes de hoy en hora de
+ *    Colombia; «vence esta semana» = de hoy al domingo de la semana en curso.
+ *  · «Soportes por revisar» = OS EJECUTADA: subir los soportes la deja así y
+ *    aceptarlos la pasa a FINALIZADA, así que EJECUTADA ES la cola de revisión.
+ *  · «Finalizadas sin visto bueno» = FINALIZADA sin `cobro_aprobado_en` (pestaña
+ *    Finalizadas + filtro Cobro «Pendiente»). Sin ese visto bueno la orden no es
+ *    facturable (`relacion.service.js`). El monto es el TOTAL del modal de Cobro
+ *    (`sqlTotalCobro`: honorarios + gastos), lo que se le cobrará al pagador; no
+ *    `valor_cobro_total`, que es lo que se le paga al profesional.
+ *  · «Borradores de factura» = documentos FACTURA en BORRADOR, la lista por
+ *    defecto de `GET /facturacion/borradores`; el monto es su `total_a_pagar`.
+ *
+ * Los conteos se filtran por la matriz de permisos del rol (`sst.permisos_rol`,
+ * la misma que arma la sesión): a quien no ve Órdenes no se le dice cuántas hay
+ * sin programar, y a quien no ve Facturación no se le enseñan sus borradores.
+ * Lo no permitido llega como `null` (no aplica), distinto de 0 (al día).
+ */
+router.get('/inicio', asyncHandler(async (req, res) => {
+  const vistas = new Set(req.user?.es_maestro === true ? VISTAS_SISTEMA : await permisosDeRol(req.user?.rol));
+  const hoy = hoyCO();
+  const r = await pool.query(
+    `WITH bandeja AS (
+       SELECT d.estado::text AS estado_borrador, o.id AS os_id, o.estado::text AS os_estado,
+              o.cobro_aprobado_en, o.profesional_asignado_id,
+              ${sqlTotalCobro('o')} AS total_cobro,
+              -- La fecha que leyó la IA se pasa primero a AAAA-MM-DD y solo se
+              -- convierte si es una fecha REAL (\`pg_input_is_valid\`, PG ≥ 16):
+              -- un «2026-02-30» o un «31/02/2026» bien escritos pero imposibles
+              -- harían fallar el cast con «out of range» y tumbarían el resumen
+              -- de todos por un solo borrador. Ese borrador cuenta sin fecha.
+              COALESCE(o.fecha_vencimiento, CASE
+                WHEN pg_input_is_valid(fv.iso, 'date') THEN fv.iso::date
+              END) AS vence
+         FROM sst.borradores_extraccion d
+         LEFT JOIN sst.ordenes_servicio o ON o.id = d.orden_servicio_id
+         CROSS JOIN LATERAL (
+           SELECT CASE
+             WHEN v ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}' THEN left(v, 10)
+             WHEN v ~ '^[0-9]{2}/[0-9]{2}/[0-9]{4}'
+               THEN substr(v, 7, 4) || '-' || substr(v, 4, 2) || '-' || substr(v, 1, 2)
+           END AS iso
+             FROM (SELECT d.metadatos_extraccion->'fecha_vencimiento'->>'value' AS v) x
+         ) fv
+        WHERE d.estado::text IN ('PENDIENTE_VALIDACION', 'VALIDADA') AND d.deshabilitado = false
+     ),
+     sin_programar AS (
+       SELECT * FROM bandeja WHERE estado_borrador <> 'VALIDADA' OR os_estado = 'SIN PROGRAMAR'
+     ),
+     por_revisar AS (
+       SELECT b.*, p.nombre AS profesional FROM bandeja b
+         LEFT JOIN sst.profesionales p ON p.id = b.profesional_asignado_id
+        WHERE b.estado_borrador = 'VALIDADA' AND b.os_estado = 'EJECUTADA'
+     ),
+     sin_visto AS (
+       SELECT * FROM bandeja
+        WHERE estado_borrador = 'VALIDADA' AND os_estado = 'FINALIZADA' AND cobro_aprobado_en IS NULL
+     ),
+     borradores AS (
+       SELECT d.total_a_pagar, COALESCE(t.razon_social, btrim(concat_ws(' ', t.nombres, t.apellidos))) AS pagador
+         FROM sst.documentos_electronicos d
+         JOIN sst.terceros t ON t.id = d.tercero_id
+        WHERE d.tipo = 'FACTURA' AND d.estado = 'BORRADOR'
+     )
+     SELECT
+       (SELECT count(*) FROM bandeja)::int AS bandeja,
+       (SELECT count(*) FROM sin_programar)::int AS sin_programar,
+       (SELECT count(*) FROM sin_programar WHERE vence < $1::date)::int AS vencidas,
+       (SELECT count(*) FROM sin_programar
+         WHERE vence BETWEEN $1::date AND date_trunc('week', $1::date)::date + 6)::int AS vencen_semana,
+       -- La vencida más antigua con OS: es la que abre «Programar la vencida» del
+       -- saludo (/ordenes?os=<id>). Un borrador sin OS no tiene modal que abrir.
+       (SELECT json_build_object('os_id', os_id, 'dias', $1::date - vence)
+          FROM sin_programar WHERE vence < $1::date AND os_id IS NOT NULL
+         ORDER BY vence LIMIT 1) AS vencida_mas_antigua,
+       (SELECT count(*) FROM por_revisar)::int AS por_revisar,
+       (SELECT COALESCE(json_agg(profesional ORDER BY profesional), '[]'::json)
+          FROM (SELECT DISTINCT profesional FROM por_revisar WHERE profesional IS NOT NULL) x) AS por_revisar_de,
+       (SELECT count(*) FROM sin_visto)::int AS sin_visto,
+       (SELECT COALESCE(sum(total_cobro), 0) FROM sin_visto)::numeric AS sin_visto_monto,
+       (SELECT count(*) FROM borradores)::int AS borradores,
+       (SELECT COALESCE(sum(total_a_pagar), 0) FROM borradores)::numeric AS borradores_monto,
+       (SELECT COALESCE(json_agg(pagador ORDER BY pagador), '[]'::json)
+          FROM (SELECT DISTINCT pagador FROM borradores) x) AS borradores_de,
+       -- La línea del acceso «Importar órdenes»: cuándo entró el último archivo.
+       (SELECT max(creado_en) FROM sst.lotes_importacion) AS ultimo_lote_en,
+       -- El conteo del acceso «Cuentas de cobro»: las filas de la pestaña «Por
+       -- cobrar» del mes en curso, con la MISMA definición que \`resumenPorMes\`
+       -- (billing.service.js): cuentas creadas sin aceptar, más un grupo «por
+       -- generar» por profesional con trabajo aceptado que aún no está en una cuenta.
+       ((SELECT count(*) FROM sst.precuentas WHERE periodo = $2 AND estado <> 'aceptada')
+        + (SELECT count(DISTINCT profesional_id) FROM sst.vw_horas_por_cobrar WHERE periodo = $2))::int
+         AS cuentas_por_cobrar`,
+    [hoy, hoy.slice(0, 7)],
+  );
+  const f = r.rows[0];
+  res.json({
+    data: {
+      hoy,
+      ordenes: vistas.has('ordenes')
+        ? {
+            bandeja: f.bandeja,
+            sin_programar: f.sin_programar,
+            vencidas: f.vencidas,
+            vencen_semana: f.vencen_semana,
+            vencida_mas_antigua: f.vencida_mas_antigua,
+            por_revisar: f.por_revisar,
+            por_revisar_de: f.por_revisar_de,
+            sin_visto_bueno: f.sin_visto,
+            sin_visto_bueno_monto: Number(f.sin_visto_monto),
+          }
+        : null,
+      facturacion: vistas.has('facturacion')
+        ? { borradores: f.borradores, monto: Number(f.borradores_monto), pagadores: f.borradores_de }
+        : null,
+      importar: vistas.has('importar') ? { ultimo_lote_en: f.ultimo_lote_en } : null,
+      precuentas: vistas.has('precuentas') ? { por_cobrar_mes: f.cuentas_por_cobrar } : null,
     },
   });
 }));
