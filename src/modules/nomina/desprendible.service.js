@@ -244,6 +244,7 @@ export async function enviarDesprendible(liquidacionId, correoAlterno) {
       titulo: 'Comprobante de nómina',
       subtitulo: `${periodo} · ${emp.nombre}`,
       pie: 'JD&D Consultores · Seguridad y Salud en el Trabajo',
+      marca: 'jdd', // 23-nov: va a clientes/empleados de JD&D, no a usuarios de ORBITA
       cuerpo: [
         parrafo(`Hola, ${emp.nombre}:`),
         parrafo(`Adjuntamos su comprobante de pago de nómina de ${periodo}.`),

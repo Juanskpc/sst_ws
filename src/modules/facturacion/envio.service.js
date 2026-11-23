@@ -10,11 +10,6 @@ import { enPesosCO } from '../../utils/formato.js';
 import { obtenerBorrador } from './borrador.service.js';
 import { pdfDeDocumento, pdfPropioFactura } from './representacion.service.js';
 import { proveedorFE } from './index.js';
-import { readFile } from 'node:fs/promises';
-
-/** Copia de `public/logoFacturacion.png` del frontend: el backend no ve esa carpeta. */
-const LOGO_RUTA = new URL('../../../assets/correo/logoFacturacion.png', import.meta.url);
-const LOGO_CID = 'logo-jdd-facturacion';
 
 /** Facturas y notas crédito: los dos documentos que se le mandan al cliente. */
 const TIPOS_ENVIABLES = ['FACTURA', 'NOTA_CREDITO'];
@@ -128,9 +123,9 @@ async function enviarCorreo(doc, destino, { exigirOficial }) {
   if (!oficial && exigirOficial) throw new Error('el proveedor tecnológico no entregó el XML de la DIAN para el correo');
 
   const esNota = doc.tipo === 'NOTA_CREDITO';
-  // 7-oct-2026 · Logo de JD&D en la cabecera del correo de la factura. Si el
-  // archivo faltara, el correo sale igual con la cabecera de texto.
-  const logo = await readFile(LOGO_RUTA).catch(() => null);
+  // 23-nov-2026 · Va al CLIENTE: cabecera de JD&D (`marca: 'jdd'`), no de ORBITA
+  // (decisión del dueño). El logo lo adjunta `sendEmail`, ahora sobre blanco
+  // opaco para que el modo oscuro del celular no lo borre.
   const numeroCompleto = numeroDeDocumento(doc.prefijo, doc.numero) || doc.reference_code;
   const facturaReferida = numeroDeDocumento(doc.referencia_prefijo, doc.referencia_numero);
   const totalTexto = enPesosCO(doc.total_a_pagar);
@@ -170,7 +165,7 @@ async function enviarCorreo(doc, destino, { exigirOficial }) {
       titulo,
       subtitulo: `${numeroCompleto} · ${doc.tercero_nombre}`,
       pie: 'JD&D Consultores · Seguridad y Salud en el Trabajo',
-      logoCid: logo ? LOGO_CID : null,
+      marca: 'jdd',
       cuerpo: [
         parrafo(`Estimado(a) ${doc.tercero_nombre},`),
         parrafo(presentacion),
@@ -183,12 +178,7 @@ async function enviarCorreo(doc, destino, { exigirOficial }) {
         ]),
       ].join(''),
     }),
-    attachments: [
-      ...adjuntos,
-      // El logo va DENTRO del correo (cid) y no como enlace: así se ve sin que el
-      // cliente tenga que «mostrar imágenes».
-      ...(logo ? [{ filename: 'logo-jdd.png', content: logo, cid: LOGO_CID, contentDisposition: 'inline' }] : []),
-    ],
+    attachments: adjuntos,
   });
   return { oficial: oficial ?? { pdfPropio: false } };
 }

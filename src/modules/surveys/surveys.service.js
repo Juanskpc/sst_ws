@@ -123,6 +123,7 @@ export async function enviarEncuesta(ordenId, { reenviar = false } = {}) {
         titulo: preguntas.titulo,
         subtitulo: `${o.codigo}${o.empresa_nombre ? ` · ${o.empresa_nombre}` : ''}`,
         pie: 'JD&D Consultores · Seguridad y Salud en el Trabajo',
+        marca: 'jdd', // 23-nov: va a clientes/empleados de JD&D, no a usuarios de ORBITA
         cuerpo: [
           parrafo(`${saludo},`),
           parrafo(

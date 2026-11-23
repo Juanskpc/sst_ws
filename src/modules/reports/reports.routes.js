@@ -42,6 +42,15 @@ function aCelda(v) {
  *
  * La serie va por día si el rango es de hasta dos meses y por mes si es mayor:
  * 365 puntos diarios no se leen, y un mes con 30 barras sí.
+ *
+ * 20-nov-2026 · Rediseño de Estadísticas (veredicto `op-veredicto.md` §3.5):
+ *  · sin `kpis.vencidas`: la pantalla pinta la vencida del Inicio (`/inicio`), y
+ *    dejar aquí otra definición (vencimiento < hoy, cualquier estado sin
+ *    ejecutar) invitaba a pintar dos cifras distintas con el mismo nombre;
+ *  · sin `por_profesional`: eran horas ASIGNADAS por fecha de carga y daban otro
+ *    número para la misma persona que las horas EJECUTADAS de `/horas`;
+ *  · ciudades sin `LIMIT 8`: el front corta en 7 + «Otras (N)», y para sumar
+ *    «Otras» necesita el resto.
  */
 router.get('/estadisticas', asyncHandler(async (req, res) => {
   const esFecha = (v) => /^\d{4}-\d{2}-\d{2}$/.test(String(v ?? ''));
@@ -56,9 +65,9 @@ router.get('/estadisticas', asyncHandler(async (req, res) => {
   const DIA = `(o.fecha_carga AT TIME ZONE 'America/Bogota')::date`;
   const EN_RANGO = `${DIA} BETWEEN $1::date AND $2::date`;
   const params = [desde, hasta];
-  const PAGADOR = `COALESCE(o.arl_nombre, 'Particulares')`;
+  const PAGADOR = `COALESCE(o.arl_nombre, 'PARTICULAR')`; // el mismo rótulo que /horas, /cobro-operacion y vw_horas_ejecutadas
 
-  const [kpis, serie, porArl, porEstado, porProfesional, porTipo, porCiudad, satisfaccion] = await Promise.all([
+  const [kpis, serie, porArl, porEstado, porTipo, porCiudad, satisfaccion] = await Promise.all([
     pool.query(
       `SELECT count(*)::int                                                        AS ordenes,
               COALESCE(sum(o.horas_asignadas), 0)::float                           AS horas,
@@ -66,8 +75,6 @@ router.get('/estadisticas', asyncHandler(async (req, res) => {
               count(*) FILTER (WHERE o.estado = 'EJECUTADA')::int                  AS ejecutadas,
               count(*) FILTER (WHERE o.estado = 'PROGRAMADA')::int                 AS programadas,
               count(*) FILTER (WHERE o.estado = 'SIN PROGRAMAR')::int              AS sin_programar,
-              count(*) FILTER (WHERE o.fecha_vencimiento < CURRENT_DATE
-                                 AND o.estado NOT IN ('FINALIZADA', 'EJECUTADA'))::int AS vencidas,
               count(DISTINCT COALESCE(o.empresa_id::text, o.empresa_nombre))::int  AS empresas,
               count(DISTINCT o.profesional_asignado_id)::int                       AS profesionales,
               COALESCE(sum(o.valor_total), 0)::float                               AS valor
@@ -92,25 +99,6 @@ router.get('/estadisticas', asyncHandler(async (req, res) => {
               COALESCE(sum(o.horas_asignadas), 0)::float AS horas
          FROM sst.vw_ordenes_expandidas o WHERE ${EN_RANGO}
         GROUP BY 1`, params),
-    // Las horas de cada asesor son las SUYAS: en una orden con varios, el
-    // principal lleva las de la orden menos las de sus compañeros.
-    pool.query(
-      `WITH asignadas AS (
-         SELECT o.id, o.estado, o.profesional_asignado_id AS profesional_id,
-                GREATEST(COALESCE(o.horas_asignadas, 0)
-                  - COALESCE((SELECT sum(c.horas) FROM sst.orden_coasesores c WHERE c.orden_id = o.id), 0), 0) AS horas
-           FROM sst.vw_ordenes_expandidas o
-          WHERE ${EN_RANGO} AND o.profesional_asignado_id IS NOT NULL
-         UNION ALL
-         SELECT o.id, o.estado, c.profesional_id, c.horas
-           FROM sst.vw_ordenes_expandidas o JOIN sst.orden_coasesores c ON c.orden_id = o.id
-          WHERE ${EN_RANGO}
-       )
-       SELECT p.nombre AS profesional, count(DISTINCT a.id)::int AS ordenes,
-              COALESCE(sum(a.horas), 0)::float AS horas,
-              count(DISTINCT a.id) FILTER (WHERE a.estado = 'FINALIZADA')::int AS finalizadas
-         FROM asignadas a JOIN sst.profesionales p ON p.id = a.profesional_id
-        GROUP BY p.nombre ORDER BY horas DESC, ordenes DESC, 1`, params),
     pool.query(
       `SELECT COALESCE(o.tipo_orden, 'Sin tipo') AS tipo, count(*)::int AS ordenes,
               COALESCE(sum(o.horas_asignadas), 0)::float AS horas
@@ -120,7 +108,7 @@ router.get('/estadisticas', asyncHandler(async (req, res) => {
       `SELECT COALESCE(NULLIF(btrim(upper(o.ciudad_ejecucion)), ''), 'SIN CIUDAD') AS ciudad,
               count(*)::int AS ordenes, COALESCE(sum(o.horas_asignadas), 0)::float AS horas
          FROM sst.vw_ordenes_expandidas o WHERE ${EN_RANGO}
-        GROUP BY 1 ORDER BY ordenes DESC, 1 LIMIT 8`, params),
+        GROUP BY 1 ORDER BY ordenes DESC, 1`, params),
     // Encuestas de las órdenes del periodo que el cliente ya respondió.
     pool.query(
       `SELECT count(*)::int AS respuestas,
@@ -136,7 +124,6 @@ router.get('/estadisticas', asyncHandler(async (req, res) => {
       serie: serie.rows,
       por_arl: porArl.rows,
       por_estado: porEstado.rows,
-      por_profesional: porProfesional.rows,
       por_tipo: porTipo.rows,
       por_ciudad: porCiudad.rows,
     },
@@ -380,8 +367,15 @@ router.get('/horas', asyncHandler(async (req, res) => {
   }
   if (desde > hasta) throw badRequest('La fecha inicial no puede ser posterior a la final');
 
+  // 20-nov-2026 · Serie para la pestaña Horas de Estadísticas, con la MISMA regla
+  // de grano que `/estadisticas` (por día hasta 62 días, por mes después). Es un
+  // campo NUEVO: `totales`, `por_profesional`, `por_arl` y `por_mes` siguen igual
+  // porque la gráfica de Indicadores del Inicio los lee tal cual.
+  const dias = Math.round((Date.parse(hasta) - Date.parse(desde)) / 86400000) + 1;
+  const grano = dias <= 62 ? 'day' : 'month';
+
   const rango = [desde, hasta];
-  const [porProfesional, porArl, porMes, totales] = await Promise.all([
+  const [porProfesional, porArl, porMes, totales, serie] = await Promise.all([
     pool.query(
       // Los viáticos van en su propia columna, no sumados a nada: son un
       // reembolso de gasto y mezclarlos con las horas o con los honorarios haría
@@ -409,15 +403,109 @@ router.get('/horas', asyncHandler(async (req, res) => {
               count(DISTINCT profesional_id)::int AS profesionales
          FROM sst.vw_horas_ejecutadas
         WHERE fecha_ejecucion BETWEEN $1::date AND $2::date`, rango),
+    pool.query(
+      `SELECT to_char(b.inicio, 'YYYY-MM-DD')              AS inicio,
+              COALESCE(sum(h.horas), 0)::float             AS horas,
+              count(DISTINCT h.orden_id)::int              AS ordenes
+         FROM generate_series(date_trunc('${grano}', $1::date), date_trunc('${grano}', $2::date), '1 ${grano}') AS b(inicio)
+         LEFT JOIN sst.vw_horas_ejecutadas h
+                ON date_trunc('${grano}', h.fecha_ejecucion) = b.inicio
+               AND h.fecha_ejecucion BETWEEN $1::date AND $2::date
+        GROUP BY b.inicio ORDER BY b.inicio`, rango),
   ]);
 
   res.json({
     data: {
-      desde, hasta,
+      desde, hasta, grano,
+      serie: serie.rows,
       totales: totales.rows[0],
       por_profesional: porProfesional.rows,
       por_arl: porArl.rows,
       por_mes: porMes.rows,
+    },
+  });
+}));
+
+/**
+ * 20-nov-2026 · Estadísticas → pestaña Cobro (veredicto `op-veredicto.md` §2.2).
+ * «De lo que ya se finalizó, ¿qué falta por facturar y dónde está atascado?».
+ *
+ * Es una EXISTENCIA (el estado de hoy): no recibe periodo.
+ *
+ * La BASE y el MONTO son los de «Finalizadas sin visto bueno» de `/inicio`, a
+ * propósito: la cifra de «Sin visto bueno» de esta pestaña tiene que ser
+ * EXACTAMENTE la del Inicio, o la oficina vería dos números para lo mismo.
+ *  · Base: OS FINALIZADA que está en la bandeja de Órdenes (tiene un borrador
+ *    VALIDADA y no deshabilitado). Una OS sembrada a mano, sin borrador, no está
+ *    en ninguna pantalla de trabajo y tampoco cuenta aquí.
+ *  · Monto: `sqlTotalCobro` = honorarios + los cinco gastos `cobro_*`, el TOTAL
+ *    del modal de Cobro y lo que la facturación cobra. NO `valor_total` (puede
+ *    traer escrita cualquier cifra) ni `valor_cobro_total` (lo que se le paga al
+ *    profesional).
+ *
+ * Tres etapas excluyentes, evaluadas en este orden:
+ *  1. `sin_visto_bueno`: sin `cobro_aprobado_en` (igual que el Inicio, también en
+ *     el caso raro de una FACTURADA sin visto bueno);
+ *  2. `facturada`: `estado_cobro = 'FACTURADA'`;
+ *  3. `por_facturar`: con visto bueno y NO FACTURADA.
+ * «Por facturar» en la pantalla = etapa 1 + etapa 3. No hay «por cobrar»: eso es
+ * Cartera, en Finanzas, y el estado PAGADA se retiró el 23-ago.
+ *
+ * `?detalle=1` añade una fila por orden (el Excel de la pestaña), hasta el tope
+ * de filas exportables.
+ */
+router.get('/cobro-operacion', asyncHandler(async (req, res) => {
+  const conDetalle = req.query.detalle === '1' || req.query.detalle === 'true';
+  const BASE = `
+    WITH base AS (
+      SELECT o.id, o.codigo, COALESCE(a.nombre, 'PARTICULAR') AS arl,
+             COALESCE(${sqlTotalCobro('o')}, 0) AS total,
+             CASE WHEN o.cobro_aprobado_en IS NULL THEN 'sin_visto_bueno'
+                  WHEN o.estado_cobro = 'FACTURADA' THEN 'facturada'
+                  ELSE 'por_facturar' END AS etapa,
+             o.cobro_numero_factura, o.empresa_nombre, o.nit_nic, p.nombre AS profesional_nombre,
+             o.horas_asignadas,
+             to_char(o.fecha_ejecucion AT TIME ZONE 'America/Bogota', 'YYYY-MM-DD') AS fecha_ejecucion,
+             to_char(o.cobro_aprobado_en AT TIME ZONE 'America/Bogota', 'YYYY-MM-DD') AS cobro_aprobado_en
+        FROM sst.ordenes_servicio o
+        LEFT JOIN sst.arls a ON a.id = o.arl_id
+        LEFT JOIN sst.profesionales p ON p.id = o.profesional_asignado_id
+       WHERE o.estado = 'FINALIZADA'
+         AND EXISTS (SELECT 1 FROM sst.borradores_extraccion d
+                      WHERE d.orden_servicio_id = o.id AND d.estado = 'VALIDADA' AND d.deshabilitado = false)
+    )`;
+
+  const [etapas, porArl, detalle] = await Promise.all([
+    // Siempre las tres etapas, en 0 si no hay: la barra y la leyenda no cambian de forma.
+    pool.query(
+      `${BASE}
+       SELECT e.etapa, count(b.id)::int AS ordenes, COALESCE(sum(b.total), 0)::float AS monto
+         FROM unnest(ARRAY['sin_visto_bueno', 'por_facturar', 'facturada']) WITH ORDINALITY AS e(etapa, n)
+         LEFT JOIN base b ON b.etapa = e.etapa
+        GROUP BY e.etapa, e.n ORDER BY e.n`),
+    pool.query(
+      `${BASE}
+       SELECT arl, count(*)::int AS ordenes, COALESCE(sum(total), 0)::float AS monto
+         FROM base WHERE etapa IN ('sin_visto_bueno', 'por_facturar')
+        GROUP BY arl ORDER BY monto DESC, ordenes DESC, arl`),
+    conDetalle
+      ? pool.query(
+          `${BASE}
+           SELECT codigo, etapa, cobro_numero_factura, arl, empresa_nombre, nit_nic, profesional_nombre,
+                  horas_asignadas::float AS horas_asignadas, total::float AS total, fecha_ejecucion, cobro_aprobado_en
+             FROM base
+            ORDER BY CASE etapa WHEN 'sin_visto_bueno' THEN 1 WHEN 'por_facturar' THEN 2 ELSE 3 END,
+                     fecha_ejecucion DESC NULLS LAST, codigo
+            LIMIT ${MAX_FILAS_XLSX}`)
+      : null,
+  ]);
+
+  res.json({
+    data: {
+      hoy: hoyCO(),
+      etapas: etapas.rows,
+      por_arl: porArl.rows,
+      ...(detalle ? { detalle: detalle.rows } : {}),
     },
   });
 }));

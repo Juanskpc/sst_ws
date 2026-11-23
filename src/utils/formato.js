@@ -82,6 +82,9 @@ export function horaAmPm(hhmm) {
   if (!m24) return '—';
   const hora = Number(m24[1]);
   const minuto = Number(m24[2]);
+  // 22-nov-2026 · '24:00' es un fin de franja válido (medianoche, fin de ESE día):
+  // se imprime 12:00 AM. Cualquier otro valor por encima de 23:59 sigue siendo basura.
+  if (hora === 24 && minuto === 0) return '12:00 AM';
   if (hora > 23 || minuto > 59) return '—';
   const periodo = hora >= 12 ? 'PM' : 'AM';
   const doce = hora % 12 === 0 ? 12 : hora % 12;

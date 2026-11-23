@@ -46,7 +46,7 @@ function avisoDeDuplicado({ archivo, deteccion }) {
  * extracción, y para entonces la petición de IA ya estaba gastada.
  */
 router.post('/precheck', requireRole('admin'), uploadImport.single('file'), asyncHandler(async (req, res) => {
-  if (!req.file) throw badRequest('Adjunta un archivo en el campo "file"');
+  if (!req.file) throw badRequest('Adjunte un archivo en el campo "file"');
   const { originalname, mimetype, buffer } = req.file;
   const deteccion = await detectarOrdenExistente({ buffer, mime: mimetype, filename: originalname });
   res.json({
@@ -59,7 +59,7 @@ router.post('/precheck', requireRole('admin'), uploadImport.single('file'), asyn
 
 // IMP-01/02 · Subir archivo (Excel SIPAB o PDF). Responde de inmediato (NFR<2s).
 router.post('/', requireRole('admin'), uploadImport.single('file'), asyncHandler(async (req, res) => {
-  if (!req.file) throw badRequest('Adjunta un archivo en el campo "file"');
+  if (!req.file) throw badRequest('Adjunte un archivo en el campo "file"');
   const { originalname, mimetype, buffer } = req.file;
 
   // IMP-09 · Última barrera antes de gastar la petición de IA. La vista ya hace

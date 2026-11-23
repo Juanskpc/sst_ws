@@ -197,7 +197,22 @@ function normalizarFranjas(entrada) {
     if (!/^\d{4}-\d{2}-\d{2}$/.test(fecha) || !/^\d{2}:\d{2}$/.test(ini) || !/^\d{2}:\d{2}$/.test(fin)) {
       throw badRequest(`Franja ${i + 1}: se esperaba fecha (YYYY-MM-DD) y horas (HH:MM).`);
     }
-    if (fin <= ini) throw badRequest(`Franja ${i + 1} (${fecha}): la hora de fin debe ser mayor que la de inicio.`);
+    // 22-nov-2026 · El inicio va de 00:00 a 23:59 y el fin hasta 24:00 (medianoche
+    // como fin de ESE día, que Postgres guarda tal cual en `time` y resta bien).
+    // Antes no se comprobaba el rango y un '25:00' llegaba hasta la BD.
+    const [hi, mi] = ini.split(':').map(Number);
+    const [hf, mf] = fin.split(':').map(Number);
+    if (hi > 23 || mi > 59 || hf > 24 || mf > 59 || (hf === 24 && mf > 0)) {
+      throw badRequest(`Franja ${i + 1} (${fecha}): hora no válida (${ini}–${fin}). La franja puede terminar como tarde a las 12:00 a. m. (24:00).`);
+    }
+    if (fin <= ini) {
+      // Una franja no cruza la medianoche: sus horas se calculan dentro del día,
+      // y 22:00–02:00 daría una duración negativa. Se bloquea con un mensaje claro.
+      throw badRequest(
+        `Franja ${i + 1} (${fecha}): la hora de fin debe ser mayor que la de inicio. ` +
+        'Una franja no puede pasar de la medianoche: termínela como tarde a las 12:00 a. m. (24:00).'
+      );
+    }
     const profesional_id = String(f?.profesional_id ?? '').trim() || null;
     return { fecha, hora_inicio: ini, hora_fin: fin, profesional_id };
   });
@@ -1186,8 +1201,8 @@ async function aplicarAsignacion(req, client, { vistaPrevia = false } = {}) {
   const objetivoMin = Math.round(Number(horasOrden ?? 0) * 60);
   if (franjas.length && objetivoMin > 0 && minutosDeFranjas(franjas) > objetivoMin) {
     throw badRequest(
-      `Las franjas suman ${horasTexto(minutosDeFranjas(franjas) / 60)} y la orden tiene ` +
-      `${horasTexto(horasOrden)} asignadas. Quite horas antes de guardar.`
+      `Las franjas suman ${horasTexto(minutosDeFranjas(franjas) / 60)} h y la orden tiene ` +
+      `${horasTexto(horasOrden)} h asignadas. Quite horas antes de guardar.`
     );
   }
   // Solo se programa cuando la visita está repartida por completo.
@@ -1514,7 +1529,9 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
   const franjasDe = (profesionalId) => result.franjas.filter(
     (f) => (f.profesional_id ?? result.profesional.id) === profesionalId,
   );
-  const invitacionesPara = (profesional, principal) => adjuntosInvitacion(construirInvitaciones({
+  // 22-nov-2026 · Devuelve las invitaciones con su sesión y su horario (no los
+  // adjuntos todavía): el cuerpo del correo las enumera aparte de los formatos.
+  const invitacionesPara = (profesional, principal) => construirInvitaciones({
     orden: result.orden,
     profesional,
     organizador: { nombre: req.user.nombre, correo: req.user.correo },
@@ -1524,7 +1541,7 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
     // El administrador va en copia de todos: sin esto las invitaciones de dos
     // asesores compartirían UID y en su calendario una pisaría a la otra.
     sufijoUid: principal ? '' : `-${String(profesional.id).slice(0, 8)}`,
-  }));
+  });
 
   const o = result.orden;
   const esRepro = result.esReprogramacion;
@@ -1563,12 +1580,23 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
       const ya = adjuntos.find((a) => a.etiqueta === etiqueta);
       // Los de alcance 'sesion' salen repetidos, uno por franja: se cuentan en
       // vez de repetir la misma línea tres veces.
-      if (ya) ya.copias += 1;
-      else adjuntos.push({ etiqueta, copias: 1, prediligenciado: d._prediligenciado !== false });
+      // 22-nov-2026 · Con la fecha de cada sesión, para que se vea qué hoja es de qué día.
+      const fechaSesion = d._sesion?.fecha || null;
+      if (ya) {
+        ya.copias += 1;
+        if (fechaSesion) ya.fechas.push(fechaSesion);
+      } else {
+        adjuntos.push({
+          etiqueta, copias: 1, prediligenciado: d._prediligenciado !== false,
+          fechas: fechaSesion ? [fechaSesion] : [],
+        });
+      }
     }
-    const listaAdjuntos = adjuntos.map(
-      (a) => (a.copias > 1 ? `${a.etiqueta} · ${a.copias} juegos, uno por franja` : a.etiqueta),
-    );
+    const listaAdjuntos = adjuntos.map((a) => {
+      if (a.copias <= 1) return a.etiqueta;
+      const dias = a.fechas.length === a.copias ? `: ${a.fechas.join(', ')}` : '';
+      return `${a.etiqueta} · ${a.copias} archivos, uno por sesión${dias}`;
+    });
     const hayPrediligenciados = adjuntos.some((a) => a.prediligenciado);
     const hayTalCual = adjuntos.some((a) => !a.prediligenciado);
     // Cada frase solo aparece si le corresponde un adjunto de esa clase.
@@ -1637,6 +1665,21 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
     const fechaDest = suyas.length ? fechaCO(instanteCO(suyas[0].fecha, suyas[0].hora_inicio)) : fecha;
     const docsDest = docsDe(dest.profesional.id);
     const { listaAdjuntos, queHacerConEllos } = adjuntosDe(docsDest);
+    // 22-nov-2026 · Las invitaciones .ics se enumeran APARTE de los formatos y se
+    // dice que no lo son: el cliente confundió «OS-2026-0249-1de4.ics …» con los
+    // formatos que faltaban (reporte del 20-nov).
+    const listaInvitaciones = invitaciones.map((inv, i) => {
+      const franja = suyas[i];
+      const cuando = inv.cancelado ? 'cancelada, se quita del calendario' : franja ? franjaEnTexto(franja) : fechaDest;
+      return invitaciones.length > 1 ? `Sesión ${inv.sesion} · ${cuando}` : cuando;
+    });
+    const notaInvitaciones = invitaciones.length
+      ? (invitaciones.length === 1
+          ? 'El archivo de calendario (.ics) NO es un formato: es la invitación para agregar la visita a tu calendario. '
+          : `Los ${invitaciones.length} archivos de calendario (.ics, «Calendario - sesion N de …») NO son formatos: son las ` +
+            'invitaciones para agregar cada sesión a tu calendario. ') +
+        'Ábrelos o pulsa «Agregar al calendario»; no se imprimen ni se devuelven.'
+      : null;
     const horasDest = equipo.length || result.parcial ? horasTexto(dest.horas) : horasTexto(o.horas_asignadas);
     const notaEquipo = equipo.length
       ? `Esta orden la ejecutan varios asesores, cada uno con su horario y sus horas. ` +
@@ -1693,7 +1736,9 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
         (queDevolver ? `Al terminar tendrás que subir: ${queDevolver}.\n` : '') +
         `Enlace para subir los soportes (sin login):\n${supportUrl}\n` +
         (invitaciones.length
-          ? `\nAdjuntamos ${invitaciones.length === 1 ? 'la invitación' : `${invitaciones.length} invitaciones`} para tu calendario.\n`
+          ? `\nInvitaciones de calendario (no son formatos):\n` +
+            listaInvitaciones.map((l) => `  · ${l}\n`).join('') +
+            `${notaInvitaciones}\n`
           : ''),
       html: correoHtml({
         titulo: esRepro ? 'Visita reprogramada' : 'Nueva orden de servicio asignada',
@@ -1764,11 +1809,17 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
           parrafo('Cuando termines la visita, sube los soportes firmados desde aquí (no necesitas iniciar sesión):'),
           boton('Subir soportes firmados', supportUrl),
           enlaceCrudo(supportUrl),
+          // 22-nov-2026 · Al final y aparte de los formatos: qué es cada .ics.
+          invitaciones.length
+            // Caja «secundaria» (blanca, borde punteado): no se confunde con la de formatos.
+            ? bloqueLista('Invitaciones de calendario (no son formatos)', listaInvitaciones, { secundaria: true })
+            : '',
+          notaInvitaciones ? parrafo(notaInvitaciones) : '',
         ].join(''),
       }),
       attachments: [
         ...docsDest.map((d) => ({ filename: d._filename, content: d._buffer })),
-        ...invitaciones,
+        ...adjuntosInvitacion(invitaciones),
       ],
     });
   };

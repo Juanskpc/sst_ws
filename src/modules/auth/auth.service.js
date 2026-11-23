@@ -8,6 +8,14 @@ import { pool } from '../../config/db.js';
 import { env } from '../../config/env.js';
 import { randomToken, hashToken, hashPassword } from '../../utils/security.js';
 import { sendEmail } from '../../services/email.service.js';
+import { correoHtml, parrafo, boton, enlaceCrudo, bloqueAviso } from '../../services/email-layout.service.js';
+
+/**
+ * 22-nov-2026 · Los dos correos de contraseña iban SOLO en texto plano: eran los
+ * únicos sin la cara de la plataforma. Ahora llevan la misma maqueta que los
+ * demás, con las mismas frases (el texto plano no cambia).
+ */
+const PIE_AUTH = 'JD&D Consultores';
 
 /** Eventos auditables. Mantener nombres estables: son datos, no código. */
 export const EVENTOS = {
@@ -83,6 +91,18 @@ export async function emitirTokenRecuperacion(usuario, req) {
       `Recibimos una solicitud para restablecer tu contraseña. Ingresa a:\n${link}\n\n` +
       `El enlace vence en ${ttl} minutos y solo puede usarse una vez.\n` +
       `Si no solicitaste este cambio, ignora este correo: tu contraseña actual sigue vigente.`,
+    html: correoHtml({
+      titulo: 'Recuperación de contraseña',
+      pie: PIE_AUTH,
+      cuerpo: [
+        parrafo(`Hola ${usuario.nombre},`),
+        parrafo('Recibimos una solicitud para restablecer tu contraseña. Ingresa a:'),
+        boton('Restablecer contraseña', link),
+        enlaceCrudo(link),
+        bloqueAviso(`El enlace vence en ${ttl} minutos y solo puede usarse una vez.`),
+        parrafo('Si no solicitaste este cambio, ignora este correo: tu contraseña actual sigue vigente.'),
+      ].join(''),
+    }),
   });
   return token;
 }
@@ -137,6 +157,15 @@ export async function canjearTokenRecuperacion(token, nuevaPassword, req) {
       text:
         `Hola ${fila.nombre},\n\nTu contraseña se actualizó correctamente.\n` +
         `Si no realizaste este cambio, contacta de inmediato al equipo de soporte.`,
+      html: correoHtml({
+        titulo: 'Contraseña actualizada',
+        pie: PIE_AUTH,
+        cuerpo: [
+          parrafo(`Hola ${fila.nombre},`),
+          parrafo('Tu contraseña se actualizó correctamente.'),
+          bloqueAviso('Si no realizaste este cambio, contacta de inmediato al equipo de soporte.'),
+        ].join(''),
+      }),
     }).catch((err) => console.error('⚠ correo de confirmación falló:', err.message));
 
     return fila;

@@ -210,11 +210,25 @@ export function construirInvitaciones({
   // Un adjunto por franja lo obliga a mostrar una tarjeta por cada una. Los UID
   // siguen siendo los mismos (`os-<id>-<n>`), de modo que reprogramar mueve cada
   // evento en su sitio y las franjas sobrantes se siguen cancelando.
+  //
+  // 22-nov-2026 · El nombre dice que es una INVITACIÓN DE CALENDARIO y de qué
+  // sesión. Con «OS-2026-0249-1de4.ics» el cliente creyó que eran los formatos
+  // que faltaban (reporte del 20-nov). Las canceladas lo dicen y no cuentan en
+  // el «de N», que es el número de sesiones vigentes.
+  const vigentes = tramos.filter((t) => !t.cancelado).length;
   return tramos.map((t, i) => ({
     contenido: calendario(evento(t)),
-    nombre: tramos.length > 1
-      ? `${orden.codigo}-${i + 1}de${tramos.length}.ics`
-      : `${orden.codigo}.ics`,
+    nombre: t.cancelado
+      ? `Calendario - sesion ${i + 1} CANCELADA - ${orden.codigo}.ics`
+      : vigentes > 1
+        ? `Calendario - sesion ${i + 1} de ${vigentes} - ${orden.codigo}.ics`
+        : `Calendario - ${orden.codigo}.ics`,
+    // Para el cuerpo del correo: qué sesión es y cuándo.
+    sesion: i + 1,
+    total: vigentes,
+    inicio: t.inicio,
+    fin: t.fin,
+    cancelado: t.cancelado,
   }));
 }
 

@@ -1,5 +1,6 @@
 import nodemailer from 'nodemailer';
 import { env } from '../config/env.js';
+import { LOGO_CID, LOGO_JDD_CID, adjuntoLogo, adjuntoLogoJdd } from './email-layout.service.js';
 
 let transporter = null;
 if (env.email.driver === 'smtp' && env.email.host) {
@@ -39,6 +40,19 @@ export async function sendEmail({ to, cc, subject, text, html, attachments }) {
     if (attachments?.length) console.log(`   Adjuntos: ${attachments.map((a) => a.filename).join(', ')}`);
     console.log('');
     return { queued: true, driver: 'console' };
+  }
+  // 22-nov-2026 · El logo de ORBITA de la cabecera (`correoHtml`) viaja como
+  // imagen en línea (`cid:`), no como enlace: así se ve sin «mostrar imágenes».
+  // Se añade aquí, una sola vez, para que ningún remitente tenga que acordarse.
+  // No es un adjunto más para quien lo recibe: va dentro del cuerpo.
+  if (html?.includes(`cid:${LOGO_CID}`) && !attachments?.some((a) => a.cid === LOGO_CID)) {
+    const logo = adjuntoLogo();
+    if (logo) attachments = [...(attachments ?? []), logo];
+  }
+  // 23-nov-2026 · Lo mismo con el logo de JD&D de los correos a clientes.
+  if (html?.includes(`cid:${LOGO_JDD_CID}`) && !attachments?.some((a) => a.cid === LOGO_JDD_CID)) {
+    const logo = adjuntoLogoJdd();
+    if (logo) attachments = [...(attachments ?? []), logo];
   }
   const info = await transporter.sendMail({
     from: env.email.from,

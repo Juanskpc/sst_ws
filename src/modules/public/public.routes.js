@@ -156,7 +156,7 @@ router.post('/support/:token/files', uploadSupports, asyncHandler(async (req, re
   const entrantes = Object.entries(req.files || {}).flatMap(([campo, archivos]) =>
     (archivos || []).map((archivo) => ({ archivo, categoria: normalizarCategoria(campo) })),
   );
-  if (!entrantes.length) throw badRequest('Adjunta al menos un archivo');
+  if (!entrantes.length) throw badRequest('Adjunte al menos un archivo');
 
   const result = await withTransaction(async (client) => {
     const row = await resolveToken(req.params.token, client);

@@ -277,7 +277,7 @@ router.put('/:id', requireRole('admin'), asyncHandler(async (req, res) => {
     ? undefined
     : (String(req.body.tipo_viatico_id ?? '').trim() || null);
   if (!fields && tipoOrdenId === undefined && tipoViaticoId === undefined) {
-    throw badRequest('Envía "fields" con los campos editados, "tipo_orden_id" o "tipo_viatico_id".');
+    throw badRequest('Envíe "fields" con los campos editados, "tipo_orden_id" o "tipo_viatico_id".');
   }
   if (tipoViaticoId) {
     const tv = await pool.query(`SELECT id FROM sst.tipos_viatico WHERE id=$1 AND activo`, [tipoViaticoId]);

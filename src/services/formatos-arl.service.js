@@ -92,8 +92,18 @@ const FORMATOS = {
   // visita se reparta en varios días (el AT-028 de asistencia sí va uno por
   // sesión, y sigue en 'sesion' más abajo). `camposSeguimientoBolivar` recibe
   // por eso el TRAMO de la visita entera (`tramoDe`), no una sesión suelta.
+  //
+  // 22-nov-2026 · Pero SOLO cuando lo acompaña el AT-028 (capacitación
+  // presencial), que es donde cada sesión ya tiene su hoja de asistencia. En la
+  // asesoría y la asistencia técnica el AT-031 ES la hoja de la sesión —trae la
+  // fecha de prestación, el horario y las firmas de los asistentes— y el cliente
+  // reportó el 20-nov (OS-2026-0249, 4 sesiones) que llegó UNO cuando debían
+  // llegar cuatro. Los escaneos que mandó la oficina el 20-oct ya traían dos
+  // hojas de AT-031 en las órdenes de varias sesiones. `alcance` puede ser una
+  // función de la entrega (las claves de formatos que salen).
   at031: {
-    archivo: 'bolivar/seguimiento.pdf', modo: 'acroform', alcance: 'orden',
+    archivo: 'bolivar/seguimiento.pdf', modo: 'acroform',
+    alcance: (formatos) => (formatos.includes('at028') ? 'orden' : 'sesion'),
     tipo: 'seguimiento', nombre: 'seguimiento.pdf',
     etiqueta: 'Seguimiento de reuniones y actividades (AT-031)',
     campos: camposSeguimientoBolivar, marcas: marcasSeguimientoBolivar,
@@ -103,7 +113,12 @@ const FORMATOS = {
     editables: () => EDITABLES_AT031,
     // 16-oct · Sobre la raya «FIRMA ARL» del pie (la del participante ARL, el profesional).
     // 24-oct-2026 · Más grande (JD&D lo pidió): cruza la raya como una firma a mano, sin pasar de la casilla (arriba hay texto de la ARL).
-    firma: [[0, 172, 84, 215, 29]],
+    // 22-nov-2026 · «Siguen muy pequeñas» (JD&D, 20-nov). La firma sale del tamaño del ALTO
+    // de la caja (las firmas son más anchas que altas), y encima de la raya solo hay 29 pt.
+    // Ahora cruza la raya hasta el borde de abajo de la celda (73 → 113 = 40 pt de alto,
+    // casi el doble de superficie), a la IZQUIERDA del rótulo «FIRMA ARL» (x 256-286) para
+    // no pisarlo. Medido con `2-pruebas/firmas-22-nov/escanear.mjs`.
+    firma: [[0, 182, 73, 72, 40]],
   },
   at028: {
     archivo: 'bolivar/asistencia.pdf', modo: 'acroform', alcance: 'sesion',
@@ -147,7 +162,8 @@ const FORMATOS = {
     campos: camposFichaAxa,
     editables: () => EDITABLES_FICHA_AXA,
     // 16-oct · Recuadro «Firma - Profesional ejecutor de la actividad» (pág. 3).
-    firma: [[2, 285, 62, 268, 58, { recuadro: true }]],
+    // 22-nov-2026 · Todo el alto del recuadro (57 → 126,5), con 2 pt de aire.
+    firma: [[2, 285, 59, 268, 66, { recuadro: true }]],
   },
   informeAxa: {
     archivo: 'colpatria/informe-tecnico.docx', modo: 'adjunto', alcance: 'orden',
@@ -205,10 +221,14 @@ const FORMATOS = {
       // El resto del SPM-F 38 lo escribió Colmena: solo es de Orbita el nombre.
       editables: () => EDITABLES_SPM38,
       // 16-oct · Sobre la raya de «FIRMA», a la derecha del nombre del profesional.
-      firma: [[0, 450, 241, 120, 25]],
+      // 22-nov-2026 · Más grande: cruza la raya (y 237) hacia abajo hasta antes del «_»
+      // suelto del original (y 226) y sube hasta el borde de la fila (266,5).
+      firma: [[0, 445, 228, 128, 37]],
     },
     // 16-oct · Raya «FIRMA» del bloque del proveedor (PSP-F-007).
-    firma: [[0, 600, 359, 165, 36]],
+    // 22-nov-2026 · El doble de alto: encima de la raya (y 356) no hay nada hasta el borde
+    // de la fila (430,5).
+    firma: [[0, 600, 357, 165, 70]],
   },
   // 29-sep · La asistencia vigente es el "Registro de Ejecución de Actividades
   // de Prevención y de Formación" (PSP-F-006 V3 03/2026), el que JD&D radica de
@@ -228,7 +248,11 @@ const FORMATOS = {
     // de observaciones solo hay 14 pt, así que la firma ahora se monta sobre el borde
     // inferior del recuadro, como una firma a mano (el 3.er renglón de observaciones
     // se acortó para no chocar con ella). Por debajo no puede bajar: está el rótulo FIRMA.
-    firma: [[0, 497, 93, 166, 28]],
+    // 22-nov-2026 · «Siguen muy pequeñas»: ahora cruza también la raya hacia abajo (hasta
+    // y 75, por encima del pie de página) y se corre a la DERECHA del rótulo «FIRMA»
+    // (x 571-591), donde no hay texto: 44 pt de alto en vez de 28. Arriba no pasa de 119,
+    // donde empiezan las letras del 2.º renglón de observaciones.
+    firma: [[0, 596, 75, 84, 44]],
   },
   evaluacionColmena: {
     archivo: 'colmena/evaluacion.pdf', modo: 'plano', alcance: 'sesion',
@@ -1239,7 +1263,11 @@ export async function generarFormatosArl({
   // las vuelve a pedir.
   const definiciones = entrega.formatos
     .filter((clave) => FORMATOS[clave])
-    .map((clave) => ({ ...FORMATOS[clave], clave }));
+    .map((clave) => {
+      const def = FORMATOS[clave];
+      const alcance = typeof def.alcance === 'function' ? def.alcance(entrega.formatos) : def.alcance;
+      return { ...def, alcance, clave };
+    });
   const obsDe = (def) => enBlanco(observaciones?.[def.clave]);
   const extra = (def) => ({ observacion: obsDe(def), campos: campos?.[def.clave] || {} });
 
@@ -1260,11 +1288,20 @@ export async function generarFormatosArl({
   }
 
   // 2) Los de alcance 'sesion': uno por franja.
+  // 22-nov-2026 · Con varias sesiones el nombre dice CUÁL es y de qué fecha
+  // («seguimiento - sesion 2 de 4 (20-11-2026).pdf»); antes era «-2» a secas y
+  // en el correo no se distinguían de las invitaciones de calendario.
   for (const [i, franja] of sesiones.entries()) {
     const sesion = sesionDe(orden, franja);
-    const sufijo = sesiones.length > 1 ? `-${i + 1}` : '';
+    const info = sesiones.length > 1
+      ? { numero: i + 1, total: sesiones.length, fecha: sesion.fechaCorta }
+      : null;
+    const sufijo = info
+      ? ` - sesion ${info.numero} de ${info.total}${info.fecha ? ` (${info.fecha.replace(/\//g, '-')})` : ''}`
+      : '';
     for (const def of definiciones.filter((d) => d.alcance === 'sesion')) {
-      generados.push(salida(def, await construir(def, orden, profesional, sesion, identidad, original, extra(def)), sufijo));
+      const doc = salida(def, await construir(def, orden, profesional, sesion, identidad, original, extra(def)), sufijo);
+      generados.push({ ...doc, sesion: info });
     }
   }
   return generados;

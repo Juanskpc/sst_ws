@@ -7,6 +7,7 @@ import { auxiliarPorCuenta, informePorTercero } from './auxiliar.service.js';
 import { libroAuxiliar } from './libros.service.js';
 import { ventasPorCliente } from './ventas.service.js';
 import { estadoResultados, estadoSituacionFinanciera } from './estados.service.js';
+import { estadisticasFinanzas } from './estadisticas.service.js';
 import { enviarLibro, libroConEncabezado, pesos, titulosDeColumna } from './excel.js';
 
 const router = Router();
@@ -39,6 +40,13 @@ async function lineasDeFiltro(f) {
   if (f.sinCierre) lineas.push('Sin el comprobante de cierre de año');
   return lineas;
 }
+
+// ─── Estadísticas de Finanzas (tablero de solo lectura) ──────────────────────
+
+// ?periodo=mes|trimestre|anio&ref=AAAA-MM (sin ellos, el mes en curso).
+router.get('/estadisticas', LEER, asyncHandler(async (req, res) => {
+  res.json({ data: await estadisticasFinanzas(req.query) });
+}));
 
 // ─── C1-01 · Balance de comprobación (RPC-06) ────────────────────────────────
 

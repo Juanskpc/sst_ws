@@ -257,6 +257,9 @@ export async function generateOrderDocuments(orderId, client = pool, { guardar =
           _clave: formato.clave, _admiteObservaciones: !!formato.admiteObservaciones,
           _editables: formato.editables || [],
           _profesionalId: juego.de?.id ?? null, _profesionalNombre: juego.de?.nombre ?? null,
+          // 22-nov-2026 · { numero, total, fecha } en los de una sesión de varias:
+          // el correo dice qué hoja corresponde a qué día.
+          _sesion: formato.sesion ?? null,
         };
         if (!guardar) {
           created.push({ tipo: formato.tipo, ...extra });
