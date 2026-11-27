@@ -182,7 +182,13 @@ async function conFirma(ficha) {
   }
 }
 
-export async function generateOrderDocuments(orderId, client = pool, { guardar = true } = {}) {
+/**
+ * 26-nov-2026 · `soloPendientes`: en una orden que se envía por partes, cada asesor
+ * recibe solo lo que todavía no tiene — los formatos de sus sesiones sin
+ * `enviada_en` y, si es su primer envío, los de alcance 'orden'. Un asesor sin
+ * sesiones nuevas no recibe nada. Sin la opción sale el juego completo (reenviar todo).
+ */
+export async function generateOrderDocuments(orderId, client = pool, { guardar = true, soloPendientes = false } = {}) {
   const order = await getOrderExpanded(orderId, client);
   // A3-01 · La orden de un cliente particular no lleva formatos: los que hay son
   // de las ARL, y las plantillas genéricas (`arl_id` NULL) saldrían con la casilla
@@ -202,7 +208,8 @@ export async function generateOrderDocuments(orderId, client = pool, { guardar =
   // Se leen aquí y no se reciben por parámetro para que el formato salga con lo
   // que quedó guardado en esta misma transacción, no con lo que traía el body.
   const todas = (await client.query(
-    `SELECT profesional_id, fecha::text AS fecha, hora_inicio::text AS hora_inicio, hora_fin::text AS hora_fin
+    `SELECT profesional_id, fecha::text AS fecha, hora_inicio::text AS hora_inicio, hora_fin::text AS hora_fin,
+            enviada_en
        FROM sst.franjas_visita WHERE orden_id=$1 ORDER BY fecha, hora_inicio`,
     [orderId]
   )).rows;
@@ -239,10 +246,14 @@ export async function generateOrderDocuments(orderId, client = pool, { guardar =
     const aliado = await aliadoEstrategico(client);
     const original = await pdfOriginalDeColmena(orderId, order.arl_nombre, client);
     for (const juego of juegos) {
+      const yaTiene = soloPendientes && juego.franjas.some((f) => f.enviada_en);
+      if (yaTiene && juego.franjas.every((f) => f.enviada_en)) continue;
       const propios = await generarFormatosArl({
         orden: order, profesional: juego.profesional, franjas: juego.franjas, aliado, original,
         observaciones: order.observaciones_formatos || {},
         campos: order.campos_formatos || {},
+        emitirSesion: soloPendientes ? (f) => !f.enviada_en : undefined,
+        emitirPorOrden: !yaTiene,
       });
       // El nombre del asesor va delante del archivo: dos juegos con el mismo
       // nombre se pisarían en el almacenamiento y en el correo no se distinguirían.
@@ -278,6 +289,8 @@ export async function generateOrderDocuments(orderId, client = pool, { guardar =
     }
   }
   if (created.length) return created;
+  // Las plantillas genéricas son de la orden entera: van solo en el primer envío.
+  if (soloPendientes && todas.some((f) => f.enviada_en)) return created;
 
   const tpls = await client.query(
     // CFG-03 · `orden` deja al administrador decidir en qué secuencia salen los

@@ -844,6 +844,12 @@ ALTER TABLE sst.franjas_visita
   ADD COLUMN IF NOT EXISTS profesional_id UUID REFERENCES sst.profesionales(id);
 CREATE INDEX IF NOT EXISTS idx_franjas_visita_profesional ON sst.franjas_visita(profesional_id);
 
+-- 26-nov-2026 · Qué sesiones ya se le enviaron al asesor, para que un envío parcial
+-- posterior mande solo las nuevas. Ver db/migraciones/2026-11-26-franjas-enviadas.sql.
+ALTER TABLE sst.franjas_visita ADD COLUMN IF NOT EXISTS enviada_en TIMESTAMPTZ;
+ALTER TABLE sst.franjas_visita ADD COLUMN IF NOT EXISTS enviada_a UUID REFERENCES sst.profesionales(id) ON DELETE SET NULL;
+ALTER TABLE sst.franjas_visita ADD COLUMN IF NOT EXISTS ics_uid TEXT;
+
 -- M4 · Documentos generados (formatos PDF auto-diligenciados) ------------------
 CREATE TABLE IF NOT EXISTS sst.documentos_generados (
   id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),

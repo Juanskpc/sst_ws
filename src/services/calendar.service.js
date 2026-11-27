@@ -86,25 +86,42 @@ function fechaHoraCO(fecha, hora) {
  * @param {number} previas      Cuántas franjas tenía antes de reprogramar.
  * @param {string} sufijoUid    Distingue las invitaciones de un asesor adicional
  *                              de las del principal (misma orden, otro horario).
+ * @param {Array}  todas        26-nov-2026 · Todas las franjas del asesor, cuando
+ *                              `franjas` es solo lo nuevo de un envío por partes: la
+ *                              sesión se numera contra la visita entera.
+ * @param {Array}  canceladas   26-nov-2026 · Franjas ya enviadas que dejaron de
+ *                              existir (con su `ics_uid`): salen como CANCELADAS.
+ *                              Si se pasa, reemplaza a `previas`.
  * @returns {{contenido: string, nombre: string}[]}
  */
 export function construirInvitaciones({
   orden, profesional, organizador, secuencia = 0, franjas = [], previas = 0, sufijoUid = '',
+  todas = null, canceladas = null,
 }) {
+  const visita = Array.isArray(todas) && todas.length ? todas : franjas;
+  // El UID es el de la franja (`ics_uid`, fijo por sesión desde el 26-nov); el
+  // posicional queda para las franjas sin él (pruebas y órdenes a la antigua).
   const tramos = Array.isArray(franjas) && franjas.length
-    ? franjas.map((f, i) => ({
-        inicio: fechaHoraCO(f.fecha, f.hora_inicio),
-        fin: fechaHoraCO(f.fecha, f.hora_fin),
-        uid: `os-${orden.id}${sufijoUid}-${i + 1}@jdd-iacore`,
-        etiqueta: franjas.length > 1 ? ` (${i + 1}/${franjas.length})` : '',
-        cancelado: false,
-      }))
+    ? franjas.map((f, i) => {
+        const pos = visita.indexOf(f);
+        const n = pos >= 0 ? pos + 1 : i + 1;
+        return {
+          inicio: fechaHoraCO(f.fecha, f.hora_inicio),
+          fin: fechaHoraCO(f.fecha, f.hora_fin),
+          uid: f.ics_uid || `os-${orden.id}${sufijoUid}-${n}@jdd-iacore`,
+          etiqueta: visita.length > 1 ? ` (${n}/${visita.length})` : '',
+          cancelado: false,
+          sesion: n,
+          franja: f,
+        };
+      })
     : [];
 
   // Sin franjas se mantiene el comportamiento de siempre: un evento que dura las
   // horas de la OS. Si no vienen se asume una hora, que es mejor que un evento
   // de duración cero (hay calendarios que lo ocultan).
-  if (!tramos.length) {
+  // Un correo que solo cancela sesiones no lleva este evento de respaldo.
+  if (!tramos.length && !canceladas?.length) {
     if (!orden?.fecha_programada) return [];
     const inicio = new Date(orden.fecha_programada);
     const horas = Number(orden.horas_asignadas) > 0 ? Number(orden.horas_asignadas) : 1;
@@ -114,21 +131,39 @@ export function construirInvitaciones({
       uid: `os-${orden.id}${sufijoUid}@jdd-iacore`,
       etiqueta: '',
       cancelado: false,
+      sesion: 1,
     });
   }
 
   // Reprogramar con MENOS franjas que antes dejaría los eventos sobrantes vivos
   // en el calendario del profesional, y se presentaría un día que ya no toca.
   // Se mandan cancelados con el mismo UID para que el cliente los tache.
-  for (let i = franjas.length; i < previas; i++) {
-    const ref = tramos[0];
-    tramos.push({
-      inicio: ref.inicio,
-      fin: ref.fin,
-      uid: `os-${orden.id}${sufijoUid}-${i + 1}@jdd-iacore`,
-      etiqueta: ' (cancelada)',
-      cancelado: true,
-    });
+  // 26-nov-2026 · Con `canceladas` se cancela CADA sesión retirada por su UID, con
+  // su fecha real; `previas` (por posición) queda para quien no las conozca.
+  if (Array.isArray(canceladas)) {
+    for (const f of canceladas) {
+      tramos.push({
+        inicio: fechaHoraCO(f.fecha, f.hora_inicio),
+        fin: fechaHoraCO(f.fecha, f.hora_fin),
+        uid: f.ics_uid,
+        etiqueta: ' (cancelada)',
+        cancelado: true,
+        fecha: f.fecha,
+        franja: f,
+      });
+    }
+  } else {
+    for (let i = franjas.length; i < previas; i++) {
+      const ref = tramos[0];
+      tramos.push({
+        inicio: ref.inicio,
+        fin: ref.fin,
+        uid: `os-${orden.id}${sufijoUid}-${i + 1}@jdd-iacore`,
+        etiqueta: ' (cancelada)',
+        cancelado: true,
+        sesion: i + 1,
+      });
+    }
   }
 
   const lugar = [orden.direccion, orden.ciudad_ejecucion].filter(Boolean).join(', ');
@@ -215,20 +250,27 @@ export function construirInvitaciones({
   // sesión. Con «OS-2026-0249-1de4.ics» el cliente creyó que eran los formatos
   // que faltaban (reporte del 20-nov). Las canceladas lo dicen y no cuentan en
   // el «de N», que es el número de sesiones vigentes.
-  const vigentes = tramos.filter((t) => !t.cancelado).length;
-  return tramos.map((t, i) => ({
+  // 26-nov-2026 · «de N» cuenta la visita entera (`todas`), no solo lo que va en
+  // este correo: en un envío por partes la sesión nueva es la 3 de 3, no la 1 de 1.
+  const vigentes = visita.length || tramos.filter((t) => !t.cancelado).length;
+  const ddmmaaaa = (iso) => String(iso).split('-').reverse().join('-');
+  return tramos.map((t) => ({
     contenido: calendario(evento(t)),
     nombre: t.cancelado
-      ? `Calendario - sesion ${i + 1} CANCELADA - ${orden.codigo}.ics`
+      ? (t.fecha
+          ? `Calendario - sesion CANCELADA (${ddmmaaaa(t.fecha)}) - ${orden.codigo}.ics`
+          : `Calendario - sesion ${t.sesion} CANCELADA - ${orden.codigo}.ics`)
       : vigentes > 1
-        ? `Calendario - sesion ${i + 1} de ${vigentes} - ${orden.codigo}.ics`
+        ? `Calendario - sesion ${t.sesion} de ${vigentes} - ${orden.codigo}.ics`
         : `Calendario - ${orden.codigo}.ics`,
     // Para el cuerpo del correo: qué sesión es y cuándo.
-    sesion: i + 1,
+    sesion: t.sesion ?? null,
     total: vigentes,
     inicio: t.inicio,
     fin: t.fin,
     cancelado: t.cancelado,
+    // La franja de la que sale (para describirla en el correo).
+    franja: t.franja ?? null,
   }));
 }
 

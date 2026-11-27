@@ -1250,9 +1250,16 @@ function salida(def, { buffer, admiteObservaciones, editables = [] }, sufijo) {
  * 'sesion' salen uno por franja; los de alcance 'orden', una sola vez.
  *
  * Devuelve `[{ tipo, filename, buffer }]`, vacío si la ARL no tiene formatos.
+ *
+ * 26-nov-2026 · Envío por partes: `emitirSesion(franja)` dice qué sesiones salen
+ * (las que el asesor aún no tiene) y `emitirPorOrden` si salen los de alcance
+ * 'orden' (solo en su primer envío). La numeración «sesion X de N» se sigue
+ * contando sobre TODAS las franjas, para que la hoja nueva no repita el número
+ * de una que ya tiene.
  */
 export async function generarFormatosArl({
   orden, profesional, franjas = [], aliado, original = null, observaciones = {}, campos = {},
+  emitirSesion = () => true, emitirPorOrden = true,
 }) {
   const entrega = entregaDeLaOrden(orden);
   if (!entrega.formatos.length) return [];
@@ -1273,17 +1280,23 @@ export async function generarFormatosArl({
 
   // Sin franjas se emite igualmente un juego, con las casillas de fecha y
   // horario en blanco: el profesional ya tiene el formato correcto en la mano.
-  const sesiones = (franjas.length ? franjas : [null]).slice(0, MAXIMO_JUEGOS);
-  if (franjas.length > MAXIMO_JUEGOS) {
+  const todas = franjas.length ? franjas : [null];
+  // El tope se aplica a lo que se EMITE: en una orden por partes la sesión 9 sale
+  // en su propio envío aunque las 8 primeras ya se hayan mandado.
+  const sesiones = todas
+    .map((franja, i) => ({ franja, numero: i + 1 }))
+    .filter(({ franja }) => !franja || emitirSesion(franja));
+  if (sesiones.length > MAXIMO_JUEGOS) {
     console.warn(
-      `[formatos] ${orden.codigo}: ${franjas.length} franjas; se adjuntan las ${MAXIMO_JUEGOS} primeras`
+      `[formatos] ${orden.codigo}: ${sesiones.length} franjas; se adjuntan las ${MAXIMO_JUEGOS} primeras`
     );
+    sesiones.length = MAXIMO_JUEGOS;
   }
   const tramo = tramoDe(franjas);
   const generados = [];
 
   // 1) Los de alcance 'orden': uno solo, con el tramo completo de la visita.
-  for (const def of definiciones.filter((d) => d.alcance === 'orden')) {
+  for (const def of definiciones.filter((d) => d.alcance === 'orden' && emitirPorOrden)) {
     generados.push(salida(def, await construir(def, orden, profesional, tramo, identidad, original, extra(def)), ''));
   }
 
@@ -1291,10 +1304,10 @@ export async function generarFormatosArl({
   // 22-nov-2026 · Con varias sesiones el nombre dice CUÁL es y de qué fecha
   // («seguimiento - sesion 2 de 4 (20-11-2026).pdf»); antes era «-2» a secas y
   // en el correo no se distinguían de las invitaciones de calendario.
-  for (const [i, franja] of sesiones.entries()) {
+  for (const { franja, numero } of sesiones) {
     const sesion = sesionDe(orden, franja);
-    const info = sesiones.length > 1
-      ? { numero: i + 1, total: sesiones.length, fecha: sesion.fechaCorta }
+    const info = todas.length > 1
+      ? { numero, total: todas.length, fecha: sesion.fechaCorta }
       : null;
     const sufijo = info
       ? ` - sesion ${info.numero} de ${info.total}${info.fecha ? ` (${info.fecha.replace(/\//g, '-')})` : ''}`

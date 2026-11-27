@@ -108,5 +108,35 @@ const leerCampo = async (buffer, nombre) => {
   ], 'reprogramar de 3 a 2 sesiones: la sobrante sale cancelada');
 }
 
+// 6) 26-nov-2026 · Envío por partes (OS-2026-0324): la sesión del 11-nov ya se envió.
+{
+  const enviada = { ...cuatro[0], enviada_en: '2026-11-10T15:00:00Z' };
+  const tres = [enviada, cuatro[2], cuatro[3]];
+  const docs = await generarFormatosArl({
+    orden: { ...ordenBase, tipo_servicio_arl: 'T' }, profesional, franjas: tres,
+    emitirSesion: (f) => !f.enviada_en, emitirPorOrden: false,
+  });
+  igual(docs.map((d) => d.filename), [
+    'seguimiento - sesion 2 de 3 (24-11-2026).pdf',
+    'seguimiento - sesion 3 de 3 (25-11-2026).pdf',
+  ], 'por partes: solo las sesiones nuevas, numeradas contra la visita entera y sin el informe por orden');
+
+  const franjas = tres.map((f, i) => ({ ...f, hora_inicio: f.hora_inicio.slice(0, 5), hora_fin: f.hora_fin.slice(0, 5), ics_uid: `uid-${i + 1}` }));
+  const nuevas = franjas.slice(1);
+  const inv = construirInvitaciones({ orden: ordenBase, profesional, franjas: nuevas, todas: franjas, canceladas: [] });
+  igual(inv.map((i) => i.nombre), [
+    'Calendario - sesion 2 de 3 - OS-PRUEBA-0249.ics',
+    'Calendario - sesion 3 de 3 - OS-PRUEBA-0249.ics',
+  ], 'por partes: solo las invitaciones nuevas, numeradas contra la visita entera');
+  igual(inv.map((i) => /UID:(.*)/.exec(i.contenido)[1].trim()), ['uid-2', 'uid-3'], 'por partes: el UID es el de cada franja');
+
+  const cancela = construirInvitaciones({
+    orden: ordenBase, profesional, franjas: [], todas: [],
+    canceladas: [{ fecha: '2026-11-24', hora_inicio: '14:00', hora_fin: '18:00', ics_uid: 'uid-2' }],
+  });
+  igual(cancela.map((i) => i.nombre), ['Calendario - sesion CANCELADA (24-11-2026) - OS-PRUEBA-0249.ics'], 'por partes: una sesión quitada sale cancelada con su fecha');
+  igual(cancela.every((i) => /STATUS:CANCELLED/.test(i.contenido) && /UID:uid-2/.test(i.contenido)), true, 'por partes: la cancelación usa el UID de esa sesión');
+}
+
 console.log(fallos ? `\n${fallos} comprobación(es) FALLARON` : '\nTodo OK');
 process.exit(fallos ? 1 : 0);

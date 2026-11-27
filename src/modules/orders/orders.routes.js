@@ -174,10 +174,13 @@ function fechaCO(valor) {
 // 7-oct-2026 · `profesional_id` dice de QUIÉN es la franja cuando la orden la
 // ejecutan varios asesores, cada uno con su horario. NULL = del asesor principal
 // (`ordenes_servicio.profesional_asignado_id`), que es el caso de siempre.
+// 26-nov-2026 · `enviada_en`/`enviada_a`/`ics_uid`: si la sesión ya le llegó al
+// asesor (envío por partes); la pantalla las protege y el envío no las repite.
 const FRANJA_COLS = `id, orden_id, profesional_id,
   to_char(fecha, 'YYYY-MM-DD') AS fecha,
   to_char(hora_inicio, 'HH24:MI') AS hora_inicio,
-  to_char(hora_fin, 'HH24:MI')    AS hora_fin`;
+  to_char(hora_fin, 'HH24:MI')    AS hora_fin,
+  enviada_en, enviada_a, ics_uid`;
 
 /**
  * ASG-02 · Valida y ordena las franjas de una visita.
@@ -1106,13 +1109,25 @@ router.post('/:id/assign/preview', requireRole('admin'), asyncHandler(async (req
       prediligenciado: d._prediligenciado !== false,
       admite_observaciones: !!d._admiteObservaciones,
       editables: d._editables || [],
+      sesion: d._sesion || null,
       // Solo los PDF se pueden ver en el navegador; los Word/Excel se listan.
       pdf: esPdf ? (await pdfDeSoloLectura(d._buffer)).toString('base64') : null,
     });
   }
+  // 26-nov-2026 · Envío por partes: qué sesiones ya tiene cada asesor (no se
+  // reenvían) y cuáles enviadas se van a cancelar, para enseñarlo en el modal.
+  const sesionDe = (f) => ({
+    fecha: f.fecha, hora_inicio: f.hora_inicio, hora_fin: f.hora_fin,
+    profesional_id: f.profesional_id ?? result.profesional.id,
+  });
+  const yaEnviadas = result.reenviarTodo ? [] : result.franjas.filter((f) => f.enviada_en).map(sesionDe);
+  const pendientes = result.franjas.filter((f) => result.reenviarTodo || !f.enviada_en);
   res.json({
     data: {
       formatos,
+      ya_enviadas: yaEnviadas,
+      canceladas: result.retiradas.map((f) => ({ ...sesionDe(f), profesional_id: f.enviada_a })),
+      sin_cambios: !pendientes.length && !result.retiradas.length,
       observaciones_formatos: result.orden.observaciones_formatos || {},
       campos_formatos: result.orden.campos_formatos || {},
       soportes: result.entrega?.soportes ?? [],
@@ -1174,6 +1189,10 @@ async function aplicarAsignacion(req, client, { vistaPrevia = false } = {}) {
   const observaciones = observacionesDeFormatos(req.body?.observaciones_formatos);
   const camposUsuario = camposDeFormatos(req.body?.campos_formatos);
   const coasesoresPedidos = normalizarCoasesores(req.body?.coasesores);
+  // 26-nov-2026 · Salida de emergencia del envío por partes: manda otra vez TODO
+  // (formatos e invitaciones de todas las sesiones, a todos los asesores), p. ej.
+  // si un correo se perdió o se corrigieron datos de formatos ya enviados.
+  const reenviarTodo = req.body?.reenviar_todo === true;
 
   const prof = await client.query(`SELECT p.*, COALESCE(p.documento_identidad, u.documento_identidad) AS documento_identidad FROM sst.profesionales p LEFT JOIN sst.usuarios u ON u.id = p.usuario_id WHERE p.id=$1`, [profesionalId]);
   if (!prof.rows[0]) throw badRequest('Profesional no existe');
@@ -1317,25 +1336,48 @@ async function aplicarAsignacion(req, client, { vistaPrevia = false } = {}) {
   // `franjasPrevias`: cuántas tenía CADA asesor, para cancelarle en el calendario
   // las invitaciones que sobren (las de NULL eran del principal de antes).
   const franjasPrevias = {};
+  // 26-nov-2026 · Envío por partes. Cada franja que sobrevive (misma fecha, horario
+  // y asesor) HEREDA su marca de enviada y su UID de calendario; las que ya se
+  // habían enviado y desaparecen (movidas o quitadas) quedan en `retiradas`, para
+  // cancelarle al asesor ese evento concreto.
+  const retiradas = [];
   if (franjas.length) {
     const ajena = franjas.find(
       (f) => f.profesional_id && !coasesores.some((c) => c.profesional_id === f.profesional_id),
     );
     if (ajena) throw badRequest('Hay franjas de un asesor que no está asignado a la orden.');
     const antes = await client.query(
-      `DELETE FROM sst.franjas_visita WHERE orden_id=$1 RETURNING profesional_id`,
+      `DELETE FROM sst.franjas_visita WHERE orden_id=$1
+       RETURNING profesional_id, to_char(fecha, 'YYYY-MM-DD') AS fecha,
+                 to_char(hora_inicio, 'HH24:MI') AS hora_inicio, to_char(hora_fin, 'HH24:MI') AS hora_fin,
+                 enviada_en, enviada_a, ics_uid`,
       [req.params.id]
     );
+    const principalAntes = actual.rows[0].profesional_asignado_id ?? profesionalId;
+    const firma = (f, de) => `${de}|${f.fecha}|${f.hora_inicio}|${f.hora_fin}`;
+    const previas = new Map();
     for (const f of antes.rows) {
-      const de = f.profesional_id ?? actual.rows[0].profesional_asignado_id ?? profesionalId;
+      const de = f.profesional_id ?? principalAntes;
       franjasPrevias[de] = (franjasPrevias[de] ?? 0) + 1;
+      previas.set(firma(f, de), f);
     }
     for (const f of franjas) {
+      const de = f.profesional_id ?? profesionalId;
+      const previa = previas.get(firma(f, de));
+      previas.delete(firma(f, de));
       await client.query(
-        `INSERT INTO sst.franjas_visita (orden_id, profesional_id, fecha, hora_inicio, hora_fin, creado_por)
-         VALUES ($1,$2,$3,$4,$5,$6)`,
-        [req.params.id, f.profesional_id, f.fecha, f.hora_inicio, f.hora_fin, req.user.sub]
+        `INSERT INTO sst.franjas_visita
+           (orden_id, profesional_id, fecha, hora_inicio, hora_fin, creado_por, enviada_en, enviada_a, ics_uid)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+        [
+          req.params.id, f.profesional_id, f.fecha, f.hora_inicio, f.hora_fin, req.user.sub,
+          previa?.enviada_en ?? null, previa?.enviada_a ?? null,
+          previa?.ics_uid ?? `os-${req.params.id}-${randomToken(8)}@jdd-iacore`,
+        ]
       );
+    }
+    for (const f of previas.values()) {
+      if (f.enviada_en && f.ics_uid) retiradas.push(f);
     }
   }
 
@@ -1407,7 +1449,7 @@ async function aplicarAsignacion(req, client, { vistaPrevia = false } = {}) {
 
   // En la vista previa se generan igual, pero sin subirlos ni registrarlos.
   const docs = programar
-    ? await generateOrderDocuments(req.params.id, client, { guardar: !vistaPrevia })
+    ? await generateOrderDocuments(req.params.id, client, { guardar: !vistaPrevia, soloPendientes: !reenviarTodo })
     : [];
 
   // SUP · Qué soportes tendrá que devolver, CONGELADO aquí.
@@ -1476,6 +1518,7 @@ async function aplicarAsignacion(req, client, { vistaPrevia = false } = {}) {
     secuenciaCalendario: guardada.rows[0].secuencia_calendario,
     franjas: await franjasDeOrden(req.params.id, client),
     franjasPrevias,
+    retiradas, reenviarTodo,
     coasesores: await coasesoresDeOrden(req.params.id, client),
   };
 }
@@ -1531,20 +1574,30 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
   );
   // 22-nov-2026 · Devuelve las invitaciones con su sesión y su horario (no los
   // adjuntos todavía): el cuerpo del correo las enumera aparte de los formatos.
+  // 26-nov-2026 · Envío por partes: a cada asesor solo le sale lo que no tiene
+  // (sus sesiones sin `enviada_en`) y la cancelación de las que ya tenía y se
+  // movieron o quitaron. Con «reenviar todo», todas sus sesiones como antes.
+  const nuevasDe = (profesionalId) => franjasDe(profesionalId)
+    .filter((f) => result.reenviarTodo || !f.enviada_en);
+  const canceladasDe = (profesionalId) => result.retiradas.filter((f) => f.enviada_a === profesionalId);
   const invitacionesPara = (profesional, principal) => construirInvitaciones({
     orden: result.orden,
     profesional,
     organizador: { nombre: req.user.nombre, correo: req.user.correo },
     secuencia: result.secuenciaCalendario,
-    franjas: franjasDe(profesional.id),
-    previas: result.franjasPrevias[profesional.id] ?? 0,
+    franjas: nuevasDe(profesional.id),
+    todas: franjasDe(profesional.id),
+    canceladas: canceladasDe(profesional.id),
     // El administrador va en copia de todos: sin esto las invitaciones de dos
     // asesores compartirían UID y en su calendario una pisaría a la otra.
     sufijoUid: principal ? '' : `-${String(profesional.id).slice(0, 8)}`,
   });
 
   const o = result.orden;
-  const esRepro = result.esReprogramacion;
+  // 26-nov-2026 · Desde el envío por partes, a quien ya tenía sesiones el correo
+  // se lo dice por su lado (`yaTenia`); el que no tenía nada (un asesor que entra)
+  // la recibe como nueva. «Reprogramada» a secas queda para «reenviar todo».
+  const esRepro = result.esReprogramacion && result.reenviarTodo;
   const lugar = [o.direccion, o.ciudad_ejecucion].filter(Boolean).join(', ');
   const contacto = [o.contacto_sst_nombre, o.contacto_sst_telefono].filter(Boolean).join(' · ');
   // A3-01 · Una orden particular no lleva formatos A PROPÓSITO: no se anuncia
@@ -1668,11 +1721,30 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
     // 22-nov-2026 · Las invitaciones .ics se enumeran APARTE de los formatos y se
     // dice que no lo son: el cliente confundió «OS-2026-0249-1de4.ics …» con los
     // formatos que faltaban (reporte del 20-nov).
-    const listaInvitaciones = invitaciones.map((inv, i) => {
-      const franja = suyas[i];
-      const cuando = inv.cancelado ? 'cancelada, se quita del calendario' : franja ? franjaEnTexto(franja) : fechaDest;
-      return invitaciones.length > 1 ? `Sesión ${inv.sesion} · ${cuando}` : cuando;
+    const listaInvitaciones = invitaciones.map((inv) => {
+      const cuando = inv.cancelado
+        ? `${inv.franja ? `${franjaEnTexto(inv.franja)}: ` : ''}cancelada, se quita del calendario`
+        : inv.franja ? franjaEnTexto(inv.franja) : fechaDest;
+      return invitaciones.length > 1 && inv.sesion && !inv.cancelado ? `Sesión ${inv.sesion} · ${cuando}` : cuando;
     });
+    // 26-nov-2026 · Envío por partes: el asesor ya tenía sesiones de esta orden, y
+    // este correo trae solo lo nuevo (o solo cancela). Lo dice desde el asunto.
+    const nuevasDest = nuevasDe(dest.profesional.id);
+    const canceladasDest = canceladasDe(dest.profesional.id);
+    const yaTenia = !result.reenviarTodo &&
+      (suyas.some((f) => f.enviada_en) || canceladasDest.length > 0);
+    const soloCancela = yaTenia && !nuevasDest.length;
+    const marcaSesion = (f) => (yaTenia ? (f.enviada_en ? ' (ya enviada)' : ' (nueva)') : '');
+    const horario = suyas.map((f) => franjaEnTexto(f) + marcaSesion(f));
+    const canceladasTexto = canceladasDest.map(franjaEnTexto);
+    const asunto = !yaTenia
+      ? (esRepro ? 'OS reprogramada' : 'Nueva OS asignada')
+      : soloCancela ? 'Sesión cancelada' : canceladasDest.length ? 'OS reprogramada' : 'Nuevas sesiones';
+    const introPartes = soloCancela
+      ? 'Se cancelaron sesiones de esta orden que ya tenías programadas. Las demás siguen igual.'
+      : `Se programaron ${nuevasDest.length === 1 ? 'una sesión nueva' : `${nuevasDest.length} sesiones nuevas`} ` +
+        'de esta orden. Este correo trae solo sus formatos y sus invitaciones de calendario: los de ' +
+        'las sesiones anteriores ya los tienes y siguen valiendo.';
     const notaInvitaciones = invitaciones.length
       ? (invitaciones.length === 1
           ? 'El archivo de calendario (.ics) NO es un formato: es la invitación para agregar la visita a tu calendario. '
@@ -1695,14 +1767,14 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
       // El administrador que asigna va en copia para que la invitación entre
       // también en SU calendario: el requisito pide los dos, no solo el asesor.
       cc: req.user.correo || undefined,
-      subject: esRepro
-        ? `OS reprogramada · ${o.codigo} · ${o.empresa_nombre || ''}`
-        : `Nueva OS asignada · ${o.codigo} · ${o.empresa_nombre || ''}`,
+      subject: `${asunto} · ${o.codigo} · ${o.empresa_nombre || ''}`,
       // La versión en texto se conserva íntegra: es lo que ve quien lee en texto
       // plano y lo que queda en los registros del driver 'console'.
       text:
         `Hola ${dest.profesional.nombre},\n\n` +
-        (esRepro
+        (yaTenia
+          ? `OS ${o.codigo} (${o.pagador_nombre ?? o.arl_nombre}) para ${o.empresa_nombre}. ${introPartes}\n`
+          : esRepro
           ? `La OS ${o.codigo} (${o.pagador_nombre ?? o.arl_nombre}) para ${o.empresa_nombre} fue REPROGRAMADA.\n`
           : `Se te asignó la OS ${o.codigo} (${o.pagador_nombre ?? o.arl_nombre}) para ${o.empresa_nombre}.\n`) +
         // P2 · Cronograma y secuencia (Bolívar) o número de orden (demás ARL), y
@@ -1713,9 +1785,12 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
         (o.tipo_actividad ? `Actividad a desarrollar: ${o.tipo_actividad}\n` : '') +
         // Con la visita partida, una sola "fecha programada" se queda corta: lo
         // que el profesional necesita saber es cada franja.
-        (varias
-          ? `La visita se realiza en ${suyas.length} franjas:\n${franjasEnTexto(suyas)}\n`
+        (varias || yaTenia
+          ? `La visita se realiza en ${suyas.length} franjas:\n${horario.map((h) => `  · ${h}`).join('\n')}\n`
           : `Fecha programada: ${fechaDest}\n`) +
+        (canceladasTexto.length
+          ? `Sesiones canceladas:\n${canceladasTexto.map((c) => `  · ${c}`).join('\n')}\n`
+          : '') +
         `Horas: ${horasDest}\n` +
         (notaEquipo ? `${notaEquipo}\n` : '') +
         (lugar ? `Lugar: ${lugar}\n` : '') +
@@ -1724,7 +1799,7 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
         '\n' +
         // Sin plantillas activas para la ARL no hay PDFs que adjuntar (CFG-03):
         // prometer unos formatos que no van deja al profesional buscándolos.
-        (particular ? '' : sinFormatos
+        (particular || (yaTenia && !docsDest.length) ? '' : sinFormatos
           ? `Los formatos de esta ARL todavía no están cargados en la plataforma; ` +
             `te los haremos llegar aparte.\n\n`
           : `Documentos adjuntos de ${o.arl_nombre}:\n` +
@@ -1741,13 +1816,17 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
             `${notaInvitaciones}\n`
           : ''),
       html: correoHtml({
-        titulo: esRepro ? 'Visita reprogramada' : 'Nueva orden de servicio asignada',
+        titulo: yaTenia
+          ? (soloCancela ? 'Sesión cancelada' : 'Nuevas sesiones programadas')
+          : esRepro ? 'Visita reprogramada' : 'Nueva orden de servicio asignada',
         subtitulo: `${o.codigo} · ${o.empresa_nombre || ''}`,
         pie: 'JD&D Consultores · Seguridad y Salud en el Trabajo',
         cuerpo: [
           parrafo(`Hola ${dest.profesional.nombre},`),
           parrafo(
-            esRepro
+            yaTenia
+              ? introPartes
+              : esRepro
               ? `La visita de esta orden cambió de programación. Estos son los datos vigentes; ` +
                 `los anteriores ya no aplican.`
               : `Te asignamos la siguiente orden de servicio. Abajo tienes los formatos y el ` +
@@ -1777,11 +1856,14 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
           ]),
           // Con una sola franja el bloque igual se usa: es donde el ojo va a
           // buscar el cuándo, y mantenerlo evita dos maquetas distintas.
-          bloqueLista(
-            varias ? `La visita se realiza en ${suyas.length} franjas` : 'Fecha de la visita',
-            suyas.length ? suyas.map(franjaEnTexto) : [fechaDest],
-          ),
-          particular ? '' : sinFormatos
+          suyas.length || !soloCancela
+            ? bloqueLista(
+                varias || yaTenia ? `La visita se realiza en ${suyas.length} franjas` : 'Fecha de la visita',
+                suyas.length ? horario : [fechaDest],
+              )
+            : '',
+          canceladasTexto.length ? bloqueAviso(`Sesiones canceladas: ${canceladasTexto.join('; ')}.`) : '',
+          particular || (yaTenia && !docsDest.length) ? '' : sinFormatos
             ? bloqueAviso(
                 'Los formatos de esta ARL todavía no están cargados en la plataforma. ' +
                 'Te los haremos llegar aparte.',
@@ -1789,7 +1871,7 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
             // Los documentos por su nombre, no "los formatos de la ARL": lo que
             // se lista es exactamente lo que trae ESTE correo.
             : bloqueLista(`Documentos adjuntos de ${o.arl_nombre}`, listaAdjuntos),
-          particular || sinFormatos ? '' : parrafo(queHacerConEllos.join(' ')),
+          particular || sinFormatos || !docsDest.length ? '' : parrafo(queHacerConEllos.join(' ')),
           // ASG · El nombre impreso no es el suyo, y hay que decírselo aquí: es
           // lo primero que va a ver al abrir el PDF adjunto.
           notaSuplente ? bloqueAviso(notaSuplente) : '',
@@ -1824,18 +1906,75 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
     });
   };
 
+  /** 26-nov-2026 · A quien ya no está en la orden: solo le cancela sus sesiones enviadas. */
+  const enviarCancelacionA = async (profesional) => {
+    const suyas = canceladasDe(profesional.id);
+    const invitaciones = construirInvitaciones({
+      orden: o, profesional,
+      organizador: { nombre: req.user.nombre, correo: req.user.correo },
+      secuencia: result.secuenciaCalendario, franjas: [], canceladas: suyas,
+    });
+    const lista = suyas.map(franjaEnTexto);
+    await sendEmail({
+      to: profesional.correo,
+      cc: req.user.correo || undefined,
+      subject: `Sesión cancelada · ${o.codigo} · ${o.empresa_nombre || ''}`,
+      text:
+        `Hola ${profesional.nombre},\n\n` +
+        `Ya no realizas estas sesiones de la OS ${o.codigo} para ${o.empresa_nombre}:\n` +
+        lista.map((l) => `  · ${l}\n`).join('') +
+        `\nLos archivos de calendario adjuntos las quitan de tu calendario.\n`,
+      html: correoHtml({
+        titulo: 'Sesión cancelada',
+        subtitulo: `${o.codigo} · ${o.empresa_nombre || ''}`,
+        pie: 'JD&D Consultores · Seguridad y Salud en el Trabajo',
+        cuerpo: [
+          parrafo(`Hola ${profesional.nombre},`),
+          parrafo('Ya no realizas estas sesiones de la orden. Los archivos de calendario adjuntos las quitan de tu calendario.'),
+          bloqueLista('Sesiones canceladas', lista),
+        ].join(''),
+      }),
+      attachments: adjuntosInvitacion(invitaciones),
+    });
+  };
+
   let correoEnviado = true;
   let correoError = null;
+  // 26-nov-2026 · Envío por partes: solo se le escribe a quien tiene algo nuevo
+  // (sesiones sin enviar o canceladas). Un asesor cuyas sesiones no cambiaron no
+  // recibe nada; con «reenviar todo», todos como antes.
+  const conCambios = (id) => result.reenviarTodo || nuevasDe(id).length > 0 || canceladasDe(id).length > 0;
   const destinatarios = [
     { profesional: result.profesional, horas: horasPrincipal, principal: true },
     ...equipo.map((c) => ({
       profesional: { id: c.profesional_id, nombre: c.nombre, correo: c.correo, usuario_id: c.usuario_id },
       horas: horasCoasesor(c), principal: false,
     })),
-  ];
+  ].filter((d) => conCambios(d.profesional.id));
+  // Quien salió de la orden (cambio de asesor) y tenía sesiones enviadas: se le
+  // cancelan en su calendario con un correo corto.
+  const enEquipo = new Set([result.profesional.id, ...equipo.map((c) => c.profesional_id)]);
+  const salientes = [...new Set(result.retiradas.map((f) => f.enviada_a).filter((id) => id && !enEquipo.has(id)))];
+  // Marca de enviado, DESPUÉS del correo y solo si salió: si falla, el siguiente
+  // envío se lo vuelve a mandar.
+  const marcarEnviadas = (dest) => pool.query(
+    `UPDATE sst.franjas_visita SET enviada_en = now(), enviada_a = $2
+      WHERE orden_id = $1 AND COALESCE(profesional_id, $3) = $2 AND ($4 OR enviada_en IS NULL)`,
+    [result.orden.id, dest.profesional.id, result.profesional.id, result.reenviarTodo],
+  );
+  for (const id of salientes) {
+    const saliente = (await pool.query(`SELECT id, nombre, correo FROM sst.profesionales WHERE id=$1`, [id])).rows[0];
+    if (!saliente?.correo) continue;
+    try {
+      await enviarCancelacionA(saliente);
+    } catch (e) {
+      console.error('[assign] cancelación no enviada:', saliente.nombre, e?.message);
+    }
+  }
   for (const dest of destinatarios) {
     try {
       await enviarCorreoA(dest);
+      await marcarEnviadas(dest);
     } catch (e) {
       // Uno que falle no impide escribirle a los demás; se avisa de cuál fue.
       correoEnviado = false;
@@ -1880,15 +2019,22 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
     ? ` Programación parcial: se envió ${horasTexto(result.repartidoMin / 60)} de ` +
       `${horasTexto(result.orden.horas_asignadas)}; faltan ${horasTexto(result.faltanMin / 60)} por programar.`
     : '';
+  // 26-nov-2026 · Nada nuevo que mandar (las sesiones ya estaban enviadas y no
+  // cambiaron): se guardó, pero no salió correo, y se dice tal cual.
+  const sinCambios = !destinatarios.length && !salientes.length;
   res.json({
-    message: (correoEnviado
-      ? `OS ${accion}, formatos generados y correo enviado.`
+    message: (sinCambios
+      ? `OS ${accion}. No había sesiones nuevas ni cambios: no se envió correo a nadie.`
+      : correoEnviado
+      ? `OS ${accion}, formatos generados y correo enviado` +
+        (destinatarios.length ? ` a ${destinatarios.map((d) => d.profesional.nombre).join(', ')}.` : '.')
       : `OS ${accion} y formatos generados, pero el correo al profesional no salió.`) + colaParcial,
+    sin_cambios: sinCambios,
     completa: result.completa,
     parcial: result.parcial,
     minutos_programados: result.repartidoMin,
     faltan_minutos: result.faltanMin,
-    correo_enviado: correoEnviado,
+    correo_enviado: correoEnviado && !sinCambios,
     correo_error: correoError,
     // Qué se envió y qué se le pedirá de vuelta, para poder enseñarlo sin
     // volver a pedir la orden.
@@ -1912,7 +2058,8 @@ router.post('/:id/assign', requireRole('admin'), asyncHandler(async (req, res) =
       ...result.orden,
       support_url: supportUrl,
       documentos: result.docs.map(({ _buffer, ...d }) => d),
-      franjas: result.franjas,
+      // Releídas: ya llevan la marca de enviadas que se puso tras el correo.
+      franjas: await franjasDeOrden(result.orden.id),
       coasesores: result.coasesores,
     },
   });
